@@ -1,0 +1,5 @@
+vtk>=9.6.2
+numpy>=2.4.6
+openpyxl>=3.1.5
+# pyvista is used by generate_report.py; install if needed:
+# pyvista>=0.44
