@@ -168,13 +168,19 @@ def run_gui():
             "name_filter":    filter_var.get().strip(),
             "save_snapshots": snap_var.get(),
             "transform": {
-                "unit":        xfm_unit_var.get(),
-                "angle_deg":   xfm_angle_var.get(),
-                "dx":          xfm_dx_var.get(),
-                "dy":          xfm_dy_var.get(),
-                "dz":          xfm_dz_var.get(),
-                "pattern":     xfm_pattern_var.get(),
-                "name_filter": xfm_filter_var.get(),
+                "unit":         xfm_unit_var.get(),
+                "angle_deg":    xfm_angle_var.get(),
+                "dx":           xfm_dx_var.get(),
+                "dy":           xfm_dy_var.get(),
+                "dz":           xfm_dz_var.get(),
+                "pattern":      xfm_pattern_var.get(),
+                "name_filter":  xfm_filter_var.get(),
+                "export_geom":  xfm_export_geom.get(),
+                "export_area":  xfm_export_area.get(),
+                "export_power": xfm_export_power.get(),
+                "export_pload": xfm_export_pload.get(),
+                "mult":         xfm_mult_var.get(),
+                "ignore_zeros": xfm_ignore_zeros.get(),
             },
         }
 
@@ -197,6 +203,12 @@ def run_gui():
             xfm_dz_var.set(xfm.get("dz", "920.0"))
             xfm_pattern_var.set(xfm.get("pattern", "smoothed_results_*.vtp"))
             xfm_filter_var.set(xfm.get("name_filter", ""))
+            xfm_export_geom.set(bool(xfm.get("export_geom", True)))
+            xfm_export_area.set(bool(xfm.get("export_area", True)))
+            xfm_export_power.set(bool(xfm.get("export_power", True)))
+            xfm_export_pload.set(bool(xfm.get("export_pload", True)))
+            xfm_mult_var.set(str(xfm.get("mult", "1.0")))
+            xfm_ignore_zeros.set(bool(xfm.get("ignore_zeros", False)))
 
     def on_save_cfg():
         path = filedialog.asksaveasfilename(
@@ -331,6 +343,41 @@ def run_gui():
         row=0, column=3, sticky="w", padx=6
     )
 
+    # ── Export options ────────────────────────────────────────────────────────
+    ttk.Separator(tab2, orient="horizontal").pack(fill="x", padx=10, pady=(10, 4))
+
+    export_lframe = tk.LabelFrame(tab2, text="Properties to export", padx=8, pady=4)
+    export_lframe.pack(fill="x", padx=10, pady=(0, 4))
+
+    xfm_export_geom = tk.BooleanVar(value=bool(xfm_s.get("export_geom", True)))
+    tk.Checkbutton(export_lframe, text="Export geometry (X, Y, Z)",
+                   variable=xfm_export_geom).pack(anchor="w", pady=1)
+
+    xfm_export_area = tk.BooleanVar(value=bool(xfm_s.get("export_area", True)))
+    tk.Checkbutton(export_lframe, text="Export cell area",
+                   variable=xfm_export_area).pack(anchor="w", pady=1)
+
+    xfm_export_power = tk.BooleanVar(value=bool(xfm_s.get("export_power", True)))
+    tk.Checkbutton(export_lframe, text="Export power (Deposited_Power_W)",
+                   variable=xfm_export_power).pack(anchor="w", pady=1)
+
+    xfm_export_pload = tk.BooleanVar(value=bool(xfm_s.get("export_pload", True)))
+    tk.Checkbutton(export_lframe, text="Export power load (Power_Density_W_m2)",
+                   variable=xfm_export_pload).pack(anchor="w", pady=1)
+
+    xfm_mult_frm = tk.Frame(tab2)
+    xfm_mult_frm.pack(fill="x", padx=10, pady=(4, 2))
+    tk.Label(xfm_mult_frm, text="Multiplication factor:",
+             font=("Segoe UI", 9, "bold")).pack(side="left")
+    xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult", "1.0")))
+    tk.Entry(xfm_mult_frm, textvariable=xfm_mult_var, width=10).pack(side="left", padx=(8, 0))
+    tk.Label(xfm_mult_frm, text="(applied to power & power load)",
+             fg="#64748b").pack(side="left", padx=(8, 0))
+
+    xfm_ignore_zeros = tk.BooleanVar(value=bool(xfm_s.get("ignore_zeros", False)))
+    tk.Checkbutton(tab2, text="Ignore zero-valued rows",
+                   variable=xfm_ignore_zeros).pack(anchor="w", padx=16, pady=(4, 4))
+
     # ── Per-tab Run buttons ───────────────────────────────────────────────────
     tab1_btn_frame = tk.Frame(tab1)
     tab1_btn_frame.pack(pady=(6, 10))
@@ -431,13 +478,32 @@ def run_gui():
         except ValueError:
             messagebox.showerror("Invalid input", "Transform parameters must be numeric.")
             return None
+        try:
+            mult = float(xfm_mult_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Multiplication factor must be a number.")
+            return None
+        exp_geom  = xfm_export_geom.get()
+        exp_area  = xfm_export_area.get()
+        exp_power = xfm_export_power.get()
+        exp_pload = xfm_export_pload.get()
+        if not any([exp_geom, exp_area, exp_power, exp_pload]):
+            messagebox.showwarning("Nothing selected",
+                                   "Select at least one property to export.")
+            return None
         unit = xfm_unit_var.get()
         return {
-            "angle_deg": angle,
+            "angle_deg":    angle,
             "dx": dx, "dy": dy, "dz": dz,
-            "unit": unit,
-            "pattern":     xfm_pattern_var.get() or "smoothed_results_*.vtp",
-            "name_filter": xfm_filter_var.get().strip(),
+            "unit":         unit,
+            "pattern":      xfm_pattern_var.get() or "smoothed_results_*.vtp",
+            "name_filter":  xfm_filter_var.get().strip(),
+            "export_geom":  exp_geom,
+            "export_area":  exp_area,
+            "export_power": exp_power,
+            "export_pload": exp_pload,
+            "mult":         mult,
+            "ignore_zeros": xfm_ignore_zeros.get(),
         }
 
     def _launch_processing(cfg: dict) -> None:
@@ -642,12 +708,18 @@ def run_transform(
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    pattern     = xfm_params["pattern"]
-    name_filter = xfm_params["name_filter"]
-    angle_deg   = xfm_params["angle_deg"]
-    dx          = xfm_params["dx"]
-    dy          = xfm_params["dy"]
-    dz          = xfm_params["dz"]
+    pattern       = xfm_params["pattern"]
+    name_filter   = xfm_params["name_filter"]
+    angle_deg     = xfm_params["angle_deg"]
+    dx            = xfm_params["dx"]
+    dy            = xfm_params["dy"]
+    dz            = xfm_params["dz"]
+    export_geom   = xfm_params.get("export_geom",  True)
+    export_area   = xfm_params.get("export_area",  True)
+    export_power  = xfm_params.get("export_power", True)
+    export_pload  = xfm_params.get("export_pload", True)
+    mult          = float(xfm_params.get("mult", 1.0))
+    ignore_zeros  = xfm_params.get("ignore_zeros", False)
 
     # Expand OUTPUT_* dirs
     expanded = []
@@ -699,7 +771,15 @@ def run_transform(
             try:
                 # Step 1: extract per-cell data from .vtp → intermediate CSV
                 tmp_csv = out_path.with_suffix(".tmp.csv")
-                extract_cells_to_csv(str(filepath), str(tmp_csv))
+                extract_cells_to_csv(
+                    str(filepath), str(tmp_csv),
+                    export_geom=export_geom,
+                    export_area=export_area,
+                    export_power=export_power,
+                    export_pload=export_pload,
+                    mult=mult,
+                    ignore_zeros=ignore_zeros,
+                )
                 log(f"  Extracted cells → {tmp_csv.name}")
 
                 # Step 2: apply coordinate transform → final CSV

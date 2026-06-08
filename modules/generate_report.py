@@ -46,12 +46,16 @@ except (ImportError, AttributeError):
 DEFAULT_REPORT_FILENAME = "summary_report.csv"
 
 
-def extract_cells_to_csv(input_path, output_path):
+def extract_cells_to_csv(input_path, output_path,
+                          export_geom=True, export_area=True,
+                          export_power=True, export_pload=True,
+                          mult=1.0, ignore_zeros=False):
     """
     Extract per-cell data from a single .vtp/.vtm file and write to a CSV.
     Uses vtk directly (no pyvista dependency).
 
-    Output columns: X, Y, Z, Area, Deposited_Power_W, Power_Density_W_m2
+    Output columns (all enabled by default):
+      X, Y, Z, Area, Deposited_Power_W, Power_Density_W_m2
     where X/Y/Z are cell-centre coordinates.
 
     Parameters
@@ -60,6 +64,18 @@ def extract_cells_to_csv(input_path, output_path):
         Path to the .vtp or .vtm file to read.
     output_path : str
         Path for the output CSV file.
+    export_geom : bool
+        Include X, Y, Z columns.
+    export_area : bool
+        Include Area column.
+    export_power : bool
+        Include Deposited_Power_W column.
+    export_pload : bool
+        Include Power_Density_W_m2 column.
+    mult : float
+        Multiplication factor applied to power and power-load values.
+    ignore_zeros : bool
+        When True, rows where all selected power columns are ≤ 1e-12 are skipped.
 
     Returns
     -------
@@ -116,10 +132,20 @@ def extract_cells_to_csv(input_path, output_path):
     dep_arr  = cd.GetArray("Deposited_Power_W")
     dens_arr = cd.GetArray("Power_Density_W_m2")
 
+    header = []
+    if export_geom:
+        header += ["X", "Y", "Z"]
+    if export_area:
+        header += ["Area"]
+    if export_power:
+        header += ["Deposited_Power_W"]
+    if export_pload:
+        header += ["Power_Density_W_m2"]
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["X", "Y", "Z", "Area", "Deposited_Power_W", "Power_Density_W_m2"])
+        writer.writerow(header)
         for i in range(n):
             x, y, z = cc_pts.GetPoint(i)
             area = float(area_arr.GetValue(i)) if area_arr else 0.0
@@ -130,14 +156,30 @@ def extract_cells_to_csv(input_path, output_path):
                 dens = dep / area
             else:
                 dens = 0.0
-            writer.writerow([
-                f"{x:.12g}",
-                f"{y:.12g}",
-                f"{z:.12g}",
-                f"{area:.6e}",
-                f"{dep:.6e}",
-                f"{dens:.6e}",
-            ])
+
+            dep_scaled  = dep  * mult
+            dens_scaled = dens * mult
+
+            # Skip zero-valued rows if requested
+            if ignore_zeros:
+                power_vals = []
+                if export_power:
+                    power_vals.append(dep_scaled)
+                if export_pload:
+                    power_vals.append(dens_scaled)
+                if power_vals and all(abs(v) <= 1e-12 for v in power_vals):
+                    continue
+
+            row = []
+            if export_geom:
+                row += [f"{x:.12g}", f"{y:.12g}", f"{z:.12g}"]
+            if export_area:
+                row += [f"{area:.6e}"]
+            if export_power:
+                row += [f"{dep_scaled:.6e}"]
+            if export_pload:
+                row += [f"{dens_scaled:.6e}"]
+            writer.writerow(row)
 
     return output_path
 
