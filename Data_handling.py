@@ -36,7 +36,8 @@ except ImportError:
     )
 
 from modules.snapshot_max import save_max_snapshot
-from modules.transform_vtp import transform_vtp_file, MM_TO_M
+from modules.generate_report import extract_cells_to_csv
+from modules import transform_reference_frame as _trf
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARRAY_NAME    = "Power_Density_W_m2"
@@ -605,7 +606,13 @@ def run_transform(
     log,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Apply coordinate transform to all matching .vtp files and write output."""
+    """
+    For each matching .vtp file:
+      1. Extract per-cell data (X, Y, Z, Area, Deposited_Power_W,
+         Power_Density_W_m2) to an intermediate CSV via generate_report.
+      2. Transform the X/Y/Z coordinates using transform_reference_frame
+         and write the final CSV to the output folder.
+    """
 
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -661,11 +668,29 @@ def run_transform(
         for filepath in files:
             if stopped():
                 break
-            out_path = dest_dir / filepath.name
+            csv_stem = filepath.stem + ".csv"
+            out_path = dest_dir / csv_stem
             log(f"\n[{filepath.name}]")
             try:
-                transform_vtp_file(filepath, out_path, angle_deg, dx, dy, dz)
-                log(f"  → {out_path}")
+                # Step 1: extract per-cell data from .vtp → intermediate CSV
+                tmp_csv = out_path.with_suffix(".tmp.csv")
+                extract_cells_to_csv(str(filepath), str(tmp_csv))
+                log(f"  Extracted cells → {tmp_csv.name}")
+
+                # Step 2: apply coordinate transform → final CSV
+                _trf.process_file(
+                    input_path=tmp_csv,
+                    output_path=out_path,
+                    x_col=None,
+                    y_col=None,
+                    z_col=None,
+                    angle_deg=angle_deg,
+                    dx=dx,
+                    dy=dy,
+                    dz=dz,
+                )
+                tmp_csv.unlink(missing_ok=True)
+                log(f"  Transformed CSV → {out_path}")
                 total += 1
             except Exception as exc:
                 log(f"  [ERROR] {exc}")

@@ -46,6 +46,102 @@ except ImportError:
 DEFAULT_REPORT_FILENAME = "summary_report.csv"
 
 
+def extract_cells_to_csv(input_path, output_path):
+    """
+    Extract per-cell data from a single .vtp/.vtm file and write to a CSV.
+    Uses vtk directly (no pyvista dependency).
+
+    Output columns: X, Y, Z, Area, Deposited_Power_W, Power_Density_W_m2
+    where X/Y/Z are cell-centre coordinates.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to the .vtp or .vtm file to read.
+    output_path : str
+        Path for the output CSV file.
+
+    Returns
+    -------
+    output_path : str
+        The path written, same as the argument.
+    """
+    import vtk
+
+    ext = os.path.splitext(str(input_path))[1].lower()
+    if ext == ".vtm":
+        reader = vtk.vtkXMLMultiBlockDataReader()
+    else:
+        reader = vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(str(input_path))
+    reader.Update()
+    raw = reader.GetOutput()
+
+    # Flatten MultiBlock into a single PolyData
+    if isinstance(raw, vtk.vtkMultiBlockDataSet):
+        appender = vtk.vtkAppendPolyData()
+        it = raw.NewIterator()
+        it.InitTraversal()
+        while not it.IsDoneWithTraversal():
+            block = it.GetCurrentDataObject()
+            if isinstance(block, vtk.vtkPolyData):
+                appender.AddInputData(block)
+            it.GoToNextItem()
+        appender.Update()
+        mesh = appender.GetOutput()
+    else:
+        mesh = raw
+
+    n = mesh.GetNumberOfCells()
+    if n == 0:
+        raise ValueError(f"No cells found in '{input_path}'")
+
+    # Cell centres
+    cc_filter = vtk.vtkCellCenters()
+    cc_filter.SetInputData(mesh)
+    cc_filter.Update()
+    cc_pts = cc_filter.GetOutput().GetPoints()
+
+    # Cell areas
+    csf = vtk.vtkCellSizeFilter()
+    csf.SetInputData(mesh)
+    csf.ComputeAreaOn()
+    csf.ComputeLengthOff()
+    csf.ComputeVolumeOff()
+    csf.ComputeVertexCountOff()
+    csf.Update()
+    area_arr = csf.GetOutput().GetCellData().GetArray("Area")
+
+    cd = mesh.GetCellData()
+    dep_arr  = cd.GetArray("Deposited_Power_W")
+    dens_arr = cd.GetArray("Power_Density_W_m2")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["X", "Y", "Z", "Area", "Deposited_Power_W", "Power_Density_W_m2"])
+        for i in range(n):
+            x, y, z = cc_pts.GetPoint(i)
+            area = float(area_arr.GetValue(i)) if area_arr else 0.0
+            dep  = float(dep_arr.GetValue(i))  if dep_arr  else 0.0
+            if dens_arr:
+                dens = float(dens_arr.GetValue(i))
+            elif area > 0.0:
+                dens = dep / area
+            else:
+                dens = 0.0
+            writer.writerow([
+                f"{x:.12g}",
+                f"{y:.12g}",
+                f"{z:.12g}",
+                f"{area:.6e}",
+                f"{dep:.6e}",
+                f"{dens:.6e}",
+            ])
+
+    return output_path
+
+
 def generate_summary_csv(input_dir, output_filename=None):
     """
     Reads all .vtp/.vtm files in *input_dir*, extracts total deposited power
