@@ -77,6 +77,7 @@ def process_file(
     dx: float,
     dy: float,
     dz: float,
+    coord_scale: float = 1.0,
 ) -> None:
     header_line_index, columns = find_header_line_and_columns(input_path)
 
@@ -127,9 +128,9 @@ def process_file(
                 dz=dz,
             )
 
-            row[x_col] = f"{x_new:.12g}"
-            row[y_col] = f"{y_new:.12g}"
-            row[z_col] = f"{z_new:.12g}"
+            row[x_col] = f"{x_new * coord_scale:.12g}"
+            row[y_col] = f"{y_new * coord_scale:.12g}"
+            row[z_col] = f"{z_new * coord_scale:.12g}"
             writer.writerow(row)
 
 

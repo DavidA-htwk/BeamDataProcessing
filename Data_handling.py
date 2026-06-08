@@ -169,6 +169,7 @@ def run_gui():
             "save_snapshots": snap_var.get(),
             "transform": {
                 "unit":         xfm_unit_var.get(),
+                "output_unit":  xfm_out_unit_var.get(),
                 "angle_deg":    xfm_angle_var.get(),
                 "dx":           xfm_dx_var.get(),
                 "dy":           xfm_dy_var.get(),
@@ -197,6 +198,7 @@ def run_gui():
         xfm = loaded.get("transform", {})
         if xfm:
             xfm_unit_var.set(xfm.get("unit", "mm"))
+            xfm_out_unit_var.set(xfm.get("output_unit", xfm.get("unit", "mm")))
             xfm_angle_var.set(xfm.get("angle_deg", "-116.0"))
             xfm_dx_var.set(xfm.get("dx", "11410.436"))
             xfm_dy_var.set(xfm.get("dy", "26617.882"))
@@ -262,12 +264,23 @@ def run_gui():
     # ── Unit ──────────────────────────────────────────────────────────────────
     unit_frame = tk.Frame(tab2)
     unit_frame.pack(fill="x", padx=10, pady=(4, 0))
-    tk.Label(unit_frame, text="File coordinate unit:", anchor="w").pack(side="left")
+    tk.Label(unit_frame, text="Input coordinate unit:", anchor="w", width=22).pack(side="left")
     xfm_unit_var = tk.StringVar(value=xfm_s.get("unit", "m"))
     for unit_label in ("mm", "m"):
         tk.Radiobutton(
             unit_frame, text=unit_label, variable=xfm_unit_var, value=unit_label
         ).pack(side="left", padx=4)
+
+    out_unit_frame = tk.Frame(tab2)
+    out_unit_frame.pack(fill="x", padx=10, pady=(2, 0))
+    tk.Label(out_unit_frame, text="Output coordinate unit:", anchor="w", width=22).pack(side="left")
+    xfm_out_unit_var = tk.StringVar(value=xfm_s.get("output_unit", xfm_s.get("unit", "m")))
+    for unit_label in ("mm", "m"):
+        tk.Radiobutton(
+            out_unit_frame, text=unit_label, variable=xfm_out_unit_var, value=unit_label
+        ).pack(side="left", padx=4)
+    tk.Label(out_unit_frame, text="(no conversion = same as input)",
+             fg="#888888").pack(side="left", padx=(8, 0))
 
     # ── Transform parameters ──────────────────────────────────────────────────
     params_frame = tk.LabelFrame(tab2, text="Transform parameters", padx=8, pady=6)
@@ -492,10 +505,16 @@ def run_gui():
                                    "Select at least one property to export.")
             return None
         unit = xfm_unit_var.get()
+        output_unit = xfm_out_unit_var.get()
+        # Scale factor: convert from input_unit to output_unit
+        unit_to_m = {"m": 1.0, "mm": 0.001}
+        coord_scale = unit_to_m[unit] / unit_to_m[output_unit]
         return {
             "angle_deg":    angle,
             "dx": dx, "dy": dy, "dz": dz,
             "unit":         unit,
+            "output_unit":  output_unit,
+            "coord_scale":  coord_scale,
             "pattern":      xfm_pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":  xfm_filter_var.get().strip(),
             "export_geom":  exp_geom,
@@ -720,6 +739,7 @@ def run_transform(
     export_pload  = xfm_params.get("export_pload", True)
     mult          = float(xfm_params.get("mult", 1.0))
     ignore_zeros  = xfm_params.get("ignore_zeros", False)
+    coord_scale   = float(xfm_params.get("coord_scale", 1.0))
 
     # Expand OUTPUT_* dirs
     expanded = []
@@ -793,6 +813,7 @@ def run_transform(
                     dx=dx,
                     dy=dy,
                     dz=dz,
+                    coord_scale=coord_scale,
                 )
                 tmp_csv.unlink(missing_ok=True)
                 log(f"  Transformed CSV → {out_path}")
