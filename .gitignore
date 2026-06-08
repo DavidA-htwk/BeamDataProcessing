@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Local settings / secrets
+data_handling_settings.json
+
+# Output folders (potentially large)
+output/
+input/
+
+# Windows
+*.lnk
+Thumbs.db
+desktop.ini
+
+# Excel / temp
+~$*.xlsx
+*.xlsb
