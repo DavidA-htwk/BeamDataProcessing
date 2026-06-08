@@ -280,6 +280,31 @@ def run_gui():
     _param_row(params_frame, 2, "Translate Y:",      xfm_dy_var,    "(same unit as files)")
     _param_row(params_frame, 3, "Translate Z:",      xfm_dz_var,    "(same unit as files)")
 
+    # ── Coordinate diagram (inside the LabelFrame, right column) ─────────────
+    _coord_img_path = str(Path(__file__).resolve().parent / "coordinates.png")
+    _coord_photo = None
+    try:
+        from PIL import Image as _PILImage, ImageTk as _PILImageTk
+        _pil = _PILImage.open(_coord_img_path)
+        # Scale to fit the 4-row height of the LabelFrame (~110 px); width proportional
+        _target_h = 110
+        _target_w = int(_target_h * _pil.width / _pil.height)
+        _pil = _pil.resize((_target_w, _target_h), _PILImage.LANCZOS)
+        _coord_photo = _PILImageTk.PhotoImage(_pil)
+    except Exception:
+        try:
+            _raw = tk.PhotoImage(file=_coord_img_path)
+            # subsample so height lands around 110 px
+            _factor = max(1, _raw.height() // 110)
+            _coord_photo = _raw.subsample(_factor, _factor)
+        except Exception:
+            _coord_photo = None
+
+    if _coord_photo is not None:
+        _img_lbl = tk.Label(params_frame, image=_coord_photo)
+        _img_lbl.image = _coord_photo   # keep reference
+        _img_lbl.grid(row=0, column=3, rowspan=4, padx=(12, 4), pady=2, sticky="ns")
+
     unit_note = tk.Label(
         tab2,
         text="Note: default values are in metres (m). If files are in mm, switch unit to 'mm'\n"

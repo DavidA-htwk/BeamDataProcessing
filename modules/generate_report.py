@@ -40,7 +40,7 @@ import argparse
 try:
     import config
     DEFAULT_OUTPUT_DIR = config.DETAILED_OUTPUT_DIR
-except ImportError:
+except (ImportError, AttributeError):
     DEFAULT_OUTPUT_DIR = "OUTPUT"
 
 DEFAULT_REPORT_FILENAME = "summary_report.csv"
