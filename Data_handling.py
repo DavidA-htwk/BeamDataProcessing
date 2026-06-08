@@ -35,15 +35,15 @@ except ImportError:
         "  Run with pvpython, or:  pip install vtk numpy"
     )
 
-from snapshot_max import save_max_snapshot
-from transform_vtp import transform_vtp_file, MM_TO_M
+from modules.snapshot_max import save_max_snapshot
+from modules.transform_vtp import transform_vtp_file, MM_TO_M
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARRAY_NAME    = "Power_Density_W_m2"
 FEATURE_ANGLE = 30.0   # degrees — matches Smart_Smooth_EDGE.py
 
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "data_handling_settings.json"
+SETTINGS_FILE = Path(__file__).resolve().parent / "config" / "data_handling_settings.json"
 
 
 def load_settings() -> dict:
