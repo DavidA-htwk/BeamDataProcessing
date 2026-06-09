@@ -310,6 +310,8 @@ def run_gui():
     xfm_dz_var    = tk.StringVar(value=xfm_s.get("dz",        str(_trf.DEFAULT_DZ)))
     xfm_unit_var  = tk.StringVar(value=xfm_s.get("unit", "m"))
 
+    xfm_summary_var = tk.StringVar(value="")
+
     def on_preset_selected(event=None):
         name = xfm_preset_var.get()
         if name not in _trf.TRANSFORM_PRESETS:
@@ -320,6 +322,9 @@ def run_gui():
         xfm_dy_var.set(str(p["dy"]))
         xfm_dz_var.set(str(p["dz"]))
         xfm_unit_var.set(p["unit"])
+        xfm_summary_var.set(
+            f"θz = {p['angle_deg']}°   Δx = {p['dx']} m   Δy = {p['dy']} m   Δz = {p['dz']} m"
+        )
 
     on_preset_selected()  # sync hidden vars with selected preset on startup
 
@@ -359,6 +364,12 @@ def run_gui():
             _radio_frame, text=name, variable=xfm_preset_var, value=name,
             command=on_preset_selected,
         ).grid(row=2, column=col + 1, sticky="w", padx=(0, 10))
+
+    tk.Label(_radio_frame, text="", width=10).grid(row=3, column=0)
+    tk.Label(
+        _radio_frame, textvariable=xfm_summary_var,
+        fg="#555555", font=("Consolas", 8), anchor="w",
+    ).grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
     # Coordinate image on the right inside preset_lframe
     _coord_img_path = str(Path(__file__).resolve().parent / "coordinates.png")
