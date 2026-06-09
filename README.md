@@ -6,11 +6,30 @@ A batch processing tool for `.vtp` files produced by **BeamOnTarget** (https://g
 
 ## Features
 
-- **Edge smoothing** — applies the Smart-Smooth-EDGE algorithm (single or multi-pass) restricted to boundary and feature-edge cells, preserving interior geometry
-- **Max comparison** — records the peak `Power_Density_W_m2` before and after smoothing for every file in a CSV log
-- **Snapshots** — renders an offscreen PNG of the cell with the highest scalar value, coloured by a blue→red heat map
-- **Coordinate transform** — extracts per-cell geometry and scalar data from `.vtp` files, applies a Z-rotation + translation, and exports a transformed CSV
-- **Persistent config** — all settings are saved to and loaded from a `.json` file
+- **Edge smoothing** 
+- **Max comparison** 
+- **Snapshots** 
+- **Coordinate transform** 
+- **Uses config** 
+
+---
+
+## Project Structure
+
+```
+BeamDataProcessing/
+├── Data_handling.py          # Main entry point — GUI + processing pipeline
+├── requirements.txt
+├── install.bat               # Windows one-click setup
+├── install.sh                # Linux/macOS setup
+├── coordinates.png           # Coordinate system reference image
+└── modules/
+    ├── snapshot_max.py           # Offscreen VTK PNG renderer
+    ├── generate_report.py        # Extracts per-cell data to CSV
+    ├── transform_reference_frame.py  # Applies rotation + translation to CSV
+    ├── transform_vtp.py          # VTP-level transform utilities
+    └── Extract_results.py        # Result extraction helpers
+```
 
 ---
 
@@ -41,6 +60,7 @@ pip install -r requirements.txt
 **Every subsequent session:**
 
 # Launch the GUI
+```powershell
 python .\Data_handling.py
 ```
 
@@ -102,24 +122,7 @@ The tool automatically detects case and scenario names from the folder hierarchy
 
 ---
 
-## Project Structure
 
-```
-BeamDataProcessing/
-├── Data_handling.py          # Main entry point — GUI + processing pipeline
-├── requirements.txt
-├── install.bat               # Windows one-click setup
-├── install.sh                # Linux/macOS setup
-├── coordinates.png           # Coordinate system reference image
-└── modules/
-    ├── snapshot_max.py           # Offscreen VTK PNG renderer
-    ├── generate_report.py        # Extracts per-cell data to CSV
-    ├── transform_reference_frame.py  # Applies rotation + translation to CSV
-    ├── transform_vtp.py          # VTP-level transform utilities
-    └── Extract_results.py        # Result extraction helpers
-```
-
----
 
 ## Config File
 
