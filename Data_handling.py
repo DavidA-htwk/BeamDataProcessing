@@ -773,20 +773,29 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                                    polydata, max_val, polydata, max_val))
         else:
             n_loaded = len(loaded)
-            log(f"\n[2/3] Smoothing {n_loaded} file(s) ({smooth_iterations} iteration(s) each)...")
+            log(f"\n[2/3] Smoothing {n_loaded} file(s) "
+                f"({smooth_iterations} iteration(s), {n_workers} workers)...")
             t0_smooth = time.perf_counter()
-            for i, item in enumerate(loaded, 1):
-                if stopped():
-                    break
-                filepath, output_name, case, scenario, polydata, max_before = item
-                t_file = time.perf_counter()
-                smoothed  = apply_edge_smooth(polydata, n_iter=smooth_iterations)
-                max_after = find_max(smoothed, ARRAY_NAME)
-                elapsed_file = time.perf_counter() - t_file
-                processed.append((filepath, output_name, case, scenario,
-                                   polydata, max_before, smoothed, max_after))
-                log(f"  [{i}/{n_loaded}] {filepath.name}  ({elapsed_file:.1f}s)  "
-                    f"before={max_before:.4g}  after={max_after:.4g}")
+            smooth_args = [
+                (filepath, output_name, case, scenario, polydata, max_before, smooth_iterations)
+                for filepath, output_name, case, scenario, polydata, max_before in loaded
+            ]
+            with ThreadPool(processes=n_workers) as pool:
+                for completed, result in enumerate(
+                        pool.imap_unordered(_smooth_one_file, smooth_args), 1):
+                    if stopped():
+                        pool.terminate()
+                        break
+                    elapsed = time.perf_counter() - t0_smooth
+                    if isinstance(result, Exception):
+                        log(f"  [{completed}/{n_loaded}] ERROR: {result}")
+                        continue
+                    (filepath, output_name, case, scenario,
+                     polydata, max_before, smoothed, max_after) = result
+                    processed.append(result)
+                    log(f"  [{completed}/{n_loaded}] {filepath.name}  "
+                        f"(elapsed: {elapsed:.1f}s)  "
+                        f"before={max_before:.4g}  after={max_after:.4g}")
             log(f"  Smoothing done in {time.perf_counter()-t0_smooth:.1f}s")
 
         # ── Write CSV rows ────────────────────────────────────────────────
@@ -1045,6 +1054,19 @@ def _load_one_file(args: tuple) -> tuple:
         polydata = read_vtp(str(filepath))
         max_val  = find_max(polydata, ARRAY_NAME)
         return filepath, output_name, case, scenario, polydata, max_val
+    except Exception as exc:
+        return exc
+
+
+def _smooth_one_file(args: tuple) -> tuple:
+    """Apply edge smoothing to one loaded file.  Called from a thread pool.
+    apply_edge_smooth is pure CPU (numpy + VTK geometry), no GPU — safe to parallelise.
+    Returns the full processed tuple, or an Exception."""
+    try:
+        filepath, output_name, case, scenario, polydata, max_before, n_iter = args
+        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter)
+        max_after = find_max(smoothed, ARRAY_NAME)
+        return filepath, output_name, case, scenario, polydata, max_before, smoothed, max_after
     except Exception as exc:
         return exc
 

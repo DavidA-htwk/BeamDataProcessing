@@ -138,21 +138,23 @@ def save_max_snapshot(
     actor.SetMapper(mapper)
 
     # ── Scalar bar ────────────────────────────────────────────────────────────
+    # Height 0.44 + bottom at 0.25 = top at 0.69.
+    # The top tick label renders ~0.04 above the bar edge, so the background
+    # panel (which ends at 0.69) needs a gap -- we leave room by starting at
+    # 0.22 and keeping height 0.44 so the panel top is at 0.66 and the label
+    # at 0.69 still sits inside the panel's visual extent.
+    # Simplest reliable fix: use SetTextPad to add internal padding.
     scalar_bar = vtk.vtkScalarBarActor()
     scalar_bar.SetLookupTable(lut)
-    scalar_bar.SetTitle(array_name)
+    scalar_bar.SetTitle("")              # title drawn as a separate rotated actor below
     scalar_bar.SetNumberOfLabels(5)
-    scalar_bar.SetWidth(0.10)
-    scalar_bar.SetHeight(0.6)
-    scalar_bar.SetPosition(0.84, 0.2)
-
-    # Black text for title and labels (white background)
-    title_prop = scalar_bar.GetTitleTextProperty()
-    title_prop.SetColor(0.0, 0.0, 0.0)
-    title_prop.SetFontSize(20)
-    title_prop.SetFontFamilyToTimes()
-    title_prop.ItalicOn()
-    title_prop.BoldOff()
+    scalar_bar.SetWidth(0.09)
+    scalar_bar.SetHeight(0.50)
+    scalar_bar.SetPosition(0.82, 0.22)
+    try:
+        scalar_bar.SetTextPad(4)         # pixels of padding inside background (VTK >= 9.1)
+    except AttributeError:
+        pass
 
     label_prop = scalar_bar.GetLabelTextProperty()
     label_prop.SetColor(0.0, 0.0, 0.0)
@@ -160,31 +162,50 @@ def save_max_snapshot(
     label_prop.SetFontFamilyToTimes()
     label_prop.ItalicOff()
     label_prop.BoldOff()
-
-    # Honour the font sizes above instead of auto-scaling them to fit
     scalar_bar.UnconstrainedFontSizeOn()
 
-    # Push title up so it sits above the bar instead of overlapping it
-    scalar_bar.SetVerticalTitleSeparation(8)
+    # Frosted white panel behind bar + labels
+    scalar_bar.DrawBackgroundOn()
+    scalar_bar.DrawFrameOn()
+    sb_bg = scalar_bar.GetBackgroundProperty()
+    sb_bg.SetColor(1.0, 1.0, 1.0)
+    sb_bg.SetOpacity(0.80)
+    sb_frame = scalar_bar.GetFrameProperty()
+    sb_frame.SetColor(0.6, 0.6, 0.6)
+    sb_frame.SetOpacity(1.0)
 
-    # ── Top-right legend: violet dot + max value ───────────────────────────────
-    legend = vtk.vtkLegendBoxActor()
-    legend.SetNumberOfEntries(1)
-    legend_sphere = vtk.vtkSphereSource()
-    legend_sphere.SetPhiResolution(12)
-    legend_sphere.SetThetaResolution(12)
-    legend_sphere.Update()
-    legend.SetEntry(0, legend_sphere.GetOutput(), f"Max: {max_val:.6g}", [0.498, 0.0, 1.0])
-    legend.GetEntryTextProperty().SetColor(0.0, 0.0, 0.0)
-    legend.GetEntryTextProperty().SetFontSize(13)
-    legend.GetEntryTextProperty().SetFontFamilyToTimes()
-    legend.GetEntryTextProperty().ItalicOff()
-    legend.GetEntryTextProperty().BoldOff()
-    legend.SetPosition(0.72, 0.88)
-    legend.SetPosition2(0.27, 0.09)
-    legend.BorderOff()
-    legend.SetBackgroundColor(1.0, 1.0, 1.0)
-    legend.SetBackgroundOpacity(1.0)
+    # ── Scalar bar title: 90° rotated, anchored at bar bottom ─────────────────
+    # vtkTextActor with SetBackgroundColor gives a reliable frosted rectangle.
+    # Position x is just right of the bar+label column; y matches bar bottom.
+    sbar_title = vtk.vtkTextActor()
+    sbar_title.SetInput(array_name)
+    sbt = sbar_title.GetTextProperty()
+    sbt.SetColor(0.0, 0.0, 0.0)
+    sbt.SetFontSize(18)
+    sbt.SetFontFamilyToTimes()
+    sbt.ItalicOn()
+    sbt.BoldOff()
+    sbt.SetOrientation(90)
+    sbt.SetBackgroundColor(1.0, 1.0, 1.0)
+    sbt.SetBackgroundOpacity(0.80)
+    sbar_title.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+    sbar_title.SetPosition(0.96, 0.22)   # matches bar bottom
+
+    # ── Max value: plain vtkTextActor (reliable background) ───────────────────
+    # vtkLegendBoxActor background is unreliable; vtkTextActor.GetTextProperty
+    # SetBackgroundColor/Opacity is composited correctly in offscreen renders.
+    max_label = vtk.vtkTextActor()
+    max_label.SetInput(f"[*] Max: {max_val:.6g}")  # [*] = ASCII stand-in for the max marker
+    ml = max_label.GetTextProperty()
+    ml.SetColor(0.498, 0.0, 1.0)          # violet to match sphere
+    ml.SetFontSize(18)
+    ml.SetFontFamilyToTimes()
+    ml.BoldOn()
+    ml.ItalicOff()
+    ml.SetBackgroundColor(1.0, 1.0, 1.0)
+    ml.SetBackgroundOpacity(0.85)
+    max_label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+    max_label.SetPosition(0.02, 0.94)
 
     # ── Max-point marker (violet sphere) ─────────────────────────────────────────────────
     sphere_src = vtk.vtkSphereSource()
@@ -203,7 +224,8 @@ def save_max_snapshot(
     renderer.AddActor(actor)
     renderer.AddActor(sphere_actor)
     renderer.AddActor2D(scalar_bar)
-    renderer.AddActor2D(legend)
+    renderer.AddActor2D(sbar_title)
+    renderer.AddActor2D(max_label)
 
     # ── Camera placement ──────────────────────────────────────────────────────
     if diag is None:
