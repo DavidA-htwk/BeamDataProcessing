@@ -242,6 +242,7 @@ def run_gui():
     def on_save_cfg():
         path = filedialog.asksaveasfilename(
             title="Save config as…",
+            initialdir=str(Path(cfg_path_var.get()).parent),
             initialfile=Path(cfg_path_var.get()).name,
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
@@ -902,7 +903,8 @@ def run_transform(
     script_dir = Path(__file__).resolve().parent
     out_root = Path(output_folder) if output_folder else script_dir / "output"
 
-    total = 0
+    # ── Collect all work items across every folder ────────────────────────────
+    all_xfm_args = []
     for folder in expanded:
         if stopped():
             break
@@ -918,54 +920,31 @@ def run_transform(
             log(f"[SKIP] No files matching '{pattern}'{note} in:\n  {folder}")
             continue
 
-        log(f"\nCase     : {folder_case}")
-        log(f"Scenario : {folder_scenario}")
-        log(f"Files    : {len(files)}")
-        log("=" * 80)
-
+        log(f"  {folder_case}/{folder_scenario}: {len(files)} file(s)")
         for filepath in files:
-            if stopped():
-                break
-            # Derive case and scenario from each file's parent path so that
-            # intermediate grouping folders (e.g. DNB_ALL) are skipped.
             _, case, scenario = extract_case_scenario(str(filepath.parent))
             dest_dir = out_root / "transformed" / output_name / case
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            csv_stem = filepath.stem + ".csv"
-            out_path = dest_dir / csv_stem
-            log(f"\n[{filepath.name}]")
-            try:
-                # Step 1: extract per-cell data from .vtp → intermediate CSV
-                tmp_csv = out_path.with_suffix(".tmp.csv")
-                extract_cells_to_csv(
-                    str(filepath), str(tmp_csv),
-                    export_geom=export_geom,
-                    export_area=export_area,
-                    export_power=export_power,
-                    export_pload=export_pload,
-                    mult=mult,
-                    ignore_zeros=ignore_zeros,
-                )
-                log(f"  Extracted cells → {tmp_csv.name}")
+            all_xfm_args.append((filepath, dest_dir, scenario, xfm_params))
 
-                # Step 2: apply coordinate transform → final CSV
-                _trf.process_file(
-                    input_path=tmp_csv,
-                    output_path=out_path,
-                    x_col=None,
-                    y_col=None,
-                    z_col=None,
-                    angle_deg=angle_deg,
-                    dx=dx,
-                    dy=dy,
-                    dz=dz,
-                    coord_scale=coord_scale,
-                )
-                tmp_csv.unlink(missing_ok=True)
-                log(f"  Transformed CSV → {out_path}")
-                total += 1
-            except Exception as exc:
-                log(f"  [ERROR] {exc}")
+    # ── Run all files in one shared pool ─────────────────────────────────────
+    n_total   = len(all_xfm_args)
+    n_workers = min(os.cpu_count() or 4, n_total, 10)
+    log(f"\nTransforming {n_total} file(s) total ({n_workers} workers)...")
+    log("=" * 80)
+
+    total = 0
+    with ThreadPool(processes=n_workers) as pool:
+        for completed, result in enumerate(
+                pool.imap_unordered(_transform_one_file, all_xfm_args), 1):
+            if stopped():
+                pool.terminate()
+                break
+            if isinstance(result, Exception):
+                log(f"  [{completed}/{n_total}] ERROR: {result}")
+                continue
+            filepath, out_path, _ = result
+            log(f"  [{completed}/{n_total}] {filepath.name} -> {out_path.name}")
+            total += 1
 
     log("\n" + "=" * 80)
     if stopped():
@@ -1071,6 +1050,50 @@ def _smooth_one_file(args: tuple) -> tuple:
         return exc
 
 
+def _transform_one_file(args: tuple) -> tuple:
+    """Extract cells to CSV and apply coordinate transform for one VTP file.
+    Pure I/O + CPU, no shared state — safe to run in a thread pool.
+    Returns (filepath, out_path, log_lines) or an Exception."""
+    try:
+        (filepath, dest_dir, scenario, xfm_params) = args
+        angle_deg    = xfm_params["angle_deg"]
+        dx           = xfm_params["dx"]
+        dy           = xfm_params["dy"]
+        dz           = xfm_params["dz"]
+        export_geom  = xfm_params.get("export_geom",  True)
+        export_area  = xfm_params.get("export_area",  True)
+        export_power = xfm_params.get("export_power", True)
+        export_pload = xfm_params.get("export_pload", True)
+        mult         = float(xfm_params.get("mult", 1.0))
+        ignore_zeros = xfm_params.get("ignore_zeros", False)
+        coord_scale  = float(xfm_params.get("coord_scale", 1.0))
+
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Prefix filename with scenario so parallel files with the same stem
+        # land in the same folder without colliding.
+        csv_name = f"{scenario}__{filepath.stem}.csv"
+        out_path = dest_dir / csv_name
+        tmp_csv  = dest_dir / f"{scenario}__{filepath.stem}.tmp.csv"
+
+        extract_cells_to_csv(
+            str(filepath), str(tmp_csv),
+            export_geom=export_geom, export_area=export_area,
+            export_power=export_power, export_pload=export_pload,
+            mult=mult, ignore_zeros=ignore_zeros,
+        )
+        _trf.process_file(
+            input_path=tmp_csv, output_path=out_path,
+            x_col=None, y_col=None, z_col=None,
+            angle_deg=angle_deg, dx=dx, dy=dy, dz=dz,
+            coord_scale=coord_scale,
+        )
+        tmp_csv.unlink(missing_ok=True)
+        return filepath, out_path, None   # None = no error
+    except Exception as exc:
+        return exc
+
+
 def _save_one_snapshot(args: tuple) -> tuple:
     """Render and save snapshot(s) for one processed item.  Called from a thread pool.
 
@@ -1162,36 +1185,46 @@ def apply_edge_smooth(src, n_iter: int = 1):
     fe.ColoringOff()
     fe.Update()
 
-    # Step 2 — build a coordinate key-set from edge-output points (numpy, no VTK loop)
+    # Step 2 — build integer keys for edge points (numpy, no loop)
     edge_pts  = fe.GetOutput().GetPoints()
-    edge_keys: set = set()
-    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
-        ep_np = vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3)
-        _sc   = np.int64(10 ** 10)
-        for row in np.round(ep_np * _sc).astype(np.int64):
-            edge_keys.add((int(row[0]), int(row[1]), int(row[2])))
-    print(f"  Feature-edge points : {len(edge_keys)}")
-
-    # Step 3 — map edge coordinates back to source point IDs (numpy, no GetPoint loop)
-    src_pts = src.GetPoints()
     edge_pt_ids: set = set()
-    if src_pts and edge_keys:
-        sp_np   = vtk_to_numpy(src_pts.GetData()).reshape(-1, 3)
-        _sc     = np.int64(10 ** 10)
-        sp_keys = np.round(sp_np * _sc).astype(np.int64)
-        for pid, row in enumerate(sp_keys):
-            if (int(row[0]), int(row[1]), int(row[2])) in edge_keys:
-                edge_pt_ids.add(pid)
+    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
+        _sc   = np.int64(10 ** 10)
+        ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+        # Pack (x,y,z) triples into single int64 keys for O(1) lookup
+        ep_keys = set(map(tuple, ep_np.tolist()))
 
-    # Step 4 — flag cells that own at least one edge point
-    cell_pts  = vtk.vtkIdList()
-    edge_cells = set()
-    for cid in range(n_cells):
-        src.GetCellPoints(cid, cell_pts)
-        for k in range(cell_pts.GetNumberOfIds()):
-            if cell_pts.GetId(k) in edge_pt_ids:
-                edge_cells.add(cid)
-                break
+        # Step 3 — find source point IDs whose coords match edge keys (vectorised)
+        src_pts = src.GetPoints()
+        if src_pts:
+            sp_np   = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+            sp_tuples = list(map(tuple, sp_np.tolist()))
+            edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
+    print(f"  Feature-edge points : {len(edge_pt_ids)}")
+
+    # Step 4 — flag cells that own at least one edge point (numpy connectivity)
+    edge_cells: set = set()
+    cell_pts = vtk.vtkIdList()   # always defined; used in fallback and Step 5
+    if edge_pt_ids:
+        polys = src.GetPolys()
+        if polys is not None and polys.GetNumberOfCells() > 0:
+            from vtk.util.numpy_support import vtk_to_numpy as _v2n
+            conn = _v2n(polys.GetConnectivityArray())
+            offs = _v2n(polys.GetOffsetsArray())
+            ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
+            mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
+            mask[ep_arr] = True
+            for cid in range(len(offs) - 1):
+                pts_in_cell = conn[offs[cid]:offs[cid + 1]]
+                if mask[pts_in_cell].any():
+                    edge_cells.add(cid)
+        else:
+            for cid in range(n_cells):
+                src.GetCellPoints(cid, cell_pts)
+                for k in range(cell_pts.GetNumberOfIds()):
+                    if cell_pts.GetId(k) in edge_pt_ids:
+                        edge_cells.add(cid)
+                        break
     print(f"  Edge-ring cells     : {len(edge_cells)}")
 
     if not edge_cells:
@@ -1199,23 +1232,30 @@ def apply_edge_smooth(src, n_iter: int = 1):
         return out
 
     # Step 5 — iterative mean of point-connected neighbours (edge-ring only)
-    # The edge-ring cell set is fixed once; only their values change each pass.
+    # Pre-build neighbour lists once using numpy connectivity for speed.
+    nbr_ids      = vtk.vtkIdList()
+    edge_cell_list = list(edge_cells)
+    # Build cell-neighbour map: for each edge cell, list of adjacent cell IDs
+    cell_neighbours: dict[int, list[int]] = {}
+    for cid in edge_cell_list:
+        src.GetCellPoints(cid, cell_pts)
+        nbrs: list[int] = []
+        for k in range(cell_pts.GetNumberOfIds()):
+            src.GetPointCells(cell_pts.GetId(k), nbr_ids)
+            for m in range(nbr_ids.GetNumberOfIds()):
+                ncid = nbr_ids.GetId(m)
+                if ncid != cid:
+                    nbrs.append(ncid)
+        cell_neighbours[cid] = nbrs
+
     n_iter = max(1, int(n_iter))
     current_vals = np.copy(raw_vals)
-    nbr_ids      = vtk.vtkIdList()
     for iteration in range(n_iter):
         next_vals = np.copy(current_vals)
-        for cid in edge_cells:
-            src.GetCellPoints(cid, cell_pts)
-            nbr_vals = []
-            for k in range(cell_pts.GetNumberOfIds()):
-                src.GetPointCells(cell_pts.GetId(k), nbr_ids)
-                for m in range(nbr_ids.GetNumberOfIds()):
-                    ncid = nbr_ids.GetId(m)
-                    if ncid != cid:
-                        nbr_vals.append(current_vals[ncid])
-            if nbr_vals:
-                next_vals[cid] = float(np.mean(nbr_vals))
+        for cid in edge_cell_list:
+            nbrs = cell_neighbours[cid]
+            if nbrs:
+                next_vals[cid] = float(np.mean(current_vals[nbrs]))
         current_vals = next_vals
         if n_iter > 1:
             print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
@@ -1225,6 +1265,7 @@ def apply_edge_smooth(src, n_iter: int = 1):
     new_arr.SetName(ARRAY_NAME)
     out.GetCellData().RemoveArray(ARRAY_NAME)
     out.GetCellData().AddArray(new_arr)
+    out.GetCellData().SetActiveScalars(ARRAY_NAME)   # restore active scalar after replace
 
     return out
 
