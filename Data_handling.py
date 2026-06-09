@@ -16,6 +16,7 @@ Run with:
 """
 
 import os
+import re
 import sys
 import glob
 import csv
@@ -141,6 +142,21 @@ def run_gui():
         side="left", padx=8
     )
 
+    # ── Smooth iterations ──────────────────────────────────────────────────────
+    smooth_iter_frame = tk.Frame(tab1)
+    smooth_iter_frame.pack(fill="x", padx=10, pady=(6, 0))
+    tk.Label(smooth_iter_frame, text="Smooth iterations:", anchor="w").pack(side="left")
+    smooth_iter_var = tk.IntVar(value=int(settings.get("smooth_iterations", 1)))
+    tk.Spinbox(
+        smooth_iter_frame, from_=1, to=20, width=5,
+        textvariable=smooth_iter_var,
+    ).pack(side="left", padx=(6, 0))
+    tk.Label(
+        smooth_iter_frame,
+        text="(edge-ring cells only — locality is preserved)",
+        fg="#888888",
+    ).pack(side="left", padx=(8, 0))
+
     # ── Snapshot checkbox ─────────────────────────────────────────────────────
     snap_var = tk.BooleanVar(value=settings.get("save_snapshots", False))
     tk.Checkbutton(
@@ -162,11 +178,12 @@ def run_gui():
         raw = text_box.get("1.0", "end").strip()
         dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
         return {
-            "input_dirs":     dirs,
-            "output_folder":  output_folder_var.get(),
-            "pattern":        pattern_var.get() or "smoothed_results_*.vtp",
-            "name_filter":    filter_var.get().strip(),
-            "save_snapshots": snap_var.get(),
+            "input_dirs":        dirs,
+            "output_folder":     output_folder_var.get(),
+            "pattern":           pattern_var.get() or "smoothed_results_*.vtp",
+            "name_filter":       filter_var.get().strip(),
+            "smooth_iterations": smooth_iter_var.get(),
+            "save_snapshots":    snap_var.get(),
             "transform": {
                 "unit":         xfm_unit_var.get(),
                 "output_unit":  xfm_out_unit_var.get(),
@@ -191,6 +208,7 @@ def run_gui():
             text_box.insert("1.0", "\n".join(loaded["input_dirs"]))
         pattern_var.set(loaded.get("pattern", "smoothed_results_*.vtp"))
         filter_var.set(loaded.get("name_filter", ""))
+        smooth_iter_var.set(int(loaded.get("smooth_iterations", 1)))
         snap_var.set(loaded.get("save_snapshots", False))
         out = loaded.get("output_folder", "")
         output_folder_var.set(out)
@@ -597,10 +615,11 @@ def run_gui():
 def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) -> None:
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
-    input_dirs      = cfg["input_dirs"]
-    pattern         = cfg["pattern"]
-    name_filter     = cfg.get("name_filter", "")
-    save_snapshots  = cfg.get("save_snapshots", False)
+    input_dirs       = cfg["input_dirs"]
+    pattern          = cfg["pattern"]
+    name_filter      = cfg.get("name_filter", "")
+    smooth_iterations = int(cfg.get("smooth_iterations", 1))
+    save_snapshots   = cfg.get("save_snapshots", False)
 
     # Expand any OUTPUT_* folder into its immediate subfolders
     expanded_dirs = []
@@ -641,7 +660,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
             if stopped():
                 break
             input_path = Path(input_folder)
-            output_name, case, scenario = extract_case_scenario(str(input_path))
+            output_name, case, _ = extract_case_scenario(str(input_path))
 
             # Search recursively so files in SMOOTHED/ (or any sub-folder) are found
             files = sorted(input_path.rglob(pattern))
@@ -654,7 +673,6 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 continue
 
             log(f"\nCase     : {case}")
-            log(f"Scenario : {scenario}")
             log(f"Files    : {len(files)}")
             log("=" * 80)
 
@@ -664,6 +682,11 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 fname = filepath.name
                 log(f"\n[{fname}]")
 
+                # Derive scenario from the file's own parent folder so that
+                # files inside subfolders (e.g. dnb_3_+10_+2/SMOOTHED/) get
+                # the correct scenario name instead of the case name.
+                _, _, scenario = extract_case_scenario(str(filepath.parent))
+
                 polydata = read_vtp(str(filepath))
 
                 max_before = find_max(polydata, ARRAY_NAME)
@@ -672,7 +695,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                     continue
                 log(f"  Max before smoothing : {max_before:.6g}")
 
-                smoothed  = apply_edge_smooth(polydata)
+                smoothed  = apply_edge_smooth(polydata, n_iter=smooth_iterations)
                 max_after = find_max(smoothed, ARRAY_NAME)
                 log(f"  Max after  smoothing : {max_after:.6g}")
 
@@ -835,23 +858,49 @@ def main():
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
+def _looks_like_scenario(name: str) -> bool:
+    """Return True if name looks like a scenario code (e.g. 'dnb_3_+10_+2').
+    Scenarios contain a sign followed immediately by a digit.
+    """
+    return bool(re.search(r'[+\-]\d', name))
+
+
 def extract_case_scenario(folder):
     """
     Find any folder whose name starts with 'OUTPUT_' and return:
-      output_name = that folder's name (e.g. 'OUTPUT_FFFC', 'OUTPUT_END_CHECK')
-      case        = the folder immediately after it (e.g. 'hnb_3_-10_+2_deuterium')
-      scenario    = any remaining sub-folder (e.g. 'SMOOTHED'), or same as case
+      output_name = that folder's name          (e.g. 'OUTPUT_CDL', 'OUTPUT_FFTC')
+      case        = the case identifier          (e.g. 'FFTC', 'FFHC')
+      scenario    = the scenario identifier      (e.g. 'dnb_3_+10_+2')
 
-    Falls back to (parts[-1], parts[-2], parts[-1]) if no OUTPUT_* is found.
+    Handles two path structures automatically:
+      OUTPUT_CDL / FFTC         / dnb_3_+10_+2  — case is explicit subfolder
+      OUTPUT_FFTC / dnb_3_+10_+2                — case is embedded in OUTPUT name
+
+    Falls back gracefully if no OUTPUT_* folder is found.
     """
     parts = Path(folder).parts
     try:
         idx = next(i for i, p in enumerate(parts) if p.upper().startswith("OUTPUT_"))
-        output_name = parts[idx]
-        case        = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
-        scenario    = parts[idx + 2] if idx + 2 < len(parts) else case
+        output_name   = parts[idx]
+        output_suffix = output_name[len("OUTPUT_"):]   # e.g. 'CDL', 'FFTC'
+        p1 = parts[idx + 1] if idx + 1 < len(parts) else None
+        p2 = parts[idx + 2] if idx + 2 < len(parts) else None
+
+        if p1 is None:
+            # Nothing after OUTPUT_X
+            case     = output_suffix or "unknown"
+            scenario = case
+        elif _looks_like_scenario(p1):
+            # Structure: OUTPUT_FFTC / dnb_3_+10_+2 / ...
+            # Case is encoded in the OUTPUT folder name.
+            case     = output_suffix or p1
+            scenario = p1
+        else:
+            # Structure: OUTPUT_CDL / FFTC / dnb_3_+10_+2 / ...
+            case     = p1
+            scenario = p2 if p2 else case
     except StopIteration:
-        # fallback
+        # No OUTPUT_* found — fall back to last two path parts
         output_name = "snapshots"
         case        = parts[-2] if len(parts) >= 2 else "unknown"
         scenario    = parts[-1] if len(parts) >= 1 else "unknown"
@@ -878,10 +927,15 @@ def find_max(polydata, array_name):
 
 
 # ── Smoothing (mirrors Smart_Smooth_EDGE.py) ──────────────────────────────────
-def apply_edge_smooth(src):
+def apply_edge_smooth(src, n_iter: int = 1):
     """
-    Single-pass neighbour-mean smoothing restricted to cells that touch
+    Iterative neighbour-mean smoothing restricted to cells that touch
     boundary or feature edges (angle >= FEATURE_ANGLE degrees).
+
+    Each iteration averages only the edge-ring cells (identified once before
+    the loop), so locality is preserved — interior cells are never touched.
+    n_iter > 1 lets a very high spike diffuse across several rings of
+    edge-adjacent cells without spreading into the bulk of the mesh.
 
     Returns a NEW vtkPolyData — src is never modified.
     """
@@ -941,24 +995,31 @@ def apply_edge_smooth(src):
         print("  Nothing to smooth.")
         return out
 
-    # Step 5 — single-pass mean of point-connected neighbours
-    smoothed = np.copy(raw_vals)
-    nbr_ids  = vtk.vtkIdList()
-    for cid in edge_cells:
-        src.GetCellPoints(cid, cell_pts)
-        nbr_vals = []
-        for k in range(cell_pts.GetNumberOfIds()):
-            src.GetPointCells(cell_pts.GetId(k), nbr_ids)
-            for m in range(nbr_ids.GetNumberOfIds()):
-                ncid = nbr_ids.GetId(m)
-                if ncid != cid:
-                    nbr_vals.append(raw_vals[ncid])
-        if nbr_vals:
-            smoothed[cid] = float(np.mean(nbr_vals))
+    # Step 5 — iterative mean of point-connected neighbours (edge-ring only)
+    # The edge-ring cell set is fixed once; only their values change each pass.
+    n_iter = max(1, int(n_iter))
+    current_vals = np.copy(raw_vals)
+    nbr_ids      = vtk.vtkIdList()
+    for iteration in range(n_iter):
+        next_vals = np.copy(current_vals)
+        for cid in edge_cells:
+            src.GetCellPoints(cid, cell_pts)
+            nbr_vals = []
+            for k in range(cell_pts.GetNumberOfIds()):
+                src.GetPointCells(cell_pts.GetId(k), nbr_ids)
+                for m in range(nbr_ids.GetNumberOfIds()):
+                    ncid = nbr_ids.GetId(m)
+                    if ncid != cid:
+                        nbr_vals.append(current_vals[ncid])
+            if nbr_vals:
+                next_vals[cid] = float(np.mean(nbr_vals))
+        current_vals = next_vals
+        if n_iter > 1:
+            print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
 
     # Step 6 — write smoothed values into the output array
     for i in range(n_cells):
-        out_arr.SetValue(i, smoothed[i])
+        out_arr.SetValue(i, current_vals[i])
 
     return out
 
