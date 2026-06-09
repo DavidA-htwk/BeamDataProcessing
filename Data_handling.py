@@ -23,6 +23,7 @@ import csv
 import json
 import threading
 import time
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 import tkinter as tk
@@ -31,13 +32,14 @@ from tkinter import ttk, filedialog, simpledialog, messagebox
 try:
     import vtk
     import numpy as np
+    from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 except ImportError:
     sys.exit(
         "ERROR: vtk and numpy are required.\n"
         "  Run with pvpython, or:  pip install vtk numpy"
     )
 
-from modules.snapshot_max import save_max_snapshot
+from modules.snapshot_max import save_max_snapshot, precompute_snapshot
 from modules.generate_report import extract_cells_to_csv
 from modules import transform_reference_frame as _trf
 
@@ -732,23 +734,33 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
 
         snapshot_only = (smooth_iterations == 0)
 
-        # ── Stage 1: Load VTP files ───────────────────────────────────────
-        n_all = len(all_files)
-        log(f"\n[1/3] Loading {n_all} VTP file(s)...")
-        loaded: list[tuple] = []   # (filepath, output_name, case, scenario, polydata, max_val)
+        # ── Stage 1: Load VTP files (parallel I/O) ───────────────────────
+        # ThreadPool.imap_unordered feeds one item per idle worker — at most
+        # n_workers files live in memory at once.  I/O-bound work benefits
+        # from a pool larger than cpu_count; cap at 12 to stay reasonable.
+        n_all     = len(all_files)
+        n_workers = min(os.cpu_count() or 4, n_all, 10)
+        log(f"\n[1/3] Loading {n_all} VTP file(s) ({n_workers} workers)...")
+        loaded: list[tuple] = []
         t0_load = time.perf_counter()
-        for i, (filepath, output_name, case, scenario) in enumerate(all_files, 1):
-            if stopped():
-                break
-            t_file = time.perf_counter()
-            polydata = read_vtp(str(filepath))
-            max_val = find_max(polydata, ARRAY_NAME)
-            elapsed_file = time.perf_counter() - t_file
-            if max_val is None:
-                log(f"  [{i}/{n_all}] SKIP  {filepath.name}  (no '{ARRAY_NAME}')")
-                continue
-            loaded.append((filepath, output_name, case, scenario, polydata, max_val))
-            log(f"  [{i}/{n_all}] {filepath.name}  ({elapsed_file:.1f}s)")
+
+        with ThreadPool(processes=n_workers) as pool:
+            for completed, result in enumerate(
+                    pool.imap_unordered(_load_one_file, all_files), 1):
+                if stopped():
+                    pool.terminate()
+                    break
+                elapsed = time.perf_counter() - t0_load
+                if isinstance(result, Exception):
+                    log(f"  [{completed}/{n_all}] ERROR: {result}")
+                    continue
+                filepath, output_name, case, scenario, polydata, max_val = result
+                if max_val is None:
+                    log(f"  [{completed}/{n_all}] SKIP  {filepath.name}  (no '{ARRAY_NAME}')")
+                    continue
+                loaded.append((filepath, output_name, case, scenario, polydata, max_val))
+                log(f"  [{completed}/{n_all}] {filepath.name}  (elapsed: {elapsed:.1f}s)")
+
         log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0_load:.1f}s")
 
         # ── Stage 2: Smoothing (skipped when smooth_iterations == 0) ─────
@@ -792,32 +804,34 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
             if not snapshot_only:
                 log(f"  {filepath.name}: before={max_before:.6g}  after={max_after:.6g}  delta={abs(max_after - max_before):.6g}")
 
-        # ── Stage 3: Snapshots ────────────────────────────────────────────
+        # ── Stage 3: Snapshots (parallel rendering) ─────────────────────────
         if save_snapshots:
             n_proc = len(processed)
-            log(f"\n[3/3] Saving {n_proc} snapshot(s)...")
+            # Rendering is single-threaded: multiple vtkRenderWindow (WGL) contexts
+            # competing for the same GPU command queue starve the Tkinter compositor
+            # and freeze the GUI.  Per-file time is already ~6s (MSAA disabled) so
+            # sequential rendering finishes in acceptable time without GUI instability.
+            n_snap_workers = 1
+            log(f"\n[3/3] Saving {n_proc} snapshot(s) ({n_snap_workers} workers)...")
             t0_snap = time.perf_counter()
-            for i, item in enumerate(processed, 1):
-                if stopped():
-                    break
-                filepath, output_name, case, scenario, polydata_orig, _, polydata_smooth, _ = item
-                stem = filepath.stem
-                case_snap_dir = snap_dir / output_name / case
-                case_snap_dir.mkdir(parents=True, exist_ok=True)
-                t_file = time.perf_counter()
-                if snapshot_only:
-                    png_snap = case_snap_dir / f"{scenario}__{stem}.png"
-                    ok = save_max_snapshot(polydata_orig, ARRAY_NAME, png_snap)
-                    elapsed_file = time.perf_counter() - t_file
-                    if ok:
-                        log(f"  [{i}/{n_proc}] {png_snap.name}  ({elapsed_file:.1f}s)")
-                else:
-                    png_before = case_snap_dir / f"{scenario}__{stem}__before.png"
-                    ok_b = save_max_snapshot(polydata_orig, ARRAY_NAME, png_before)
-                    png_after = case_snap_dir / f"{scenario}__{stem}__after.png"
-                    ok_a = save_max_snapshot(polydata_smooth, ARRAY_NAME, png_after)
-                    elapsed_file = time.perf_counter() - t_file
-                    log(f"  [{i}/{n_proc}] {stem}  ({elapsed_file:.1f}s)")
+            snap_args = [
+                (filepath, output_name, case, scenario,
+                 polydata_orig, polydata_smooth, snap_dir, snapshot_only)
+                for filepath, output_name, case, scenario,
+                    polydata_orig, _, polydata_smooth, _ in processed
+            ]
+            with ThreadPool(processes=n_snap_workers) as pool:
+                for completed, result in enumerate(
+                        pool.imap_unordered(_save_one_snapshot, snap_args), 1):
+                    if stopped():
+                        pool.terminate()
+                        break
+                    elapsed = time.perf_counter() - t0_snap
+                    if isinstance(result, Exception):
+                        log(f"  [{completed}/{n_proc}] ERROR: {result}")
+                        continue
+                    label, file_elapsed = result
+                    log(f"  [{completed}/{n_proc}] {label}  ({file_elapsed:.1f}s)")
             log(f"  Snapshots done in {time.perf_counter()-t0_snap:.1f}s")
         else:
             log("\n[3/3] Snapshots disabled")
@@ -1023,6 +1037,62 @@ def read_vtp(filepath):
     return reader.GetOutput()
 
 
+def _load_one_file(args: tuple) -> tuple:
+    """Load one VTP file and extract the max scalar value.  Called from a thread pool.
+    Returns the result tuple, or the Exception on failure (never raises — keeps the pool alive)."""
+    try:
+        filepath, output_name, case, scenario = args
+        polydata = read_vtp(str(filepath))
+        max_val  = find_max(polydata, ARRAY_NAME)
+        return filepath, output_name, case, scenario, polydata, max_val
+    except Exception as exc:
+        return exc
+
+
+def _save_one_snapshot(args: tuple) -> tuple:
+    """Render and save snapshot(s) for one processed item.  Called from a thread pool.
+
+    THREAD SAFETY: DeepCopy is performed FIRST to move polydata ownership into this
+    worker thread.  ALL subsequent VTK operations (precompute + render) run on the
+    local copy, so no cross-thread VTK object access occurs after the initial copy.
+    Returns (label, elapsed_s) or an Exception."""
+    try:
+        (filepath, output_name, case, scenario,
+         polydata_orig, polydata_smooth, snap_dir, snapshot_only) = args
+
+        # ── Step 1: DeepCopy into this thread first (minimal cross-thread touch) ──
+        # vtkCellLocator.SetDataSet() increments the ref-count on its polydata arg,
+        # which is a write — not safe to do on cross-thread VTK objects.  DeepCopy is
+        # the only cross-thread VTK call and is safe as a single read operation.
+        pd_orig = vtk.vtkPolyData()
+        pd_orig.DeepCopy(polydata_orig)
+
+        # ── Step 2: Pre-compute on the local copy (CPU, no GPU, single thread) ──
+        pre_orig = precompute_snapshot(pd_orig, ARRAY_NAME)
+
+        stem = filepath.stem
+        case_snap_dir = snap_dir / output_name / case
+        case_snap_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.perf_counter()
+
+        # ── Step 3: Render from the local copy ───────────────────────────────────
+        if snapshot_only:
+            png_snap = case_snap_dir / f"{scenario}__{stem}.png"
+            save_max_snapshot(pd_orig, ARRAY_NAME, png_snap, precomputed=pre_orig)
+            return png_snap.name, time.perf_counter() - t0
+        else:
+            pd_smooth = vtk.vtkPolyData()
+            pd_smooth.DeepCopy(polydata_smooth)
+            pre_smooth = precompute_snapshot(pd_smooth, ARRAY_NAME)
+            png_before = case_snap_dir / f"{scenario}__{stem}__before.png"
+            save_max_snapshot(pd_orig, ARRAY_NAME, png_before, precomputed=pre_orig)
+            png_after  = case_snap_dir / f"{scenario}__{stem}__after.png"
+            save_max_snapshot(pd_smooth, ARRAY_NAME, png_after, precomputed=pre_smooth)
+            return stem, time.perf_counter() - t0
+    except Exception as exc:
+        return exc
+
+
 def find_max(polydata, array_name):
     """Return the maximum value of *array_name* in cell data, or None."""
     arr = polydata.GetCellData().GetArray(array_name)
@@ -1031,7 +1101,7 @@ def find_max(polydata, array_name):
     n = arr.GetNumberOfTuples()
     if n == 0:
         return None
-    return float(max(arr.GetValue(i) for i in range(n)))
+    return float(vtk_to_numpy(arr).max())
 
 
 # ── Smoothing (mirrors Smart_Smooth_EDGE.py) ──────────────────────────────────
@@ -1057,7 +1127,7 @@ def apply_edge_smooth(src, n_iter: int = 1):
         return out
 
     n_cells  = in_arr.GetNumberOfTuples()
-    raw_vals = np.array([in_arr.GetValue(i) for i in range(n_cells)], dtype=float)
+    raw_vals = vtk_to_numpy(in_arr).astype(float, copy=True)
 
     # Step 1 — extract boundary + feature edges
     fe = vtk.vtkFeatureEdges()
@@ -1070,22 +1140,25 @@ def apply_edge_smooth(src, n_iter: int = 1):
     fe.ColoringOff()
     fe.Update()
 
-    # Step 2 — build a coordinate set from edge-output points
-    edge_pts = fe.GetOutput().GetPoints()
-    edge_coord_set = set()
-    if edge_pts:
-        for i in range(edge_pts.GetNumberOfPoints()):
-            x, y, z = edge_pts.GetPoint(i)
-            edge_coord_set.add((round(x, 10), round(y, 10), round(z, 10)))
-    print(f"  Feature-edge points : {len(edge_coord_set)}")
+    # Step 2 — build a coordinate key-set from edge-output points (numpy, no VTK loop)
+    edge_pts  = fe.GetOutput().GetPoints()
+    edge_keys: set = set()
+    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
+        ep_np = vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3)
+        _sc   = np.int64(10 ** 10)
+        for row in np.round(ep_np * _sc).astype(np.int64):
+            edge_keys.add((int(row[0]), int(row[1]), int(row[2])))
+    print(f"  Feature-edge points : {len(edge_keys)}")
 
-    # Step 3 — map edge coordinates back to source point IDs
+    # Step 3 — map edge coordinates back to source point IDs (numpy, no GetPoint loop)
     src_pts = src.GetPoints()
-    edge_pt_ids = set()
-    if src_pts:
-        for pid in range(src_pts.GetNumberOfPoints()):
-            x, y, z = src_pts.GetPoint(pid)
-            if (round(x, 10), round(y, 10), round(z, 10)) in edge_coord_set:
+    edge_pt_ids: set = set()
+    if src_pts and edge_keys:
+        sp_np   = vtk_to_numpy(src_pts.GetData()).reshape(-1, 3)
+        _sc     = np.int64(10 ** 10)
+        sp_keys = np.round(sp_np * _sc).astype(np.int64)
+        for pid, row in enumerate(sp_keys):
+            if (int(row[0]), int(row[1]), int(row[2])) in edge_keys:
                 edge_pt_ids.add(pid)
 
     # Step 4 — flag cells that own at least one edge point
@@ -1125,9 +1198,11 @@ def apply_edge_smooth(src, n_iter: int = 1):
         if n_iter > 1:
             print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
 
-    # Step 6 — write smoothed values into the output array
-    for i in range(n_cells):
-        out_arr.SetValue(i, current_vals[i])
+    # Step 6 — write smoothed values back via numpy_to_vtk (avoids SetValue loop)
+    new_arr = numpy_to_vtk(current_vals, deep=True, array_type=out_arr.GetDataType())
+    new_arr.SetName(ARRAY_NAME)
+    out.GetCellData().RemoveArray(ARRAY_NAME)
+    out.GetCellData().AddArray(new_arr)
 
     return out
 

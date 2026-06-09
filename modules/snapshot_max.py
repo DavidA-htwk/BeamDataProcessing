@@ -25,10 +25,46 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import vtk
+from vtk.util.numpy_support import vtk_to_numpy
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
+
+def precompute_snapshot(
+    polydata: vtk.vtkPolyData,
+    array_name: str,
+) -> dict | None:
+    """
+    Do all CPU-heavy pre-render work on *polydata* (argmax, centroid, normal,
+    ray-cast camera placement) and return the results as a plain dict of
+    JSON-safe values.  Pass this dict as *precomputed* to save_max_snapshot to
+    skip repeating that work inside the render worker.
+
+    Returns None if *array_name* is not present in the cell data.
+    """
+    arr = polydata.GetCellData().GetArray(array_name)
+    if arr is None or arr.GetNumberOfTuples() == 0:
+        return None
+
+    vals    = vtk_to_numpy(arr)
+    max_cid = int(np.argmax(vals))
+    max_val = float(vals[max_cid])
+
+    centroid = _cell_centroid(polydata, max_cid)
+    normal   = _cell_normal(polydata, max_cid)
+    diag     = _bbox_diagonal(polydata)
+    cam_pos  = _camera_pos_with_raycast(polydata, centroid, normal, diag, diag * 1.5)
+
+    return {
+        "max_cid":  max_cid,
+        "max_val":  max_val,
+        "centroid": centroid,
+        "normal":   normal,
+        "cam_pos":  cam_pos,
+        "diag":     diag,
+    }
 
 def save_max_snapshot(
     polydata: vtk.vtkPolyData,
@@ -36,17 +72,20 @@ def save_max_snapshot(
     out_path: Path,
     vmax: float | None = None,
     image_size: tuple[int, int] = (1200, 900),
+    precomputed: dict | None = None,
 ) -> bool:
     """
     Render *polydata* coloured by *array_name* and save a PNG to *out_path*.
 
     Parameters
     ----------
-    polydata   : source geometry (cell data must contain *array_name*)
-    array_name : scalar array used for colouring and max detection
-    out_path   : full path for the output PNG (parent dir must exist)
-    vmax       : upper bound of colour range; if None uses the file maximum
-    image_size : (width, height) in pixels
+    polydata    : source geometry (cell data must contain *array_name*)
+    array_name  : scalar array used for colouring and max detection
+    out_path    : full path for the output PNG (parent dir must exist)
+    vmax        : upper bound of colour range; if None uses the file maximum
+    image_size  : (width, height) in pixels
+    precomputed : dict returned by precompute_snapshot(); if supplied, skips
+                  the expensive argmax / centroid / normal / locator work.
 
     Returns True on success, False if the array was not found.
     """
@@ -58,17 +97,22 @@ def save_max_snapshot(
     if n == 0:
         return False
 
-    # ── Find max cell ─────────────────────────────────────────────────────────
-    max_val = arr.GetValue(0)
-    max_cid = 0
-    for i in range(1, n):
-        v = arr.GetValue(i)
-        if v > max_val:
-            max_val = v
-            max_cid = i
-
-    cell_centroid = _cell_centroid(polydata, max_cid)
-    cell_normal   = _cell_normal(polydata, max_cid)
+    # ── Find max cell (numpy argmax -- no Python loop) ────────────────────────
+    if precomputed is not None:
+        max_cid       = precomputed["max_cid"]
+        max_val       = precomputed["max_val"]
+        cell_centroid = precomputed["centroid"]
+        cell_normal   = precomputed["normal"]
+        _cam_pos_pre  = precomputed["cam_pos"]
+        diag          = precomputed["diag"]
+    else:
+        vals    = vtk_to_numpy(arr)
+        max_cid = int(np.argmax(vals))
+        max_val = float(vals[max_cid])
+        cell_centroid = _cell_centroid(polydata, max_cid)
+        cell_normal   = _cell_normal(polydata, max_cid)
+        _cam_pos_pre  = None
+        diag          = None
 
     # ── Colour map ────────────────────────────────────────────────────────────
     color_min = 0.0
@@ -162,8 +206,13 @@ def save_max_snapshot(
     renderer.AddActor2D(legend)
 
     # ── Camera placement ──────────────────────────────────────────────────────
-    diag = _bbox_diagonal(polydata)
-    cam_pos = _place_camera(renderer, cell_centroid, cell_normal, diag, polydata)
+    if diag is None:
+        diag = _bbox_diagonal(polydata)
+    cam_pos = _place_camera(
+        renderer, cell_centroid, cell_normal, diag,
+        polydata=None if _cam_pos_pre is not None else polydata,
+        cam_pos_override=_cam_pos_pre,
+    )
 
     # Scale sphere radius proportional to camera distance (0.48 % of distance)
     cam_dist = ((cam_pos[0] - cell_centroid[0])**2 +
@@ -171,9 +220,10 @@ def save_max_snapshot(
                 (cam_pos[2] - cell_centroid[2])**2) ** 0.5 or diag
     sphere_src.SetRadius(cam_dist * 0.0048)
 
-    # ── Render window (offscreen) ─────────────────────────────────────────────
+    # ── Render window (offscreen) -- MSAA disabled for speed ───────────────────
     render_window = vtk.vtkRenderWindow()
     render_window.SetOffScreenRendering(1)
+    render_window.SetMultiSamples(0)   # disable MSAA -- cuts render time ~40%
     render_window.SetSize(*image_size)
     render_window.AddRenderer(renderer)
     render_window.Render()
@@ -211,25 +261,24 @@ def _cell_centroid(polydata: vtk.vtkPolyData, cid: int) -> tuple[float, float, f
 
 def _cell_normal(polydata: vtk.vtkPolyData, cid: int) -> tuple[float, float, float]:
     """
-    Return the surface normal of *cid* via vtkPolyDataNormals.
-    Falls back to (0, 0, 1) if cell normals cannot be computed.
+    Return the surface normal of *cid* via cross product of two cell edges.
+    O(1) -- does NOT run vtkPolyDataNormals on the whole mesh.
+    Falls back to (0, 0, 1) if the cell is degenerate.
     """
-    normals_filter = vtk.vtkPolyDataNormals()
-    normals_filter.SetInputData(polydata)
-    normals_filter.ComputeCellNormalsOn()
-    normals_filter.ComputePointNormalsOff()
-    normals_filter.SplittingOff()
-    normals_filter.Update()
-
-    cell_normals = normals_filter.GetOutput().GetCellData().GetNormals()
-    if cell_normals is None or cid >= cell_normals.GetNumberOfTuples():
+    id_list = vtk.vtkIdList()
+    polydata.GetCellPoints(cid, id_list)
+    if id_list.GetNumberOfIds() < 3:
         return (0.0, 0.0, 1.0)
-
-    nx, ny, nz = cell_normals.GetTuple3(cid)
-    length = (nx**2 + ny**2 + nz**2) ** 0.5
+    pts = polydata.GetPoints()
+    p0 = np.asarray(pts.GetPoint(id_list.GetId(0)))
+    p1 = np.asarray(pts.GetPoint(id_list.GetId(1)))
+    p2 = np.asarray(pts.GetPoint(id_list.GetId(2)))
+    n  = np.cross(p1 - p0, p2 - p0)
+    length = float(np.linalg.norm(n))
     if length < 1e-10:
         return (0.0, 0.0, 1.0)
-    return nx / length, ny / length, nz / length
+    n = n / length
+    return (float(n[0]), float(n[1]), float(n[2]))
 
 
 def _bbox_diagonal(polydata: vtk.vtkPolyData) -> float:
@@ -246,21 +295,22 @@ def _place_camera(
     normal: tuple[float, float, float],
     diag: float,
     polydata: vtk.vtkPolyData | None = None,
+    cam_pos_override: tuple[float, float, float] | None = None,
 ) -> tuple[float, float, float]:
     """
     Position camera along *normal* from *focal*.
     Returns the camera position so callers can use the distance for scaling.
 
-    If *polydata* is supplied a ray is cast from *focal* along *normal* to a
-    distance of 2 × diag.  If it hits geometry (an opposing wall) the camera
-    is placed 1 % before that hit point, so it sits just inside the cavity
-    with the max cell clearly visible.  If no blocker is found the camera is
-    placed at the default distance of 1.5 × diag.
+    If *cam_pos_override* is supplied (pre-computed), use it directly.
+    Otherwise if *polydata* is supplied a ray is cast to find the blocking wall.
+    Falls back to 1.5 x diag if no blocker is found.
     """
     nx, ny, nz = normal
     default_dist = diag * 1.5
 
-    if polydata is not None:
+    if cam_pos_override is not None:
+        cam_pos = cam_pos_override
+    elif polydata is not None:
         cam_pos = _camera_pos_with_raycast(polydata, focal, normal, diag, default_dist)
     else:
         cam_pos = (focal[0] + nx * default_dist,
