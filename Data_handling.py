@@ -22,6 +22,7 @@ import glob
 import csv
 import json
 import threading
+import time
 from pathlib import Path
 
 import tkinter as tk
@@ -148,12 +149,12 @@ def run_gui():
     tk.Label(smooth_iter_frame, text="Smooth iterations:", anchor="w").pack(side="left")
     smooth_iter_var = tk.IntVar(value=int(settings.get("smooth_iterations", 1)))
     tk.Spinbox(
-        smooth_iter_frame, from_=1, to=20, width=5,
+        smooth_iter_frame, from_=0, to=20, width=5,
         textvariable=smooth_iter_var,
     ).pack(side="left", padx=(6, 0))
     tk.Label(
         smooth_iter_frame,
-        text="(edge-ring cells only — locality is preserved)",
+        text="(0 = no smoothing, snapshot only; edge-ring cells only)",
         fg="#888888",
     ).pack(side="left", padx=(8, 0))
 
@@ -700,13 +701,14 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
             "delta", "discrepancy",
         ])
 
+        # ── Collect all matching files across every folder first ──────────
+        all_files: list[tuple[Path, str, str, str]] = []  # (path, output_name, case, scenario)
         for input_folder in input_dirs:
             if stopped():
                 break
             input_path = Path(input_folder)
-            output_name, case, _ = extract_case_scenario(str(input_path))
+            output_name, folder_case, _ = extract_case_scenario(str(input_path))
 
-            # Search recursively so files in SMOOTHED/ (or any sub-folder) are found
             files = sorted(input_path.rglob(pattern))
             if name_filter:
                 terms = [t.strip().lower() for t in name_filter.split(",") if t.strip()]
@@ -716,57 +718,109 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 log(f"[SKIP] No files matching '{pattern}'{filter_note} in (or below):\n  {input_path}")
                 continue
 
-            log(f"\nCase     : {case}")
-            log(f"Files    : {len(files)}")
-            log("=" * 80)
-
+            log(f"  {folder_case}: {len(files)} file(s) found")
             for filepath in files:
+                _, case, scenario = extract_case_scenario(str(filepath.parent))
+                all_files.append((filepath, output_name, case, scenario))
+
+        if not all_files:
+            log("No files found.")
+            return
+
+        log(f"\nTotal: {len(all_files)} file(s) to process")
+        log("=" * 80)
+
+        snapshot_only = (smooth_iterations == 0)
+
+        # ── Stage 1: Load VTP files ───────────────────────────────────────
+        n_all = len(all_files)
+        log(f"\n[1/3] Loading {n_all} VTP file(s)...")
+        loaded: list[tuple] = []   # (filepath, output_name, case, scenario, polydata, max_val)
+        t0_load = time.perf_counter()
+        for i, (filepath, output_name, case, scenario) in enumerate(all_files, 1):
+            if stopped():
+                break
+            t_file = time.perf_counter()
+            polydata = read_vtp(str(filepath))
+            max_val = find_max(polydata, ARRAY_NAME)
+            elapsed_file = time.perf_counter() - t_file
+            if max_val is None:
+                log(f"  [{i}/{n_all}] SKIP  {filepath.name}  (no '{ARRAY_NAME}')")
+                continue
+            loaded.append((filepath, output_name, case, scenario, polydata, max_val))
+            log(f"  [{i}/{n_all}] {filepath.name}  ({elapsed_file:.1f}s)")
+        log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0_load:.1f}s")
+
+        # ── Stage 2: Smoothing (skipped when smooth_iterations == 0) ─────
+        processed: list[tuple] = []  # (..., polydata_orig, max_before, polydata_smooth, max_after)
+        if snapshot_only:
+            log("\n[2/3] Smoothing skipped (iterations = 0)")
+            for item in loaded:
+                filepath, output_name, case, scenario, polydata, max_val = item
+                processed.append((filepath, output_name, case, scenario,
+                                   polydata, max_val, polydata, max_val))
+        else:
+            n_loaded = len(loaded)
+            log(f"\n[2/3] Smoothing {n_loaded} file(s) ({smooth_iterations} iteration(s) each)...")
+            t0_smooth = time.perf_counter()
+            for i, item in enumerate(loaded, 1):
                 if stopped():
                     break
-                fname = filepath.name
-                log(f"\n[{fname}]")
-
-                # Derive scenario from the file's own parent folder so that
-                # files inside subfolders (e.g. dnb_3_+10_+2/SMOOTHED/) get
-                # the correct scenario name instead of the case name.
-                _, _, scenario = extract_case_scenario(str(filepath.parent))
-
-                polydata = read_vtp(str(filepath))
-
-                max_before = find_max(polydata, ARRAY_NAME)
-                if max_before is None:
-                    log(f"  Array '{ARRAY_NAME}' not found — file skipped.")
-                    continue
-                log(f"  Max before smoothing : {max_before:.6g}")
-
+                filepath, output_name, case, scenario, polydata, max_before = item
+                t_file = time.perf_counter()
                 smoothed  = apply_edge_smooth(polydata, n_iter=smooth_iterations)
                 max_after = find_max(smoothed, ARRAY_NAME)
-                log(f"  Max after  smoothing : {max_after:.6g}")
+                elapsed_file = time.perf_counter() - t_file
+                processed.append((filepath, output_name, case, scenario,
+                                   polydata, max_before, smoothed, max_after))
+                log(f"  [{i}/{n_loaded}] {filepath.name}  ({elapsed_file:.1f}s)  "
+                    f"before={max_before:.4g}  after={max_after:.4g}")
+            log(f"  Smoothing done in {time.perf_counter()-t0_smooth:.1f}s")
 
-                delta       = abs(max_after - max_before)
-                discrepancy = "YES" if delta > 0.0 else "NO"
+        # ── Write CSV rows ────────────────────────────────────────────────
+        for item in processed:
+            filepath, output_name, case, scenario, _, max_before, _, max_after = item
+            delta       = abs(max_after - max_before)
+            discrepancy = "YES" if delta > 0.0 else "NO"
+            writer.writerow([
+                case, scenario, filepath.name,
+                f"{max_before:.6g}", f"{max_after:.6g}",
+                f"{delta:.6g}", discrepancy,
+            ])
+            total_files += 1
 
-                writer.writerow([
-                    case, scenario, fname,
-                    f"{max_before:.6g}", f"{max_after:.6g}",
-                    f"{delta:.6g}", discrepancy,
-                ])
-                total_files += 1
+            if not snapshot_only:
+                log(f"  {filepath.name}: before={max_before:.6g}  after={max_after:.6g}  delta={abs(max_after - max_before):.6g}")
 
-                if save_snapshots:
-                    stem = Path(fname).stem
-                    case_snap_dir = snap_dir / output_name / case
-                    case_snap_dir.mkdir(parents=True, exist_ok=True)
-                    # before-smoothing snapshot
+        # ── Stage 3: Snapshots ────────────────────────────────────────────
+        if save_snapshots:
+            n_proc = len(processed)
+            log(f"\n[3/3] Saving {n_proc} snapshot(s)...")
+            t0_snap = time.perf_counter()
+            for i, item in enumerate(processed, 1):
+                if stopped():
+                    break
+                filepath, output_name, case, scenario, polydata_orig, _, polydata_smooth, _ = item
+                stem = filepath.stem
+                case_snap_dir = snap_dir / output_name / case
+                case_snap_dir.mkdir(parents=True, exist_ok=True)
+                t_file = time.perf_counter()
+                if snapshot_only:
+                    png_snap = case_snap_dir / f"{scenario}__{stem}.png"
+                    ok = save_max_snapshot(polydata_orig, ARRAY_NAME, png_snap)
+                    elapsed_file = time.perf_counter() - t_file
+                    if ok:
+                        log(f"  [{i}/{n_proc}] {png_snap.name}  ({elapsed_file:.1f}s)")
+                else:
                     png_before = case_snap_dir / f"{scenario}__{stem}__before.png"
-                    ok = save_max_snapshot(polydata, ARRAY_NAME, png_before)
-                    if ok:
-                        log(f"  Snapshot (before): {output_name}/{case}/{png_before.name}")
-                    # after-smoothing snapshot
+                    ok_b = save_max_snapshot(polydata_orig, ARRAY_NAME, png_before)
                     png_after = case_snap_dir / f"{scenario}__{stem}__after.png"
-                    ok = save_max_snapshot(smoothed, ARRAY_NAME, png_after)
-                    if ok:
-                        log(f"  Snapshot (after) : {output_name}/{case}/{png_after.name}")
+                    ok_a = save_max_snapshot(polydata_smooth, ARRAY_NAME, png_after)
+                    elapsed_file = time.perf_counter() - t_file
+                    log(f"  [{i}/{n_proc}] {stem}  ({elapsed_file:.1f}s)")
+            log(f"  Snapshots done in {time.perf_counter()-t0_snap:.1f}s")
+        else:
+            log("\n[3/3] Snapshots disabled")
 
     log("\n" + "=" * 80)
     if stopped():
@@ -830,7 +884,7 @@ def run_transform(
         if stopped():
             break
         folder = Path(folder)
-        output_name, case, scenario = extract_case_scenario(str(folder))
+        output_name, folder_case, folder_scenario = extract_case_scenario(str(folder))
 
         files = sorted(folder.rglob(pattern))
         if name_filter:
@@ -841,17 +895,19 @@ def run_transform(
             log(f"[SKIP] No files matching '{pattern}'{note} in:\n  {folder}")
             continue
 
-        dest_dir = out_root / "transformed" / output_name / case
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        log(f"\nCase     : {case}")
-        log(f"Scenario : {scenario}")
+        log(f"\nCase     : {folder_case}")
+        log(f"Scenario : {folder_scenario}")
         log(f"Files    : {len(files)}")
         log("=" * 80)
 
         for filepath in files:
             if stopped():
                 break
+            # Derive case and scenario from each file's parent path so that
+            # intermediate grouping folders (e.g. DNB_ALL) are skipped.
+            _, case, scenario = extract_case_scenario(str(filepath.parent))
+            dest_dir = out_root / "transformed" / output_name / case
+            dest_dir.mkdir(parents=True, exist_ok=True)
             csv_stem = filepath.stem + ".csv"
             out_path = dest_dir / csv_stem
             log(f"\n[{filepath.name}]")
@@ -911,40 +967,48 @@ def _looks_like_scenario(name: str) -> bool:
 
 def extract_case_scenario(folder):
     """
-    Find any folder whose name starts with 'OUTPUT_' and return:
-      output_name = that folder's name          (e.g. 'OUTPUT_CDL', 'OUTPUT_FFTC')
-      case        = the case identifier          (e.g. 'FFTC', 'FFHC')
-      scenario    = the scenario identifier      (e.g. 'dnb_3_+10_+2')
+    Find the OUTPUT_* ancestor and return (output_name, case, scenario).
 
-    Handles two path structures automatically:
-      OUTPUT_CDL / FFTC         / dnb_3_+10_+2  — case is explicit subfolder
-      OUTPUT_FFTC / dnb_3_+10_+2                — case is embedded in OUTPUT name
+    Handles any depth of nesting below OUTPUT_* with a bottom-up rule:
+      - 0 sub-levels  → case = scenario = output_suffix
+      - 1 sub-level   → case = suffix if it looks like a scenario, else sub[0];
+                         scenario = sub[0]
+      - 2 sub-levels  → case = sub[0] unless sub[0] looks like a scenario
+                         (in which case case = output_suffix); scenario = sub[0]
+      - 3+ sub-levels → case = sub[-2], scenario = sub[-1]
+                         (ignores intermediate grouping folders like 'DNB_ALL')
 
-    Falls back gracefully if no OUTPUT_* folder is found.
+    Falls back to ("snapshots", parts[-2], parts[-1]) if no OUTPUT_* is found.
     """
     parts = Path(folder).parts
     try:
         idx = next(i for i, p in enumerate(parts) if p.upper().startswith("OUTPUT_"))
         output_name   = parts[idx]
-        output_suffix = output_name[len("OUTPUT_"):]   # e.g. 'CDL', 'FFTC'
-        p1 = parts[idx + 1] if idx + 1 < len(parts) else None
-        p2 = parts[idx + 2] if idx + 2 < len(parts) else None
+        output_suffix = output_name[len("OUTPUT_"):]
+        sub = parts[idx + 1:]   # everything after OUTPUT_*
 
-        if p1 is None:
-            # Nothing after OUTPUT_X
-            case     = output_suffix or "unknown"
+        if len(sub) == 0:
+            case = output_suffix or "unknown"
             scenario = case
-        elif _looks_like_scenario(p1):
-            # Structure: OUTPUT_FFTC / dnb_3_+10_+2 / ...
-            # Case is encoded in the OUTPUT folder name.
-            case     = output_suffix or p1
-            scenario = p1
+        elif len(sub) == 1:
+            if _looks_like_scenario(sub[0]):
+                case = output_suffix or sub[0]
+            else:
+                case = sub[0]
+            scenario = sub[0]
+        elif len(sub) == 2:
+            if _looks_like_scenario(sub[0]):
+                # OUTPUT_FFTC / dnb_3_+10_+2 / ...
+                case     = output_suffix or sub[0]
+                scenario = sub[0]
+            else:
+                case     = sub[0]
+                scenario = sub[1]
         else:
-            # Structure: OUTPUT_CDL / FFTC / dnb_3_+10_+2 / ...
-            case     = p1
-            scenario = p2 if p2 else case
+            # 3+ levels: skip intermediate grouping folders; use last two
+            case     = sub[-2]
+            scenario = sub[-1]
     except StopIteration:
-        # No OUTPUT_* found — fall back to last two path parts
         output_name = "snapshots"
         case        = parts[-2] if len(parts) >= 2 else "unknown"
         scenario    = parts[-1] if len(parts) >= 1 else "unknown"

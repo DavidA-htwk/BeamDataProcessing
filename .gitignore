@@ -16,6 +16,8 @@ data_handling_settings.json
 # Output folders (potentially large)
 output/
 input/
+RESULTS*/
+
 
 # Windows
 *.lnk

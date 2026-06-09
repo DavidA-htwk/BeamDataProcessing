@@ -8,12 +8,15 @@ Camera strategy
 ~~~~~~~~~~~~~~~
 1. Find the cell with the maximum value of *array_name*.
 2. Compute that cell's centroid and surface normal (via vtkPolyDataNormals).
-3. Place the camera *behind* the normal (i.e. looking along -normal toward the
-   centroid) at a distance proportional to the bounding-box diagonal.
+3. Cast a ray from the centroid along the normal up to 2 x bounding-box
+   diagonal.  If it hits geometry (an opposing wall - e.g. the far side of
+   a duct) the camera is placed 1 % before the hit point, sitting inside
+   the cavity with the max cell in direct view.  If the ray hits nothing the
+   camera falls back to the default 1.5 x diagonal distance.
 4. Set the view-up vector to whichever world axis is least parallel to the
    normal (to avoid gimbal lock).
 
-The polydata is coloured by *array_name* using a blue→red (cool-to-warm)
+The polydata is coloured by *array_name* using a blue->red (cool-to-warm)
 colour map.  The colour range is fixed to [0, global_max] when *vmax* is
 supplied, otherwise per-file.
 """
@@ -142,8 +145,6 @@ def save_max_snapshot(
     # ── Max-point marker (violet sphere) ─────────────────────────────────────────────────
     sphere_src = vtk.vtkSphereSource()
     sphere_src.SetCenter(*cell_centroid)
-    diag = _bbox_diagonal(polydata)
-    sphere_src.SetRadius(diag * 0.008)
     sphere_src.SetPhiResolution(12)
     sphere_src.SetThetaResolution(12)
     sphere_mapper = vtk.vtkPolyDataMapper()
@@ -161,7 +162,14 @@ def save_max_snapshot(
     renderer.AddActor2D(legend)
 
     # ── Camera placement ──────────────────────────────────────────────────────
-    _place_camera(renderer, cell_centroid, cell_normal, diag)
+    diag = _bbox_diagonal(polydata)
+    cam_pos = _place_camera(renderer, cell_centroid, cell_normal, diag, polydata)
+
+    # Scale sphere radius proportional to camera distance (0.48 % of distance)
+    cam_dist = ((cam_pos[0] - cell_centroid[0])**2 +
+                (cam_pos[1] - cell_centroid[1])**2 +
+                (cam_pos[2] - cell_centroid[2])**2) ** 0.5 or diag
+    sphere_src.SetRadius(cam_dist * 0.0048)
 
     # ── Render window (offscreen) ─────────────────────────────────────────────
     render_window = vtk.vtkRenderWindow()
@@ -237,18 +245,28 @@ def _place_camera(
     focal: tuple[float, float, float],
     normal: tuple[float, float, float],
     diag: float,
-) -> None:
+    polydata: vtk.vtkPolyData | None = None,
+) -> tuple[float, float, float]:
     """
-    Position camera along *normal* from *focal*, at distance ~1.5 * diag.
-    Choose view-up as the world axis least parallel to *normal*.
-    """
-    dist = diag * 1.5
-    nx, ny, nz = normal
-    cam_pos = (focal[0] + nx * dist,
-               focal[1] + ny * dist,
-               focal[2] + nz * dist)
+    Position camera along *normal* from *focal*.
+    Returns the camera position so callers can use the distance for scaling.
 
-    # Pick view-up: world axis most orthogonal to the normal
+    If *polydata* is supplied a ray is cast from *focal* along *normal* to a
+    distance of 2 × diag.  If it hits geometry (an opposing wall) the camera
+    is placed 1 % before that hit point, so it sits just inside the cavity
+    with the max cell clearly visible.  If no blocker is found the camera is
+    placed at the default distance of 1.5 × diag.
+    """
+    nx, ny, nz = normal
+    default_dist = diag * 1.5
+
+    if polydata is not None:
+        cam_pos = _camera_pos_with_raycast(polydata, focal, normal, diag, default_dist)
+    else:
+        cam_pos = (focal[0] + nx * default_dist,
+                   focal[1] + ny * default_dist,
+                   focal[2] + nz * default_dist)
+
     axes = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
     dot_abs = [abs(nx * ax[0] + ny * ax[1] + nz * ax[2]) for ax in axes]
     view_up = axes[dot_abs.index(min(dot_abs))]
@@ -258,3 +276,61 @@ def _place_camera(
     camera.SetPosition(*cam_pos)
     camera.SetViewUp(*view_up)
     renderer.ResetCameraClippingRange()
+    return cam_pos
+
+
+def _camera_pos_with_raycast(
+    polydata: vtk.vtkPolyData,
+    focal: tuple[float, float, float],
+    normal: tuple[float, float, float],
+    diag: float,
+    default_dist: float,
+) -> tuple[float, float, float]:
+    """
+    Cast a ray from *focal* along *normal* up to 2 × diag.
+    If it hits geometry (a wall on the other side) place the camera 1 %
+    before that hit so it ends up inside the cavity looking at the cell.
+    If no blocker is found, use *default_dist*.
+    """
+    nx, ny, nz = normal
+    ray_end = (focal[0] + nx * diag * 2,
+               focal[1] + ny * diag * 2,
+               focal[2] + nz * diag * 2)
+
+    locator = vtk.vtkCellLocator()
+    locator.SetDataSet(polydata)
+    locator.BuildLocator()
+
+    t       = vtk.reference(0.0)
+    x       = [0.0, 0.0, 0.0]
+    pcoords = [0.0, 0.0, 0.0]
+    sub_id  = vtk.reference(0)
+    cell_id = vtk.reference(-1)
+
+    # Small offset so the ray starts just above the source cell surface
+    offset = diag * 0.01
+    ray_start = (focal[0] + nx * offset,
+                 focal[1] + ny * offset,
+                 focal[2] + nz * offset)
+
+    hit = locator.IntersectWithLine(
+        list(ray_start), list(ray_end),
+        1e-6,
+        t, x, pcoords, sub_id, cell_id,
+    )
+
+    if hit:
+        # Distance from focal to the blocking wall.
+        # Place camera right at the wall (clamped to at least offset from focal)
+        # so it is as far from the hot cell as possible.
+        hit_dist = ((x[0] - focal[0])**2 +
+                    (x[1] - focal[1])**2 +
+                    (x[2] - focal[2])**2) ** 0.5
+        cam_dist = max(hit_dist, offset * 2)
+        return (focal[0] + nx * cam_dist,
+                focal[1] + ny * cam_dist,
+                focal[2] + nz * cam_dist)
+
+    return (focal[0] + nx * default_dist,
+            focal[1] + ny * default_dist,
+            focal[2] + nz * default_dist)
