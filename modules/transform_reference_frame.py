@@ -22,6 +22,20 @@ DEFAULT_DX = 11.410436
 DEFAULT_DY = 26.617882
 DEFAULT_DZ = 0.920
 
+# ── Named transform presets ───────────────────────────────────────────────────
+# All translations are in metres (m).  Reverse presets flip all signs.
+TRANSFORM_PRESETS: dict[str, dict] = {
+    "DNB → Tokamak":   {"angle_deg": -116.0,   "dx":  11.410436, "dy":  26.617882, "dz":   0.920,    "unit": "m"},
+    "Tokamak → DNB":   {"angle_deg":  116.0,   "dx": -11.410436, "dy": -26.617882, "dz":  -0.920,    "unit": "m"},
+    "HNB1 → Tokamak":  {"angle_deg":  -79.543, "dx":  -0.57723,  "dy":  32.385248, "dz":   1.453462, "unit": "m"},
+    "Tokamak → HNB1":  {"angle_deg":   79.543, "dx":   0.57723,  "dy": -32.385248, "dz":  -1.453462, "unit": "m"},
+    "HNB2 → Tokamak":  {"angle_deg":  -59.543, "dx": -11.618826, "dy":  30.234754, "dz":   1.453462, "unit": "m"},
+    "Tokamak → HNB2":  {"angle_deg":   59.543, "dx":  11.618826, "dy": -30.234754, "dz":  -1.453462, "unit": "m"},
+    "HNB3 → Tokamak":  {"angle_deg":  -39.543, "dx": -21.25902,  "dy":  24.437503, "dz":   1.453462, "unit": "m"},
+    "Tokamak → HNB3":  {"angle_deg":   39.543, "dx":  21.25902,  "dy": -24.437503, "dz":  -1.453462, "unit": "m"},
+    "No Transformation": {"angle_deg":  0.0,     "dx":  0.0,       "dy":  0.0,       "dz":   0.0,       "unit": "m"},
+}
+
 DEFAULT_COLUMN_CANDIDATES = [
     ("X", "Y", "Z"),
     ("x", "y", "z"),

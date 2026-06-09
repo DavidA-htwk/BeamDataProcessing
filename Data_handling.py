@@ -74,7 +74,7 @@ def run_gui():
     root.title("Data Handling")
     root.resizable(True, True)
 
-    # ── Notebook ──────────────────────────────────────────────────────────────
+    # ── Notebook ────────────────────────────────────────────────────────────
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=False, padx=10, pady=(10, 0))
 
@@ -185,6 +185,7 @@ def run_gui():
             "smooth_iterations": smooth_iter_var.get(),
             "save_snapshots":    snap_var.get(),
             "transform": {
+                "preset":       xfm_preset_var.get(),
                 "unit":         xfm_unit_var.get(),
                 "output_unit":  xfm_out_unit_var.get(),
                 "angle_deg":    xfm_angle_var.get(),
@@ -215,12 +216,17 @@ def run_gui():
         output_label_var.set(out or "(script output/ folder)")
         xfm = loaded.get("transform", {})
         if xfm:
-            xfm_unit_var.set(xfm.get("unit", "mm"))
-            xfm_out_unit_var.set(xfm.get("output_unit", xfm.get("unit", "mm")))
+            _p = xfm.get("preset", "")
+            if _p not in _trf.TRANSFORM_PRESETS:
+                _p = list(_trf.TRANSFORM_PRESETS.keys())[0]
+            xfm_preset_var.set(_p)
+            on_preset_selected()
+            xfm_unit_var.set(xfm.get("unit", "m"))
+            xfm_out_unit_var.set(xfm.get("output_unit", xfm.get("unit", "m")))
             xfm_angle_var.set(xfm.get("angle_deg", "-116.0"))
-            xfm_dx_var.set(xfm.get("dx", "11410.436"))
-            xfm_dy_var.set(xfm.get("dy", "26617.882"))
-            xfm_dz_var.set(xfm.get("dz", "920.0"))
+            xfm_dx_var.set(xfm.get("dx", "11.410436"))
+            xfm_dy_var.set(xfm.get("dy", "26.617882"))
+            xfm_dz_var.set(xfm.get("dz", "0.920"))
             xfm_pattern_var.set(xfm.get("pattern", "smoothed_results_*.vtp"))
             xfm_filter_var.set(xfm.get("name_filter", ""))
             xfm_export_geom.set(bool(xfm.get("export_geom", True)))
@@ -264,26 +270,123 @@ def run_gui():
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
 
+    def _open_cfg_file():
+        path = Path(cfg_path_var.get())
+        if path.exists():
+            os.startfile(str(path))
+        else:
+            messagebox.showinfo("Not found", f"Config file does not exist yet:\n{path}")
+
     tk.Button(cfg_frame, text="Save config", width=11, command=on_save_cfg).pack(side="left", padx=2)
     tk.Button(cfg_frame, text="Load config", width=11, command=on_load_cfg).pack(side="left", padx=2)
+    tk.Button(cfg_frame, text="Open file",   width=9,  command=_open_cfg_file).pack(side="left", padx=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 2 — Coordinate Transform
     # ══════════════════════════════════════════════════════════════════════════
     xfm_s = settings.get("transform", {})
 
-    tk.Label(
-        tab2,
-        text="Input directories are shared with the Processing tab.\n"
-             "Files are searched recursively using the pattern below.",
-        anchor="w", justify="left", fg="#444444",
-    ).pack(fill="x", padx=10, pady=(10, 4))
+    # ── Run button for tab 1 ───────────────────────────────────────────────────
+    tab1_btn_frame = tk.Frame(tab1)
+    tab1_btn_frame.pack(pady=(6, 10))
+    tab1_run_btn = tk.Button(
+        tab1_btn_frame, text="Run Processing", width=16, bg="#d4000e", fg="white",
+        font=("Segoe UI", 10, "bold"),
+    )
+    tab1_run_btn.pack(side="left", padx=6)
+
+    # ── Preset selector (two-row radio grid) ───────────────────────────────
+
+    _first_preset = list(_trf.TRANSFORM_PRESETS.keys())[0]
+    _saved_preset = xfm_s.get("preset", _first_preset)
+    if _saved_preset not in _trf.TRANSFORM_PRESETS:
+        _saved_preset = _first_preset
+    xfm_preset_var = tk.StringVar(value=_saved_preset)
+
+    # Hidden vars — updated by preset, consumed by _get_transform_params
+    xfm_angle_var = tk.StringVar(value=xfm_s.get("angle_deg", str(_trf.DEFAULT_ANGLE_DEG)))
+    xfm_dx_var    = tk.StringVar(value=xfm_s.get("dx",        str(_trf.DEFAULT_DX)))
+    xfm_dy_var    = tk.StringVar(value=xfm_s.get("dy",        str(_trf.DEFAULT_DY)))
+    xfm_dz_var    = tk.StringVar(value=xfm_s.get("dz",        str(_trf.DEFAULT_DZ)))
+    xfm_unit_var  = tk.StringVar(value=xfm_s.get("unit", "m"))
+
+    def on_preset_selected(event=None):
+        name = xfm_preset_var.get()
+        if name not in _trf.TRANSFORM_PRESETS:
+            return
+        p = _trf.TRANSFORM_PRESETS[name]
+        xfm_angle_var.set(str(p["angle_deg"]))
+        xfm_dx_var.set(str(p["dx"]))
+        xfm_dy_var.set(str(p["dy"]))
+        xfm_dz_var.set(str(p["dz"]))
+        xfm_unit_var.set(p["unit"])
+
+    on_preset_selected()  # sync hidden vars with selected preset on startup
+
+    _presets_row0 = ["DNB → Tokamak",  "HNB1 → Tokamak", "HNB2 → Tokamak", "HNB3 → Tokamak"]
+    _presets_row1 = ["Tokamak → DNB",  "Tokamak → HNB1", "Tokamak → HNB2", "Tokamak → HNB3"]
+    _presets_row2 = ["No Transformation"]
+
+    preset_lframe = tk.LabelFrame(tab2, text="Coordinate Transform Preset", padx=8, pady=6)
+    preset_lframe.pack(fill="x", padx=10, pady=(8, 4))
+
+    _radio_frame = tk.Frame(preset_lframe)
+    _radio_frame.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+
+    tk.Label(_radio_frame, text="→ Tokamak:", fg="#444444", width=10, anchor="e").grid(
+        row=0, column=0, sticky="e", padx=(0, 6)
+    )
+    for col, name in enumerate(_presets_row0):
+        tk.Radiobutton(
+            _radio_frame, text=name, variable=xfm_preset_var, value=name,
+            command=on_preset_selected,
+        ).grid(row=0, column=col + 1, sticky="w", padx=(0, 10))
+
+    tk.Label(_radio_frame, text="Tokamak →:", fg="#444444", width=10, anchor="e").grid(
+        row=1, column=0, sticky="e", padx=(0, 6)
+    )
+    for col, name in enumerate(_presets_row1):
+        tk.Radiobutton(
+            _radio_frame, text=name, variable=xfm_preset_var, value=name,
+            command=on_preset_selected,
+        ).grid(row=1, column=col + 1, sticky="w", padx=(0, 10))
+
+    tk.Label(_radio_frame, text="Other:", fg="#444444", width=10, anchor="e").grid(
+        row=2, column=0, sticky="e", padx=(0, 6)
+    )
+    for col, name in enumerate(_presets_row2):
+        tk.Radiobutton(
+            _radio_frame, text=name, variable=xfm_preset_var, value=name,
+            command=on_preset_selected,
+        ).grid(row=2, column=col + 1, sticky="w", padx=(0, 10))
+
+    # Coordinate image on the right inside preset_lframe
+    _coord_img_path = str(Path(__file__).resolve().parent / "coordinates.png")
+    _coord_photo = None
+    try:
+        from PIL import Image as _PILImage, ImageTk as _PILImageTk
+        _pil = _PILImage.open(_coord_img_path)
+        _target_h = 70
+        _target_w = int(_target_h * _pil.width / _pil.height)
+        _pil = _pil.resize((_target_w, _target_h), _PILImage.LANCZOS)
+        _coord_photo = _PILImageTk.PhotoImage(_pil)
+    except Exception:
+        try:
+            _raw = tk.PhotoImage(file=_coord_img_path)
+            _factor = max(1, _raw.height() // 70)
+            _coord_photo = _raw.subsample(_factor, _factor)
+        except Exception:
+            _coord_photo = None
+
+    if _coord_photo is not None:
+        _img_lbl = tk.Label(preset_lframe, image=_coord_photo)
+        _img_lbl.image = _coord_photo
+        _img_lbl.grid(row=0, column=1, padx=(16, 4), pady=2, sticky="ns")
 
     # ── Unit ──────────────────────────────────────────────────────────────────
     unit_frame = tk.Frame(tab2)
     unit_frame.pack(fill="x", padx=10, pady=(4, 0))
     tk.Label(unit_frame, text="Input coordinate unit:", anchor="w", width=22).pack(side="left")
-    xfm_unit_var = tk.StringVar(value=xfm_s.get("unit", "m"))
     for unit_label in ("mm", "m"):
         tk.Radiobutton(
             unit_frame, text=unit_label, variable=xfm_unit_var, value=unit_label
@@ -300,72 +403,15 @@ def run_gui():
     tk.Label(out_unit_frame, text="(no conversion = same as input)",
              fg="#888888").pack(side="left", padx=(8, 0))
 
-    # ── Transform parameters ──────────────────────────────────────────────────
-    params_frame = tk.LabelFrame(tab2, text="Transform parameters", padx=8, pady=6)
-    params_frame.pack(fill="x", padx=10, pady=(8, 0))
-
-    def _param_row(parent, row, label, var, unit_hint=""):
-        tk.Label(parent, text=label, anchor="w", width=14).grid(
-            row=row, column=0, sticky="w", pady=3
-        )
-        tk.Entry(parent, textvariable=var, width=18).grid(row=row, column=1, sticky="w", padx=4)
-        tk.Label(parent, text=unit_hint, anchor="w", fg="#666666").grid(
-            row=row, column=2, sticky="w"
-        )
-
-    xfm_angle_var   = tk.StringVar(value=xfm_s.get("angle_deg", "-116.0"))
-    xfm_dx_var      = tk.StringVar(value=xfm_s.get("dx",        "11.410436"))
-    xfm_dy_var      = tk.StringVar(value=xfm_s.get("dy",        "26.617882"))
-    xfm_dz_var      = tk.StringVar(value=xfm_s.get("dz",        "0.920"))
-
-    _param_row(params_frame, 0, "Rotation Z (deg):", xfm_angle_var, "degrees")
-    _param_row(params_frame, 1, "Translate X:",      xfm_dx_var,    "(same unit as files)")
-    _param_row(params_frame, 2, "Translate Y:",      xfm_dy_var,    "(same unit as files)")
-    _param_row(params_frame, 3, "Translate Z:",      xfm_dz_var,    "(same unit as files)")
-
-    # ── Coordinate diagram (inside the LabelFrame, right column) ─────────────
-    _coord_img_path = str(Path(__file__).resolve().parent / "coordinates.png")
-    _coord_photo = None
-    try:
-        from PIL import Image as _PILImage, ImageTk as _PILImageTk
-        _pil = _PILImage.open(_coord_img_path)
-        # Scale to fit the 4-row height of the LabelFrame (~110 px); width proportional
-        _target_h = 110
-        _target_w = int(_target_h * _pil.width / _pil.height)
-        _pil = _pil.resize((_target_w, _target_h), _PILImage.LANCZOS)
-        _coord_photo = _PILImageTk.PhotoImage(_pil)
-    except Exception:
-        try:
-            _raw = tk.PhotoImage(file=_coord_img_path)
-            # subsample so height lands around 110 px
-            _factor = max(1, _raw.height() // 110)
-            _coord_photo = _raw.subsample(_factor, _factor)
-        except Exception:
-            _coord_photo = None
-
-    if _coord_photo is not None:
-        _img_lbl = tk.Label(params_frame, image=_coord_photo)
-        _img_lbl.image = _coord_photo   # keep reference
-        _img_lbl.grid(row=0, column=3, rowspan=4, padx=(12, 4), pady=2, sticky="ns")
-
-    unit_note = tk.Label(
-        tab2,
-        text="Note: default values are in metres (m). If files are in mm, switch unit to 'mm'\n"
-             "and adjust the translation values accordingly (× 1000).",
-        anchor="w", justify="left", fg="#888888",
-    )
-    unit_note.pack(fill="x", padx=10, pady=(4, 0))
 
     # ── File selection ────────────────────────────────────────────────────────
     xfm_opt_frame = tk.Frame(tab2)
-    xfm_opt_frame.pack(fill="x", padx=10, pady=(10, 0))
-
+    xfm_opt_frame.pack(fill="x", padx=10, pady=(8, 0))
     tk.Label(xfm_opt_frame, text="Glob pattern:", anchor="w").grid(row=0, column=0, sticky="w")
     xfm_pattern_var = tk.StringVar(value=xfm_s.get("pattern", "smoothed_results_*.vtp"))
     tk.Entry(xfm_opt_frame, textvariable=xfm_pattern_var, width=40).grid(
         row=0, column=1, sticky="w", padx=(6, 20)
     )
-
     tk.Label(xfm_opt_frame, text="Name filter (comma-separated):", anchor="w").grid(
         row=0, column=2, sticky="w"
     )
@@ -375,51 +421,38 @@ def run_gui():
     )
 
     # ── Export options ────────────────────────────────────────────────────────
-    ttk.Separator(tab2, orient="horizontal").pack(fill="x", padx=10, pady=(10, 4))
-
     export_lframe = tk.LabelFrame(tab2, text="Properties to export", padx=8, pady=4)
-    export_lframe.pack(fill="x", padx=10, pady=(0, 4))
-
+    export_lframe.pack(fill="x", padx=10, pady=(8, 4))
+    _exp_row = tk.Frame(export_lframe)
+    _exp_row.pack(fill="x")
     xfm_export_geom = tk.BooleanVar(value=bool(xfm_s.get("export_geom", True)))
-    tk.Checkbutton(export_lframe, text="Export geometry (X, Y, Z)",
-                   variable=xfm_export_geom).pack(anchor="w", pady=1)
-
+    tk.Checkbutton(_exp_row, text="Geometry (X, Y, Z)",
+                   variable=xfm_export_geom).pack(side="left", padx=(0, 12))
     xfm_export_area = tk.BooleanVar(value=bool(xfm_s.get("export_area", True)))
-    tk.Checkbutton(export_lframe, text="Export cell area",
-                   variable=xfm_export_area).pack(anchor="w", pady=1)
-
+    tk.Checkbutton(_exp_row, text="Cell area",
+                   variable=xfm_export_area).pack(side="left", padx=(0, 12))
     xfm_export_power = tk.BooleanVar(value=bool(xfm_s.get("export_power", True)))
-    tk.Checkbutton(export_lframe, text="Export power (Deposited_Power_W)",
-                   variable=xfm_export_power).pack(anchor="w", pady=1)
-
+    tk.Checkbutton(_exp_row, text="Power (Deposited_Power_W)",
+                   variable=xfm_export_power).pack(side="left", padx=(0, 12))
     xfm_export_pload = tk.BooleanVar(value=bool(xfm_s.get("export_pload", True)))
-    tk.Checkbutton(export_lframe, text="Export power load (Power_Density_W_m2)",
-                   variable=xfm_export_pload).pack(anchor="w", pady=1)
+    tk.Checkbutton(_exp_row, text="Power load (Power_Density_W_m2)",
+                   variable=xfm_export_pload).pack(side="left")
 
-    xfm_mult_frm = tk.Frame(tab2)
-    xfm_mult_frm.pack(fill="x", padx=10, pady=(4, 2))
-    tk.Label(xfm_mult_frm, text="Multiplication factor:",
+    xfm_misc_frame = tk.Frame(tab2)
+    xfm_misc_frame.pack(fill="x", padx=10, pady=(2, 4))
+    tk.Label(xfm_misc_frame, text="Multiplication factor:",
              font=("Segoe UI", 9, "bold")).pack(side="left")
     xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult", "1.0")))
-    tk.Entry(xfm_mult_frm, textvariable=xfm_mult_var, width=10).pack(side="left", padx=(8, 0))
-    tk.Label(xfm_mult_frm, text="(applied to power & power load)",
-             fg="#64748b").pack(side="left", padx=(8, 0))
-
+    tk.Entry(xfm_misc_frame, textvariable=xfm_mult_var, width=10).pack(side="left", padx=(8, 0))
+    tk.Label(xfm_misc_frame, text="(applied to power & power load)",
+             fg="#64748b").pack(side="left", padx=(8, 20))
     xfm_ignore_zeros = tk.BooleanVar(value=bool(xfm_s.get("ignore_zeros", False)))
-    tk.Checkbutton(tab2, text="Ignore zero-valued rows",
-                   variable=xfm_ignore_zeros).pack(anchor="w", padx=16, pady=(4, 4))
+    tk.Checkbutton(xfm_misc_frame, text="Ignore zero-valued rows",
+                   variable=xfm_ignore_zeros).pack(side="left")
 
-    # ── Per-tab Run buttons ───────────────────────────────────────────────────
-    tab1_btn_frame = tk.Frame(tab1)
-    tab1_btn_frame.pack(pady=(6, 10))
-    tab1_run_btn = tk.Button(
-        tab1_btn_frame, text="Run Processing", width=16, bg="#d4000e", fg="white",
-        font=("Segoe UI", 10, "bold"),
-    )
-    tab1_run_btn.pack(side="left", padx=6)
-
+    # ── Run button for tab 2 ─────────────────────────────────────────────────
     tab2_btn_frame = tk.Frame(tab2)
-    tab2_btn_frame.pack(pady=(10, 10))
+    tab2_btn_frame.pack(pady=(8, 10))
     tab2_run_btn = tk.Button(
         tab2_btn_frame, text="Run Transform", width=16, bg="#0060c0", fg="white",
         font=("Segoe UI", 10, "bold"),
@@ -447,7 +480,7 @@ def run_gui():
         log_box.configure(state="disabled")
         root.update_idletasks()
 
-    # ── Bottom Run Both / Stop buttons ────────────────────────────────────────
+    # ── Run Both + Stop ───────────────────────────────────────────────────────
     _stop_event = threading.Event()
     _active_workers = [0]   # mutable counter shared across closures
 
