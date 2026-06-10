@@ -27,3 +27,4 @@ desktop.ini
 # Excel / temp
 ~$*.xlsx
 *.xlsb
+config/data_handling_settings_CDL.json

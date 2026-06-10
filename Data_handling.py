@@ -145,29 +145,130 @@ def run_gui():
         side="left", padx=8
     )
 
-    # ── Smooth iterations ──────────────────────────────────────────────────────
-    smooth_iter_frame = tk.Frame(tab1)
-    smooth_iter_frame.pack(fill="x", padx=10, pady=(6, 0))
-    tk.Label(smooth_iter_frame, text="Smooth iterations:", anchor="w").pack(side="left")
-    smooth_iter_var = tk.IntVar(value=int(settings.get("smooth_iterations", 1)))
-    tk.Spinbox(
-        smooth_iter_frame, from_=0, to=20, width=5,
-        textvariable=smooth_iter_var,
-    ).pack(side="left", padx=(6, 0))
-    tk.Label(
-        smooth_iter_frame,
-        text="(0 = no smoothing, snapshot only; edge-ring cells only)",
-        fg="#888888",
-    ).pack(side="left", padx=(8, 0))
+    # ── Load Geometry + per-component settings ────────────────────────────────
+    load_geo_frame = tk.Frame(tab1)
+    load_geo_frame.pack(fill="x", padx=10, pady=(8, 0))
+    load_geo_btn = tk.Button(
+        load_geo_frame, text="Load Geometry", width=16, bg="#005f73", fg="white",
+        font=("Segoe UI", 10, "bold"),
+    )
+    load_geo_btn.pack(side="left")
+    load_geo_status = tk.StringVar(value="  (scan folders to detect components)")
+    tk.Label(load_geo_frame, textvariable=load_geo_status, fg="#555555", anchor="w").pack(
+        side="left", padx=6
+    )
 
-    # ── Snapshot checkbox ─────────────────────────────────────────────────────
-    snap_var = tk.BooleanVar(value=settings.get("save_snapshots", False))
-    tk.Checkbutton(
-        tab1,
-        text="Save max-point snapshots (PNG per file)",
-        variable=snap_var,
-        anchor="w",
-    ).pack(fill="x", padx=10, pady=(6, 0))
+    comp_lframe = tk.LabelFrame(tab1, text="Components", padx=8, pady=4)
+    comp_lframe.pack(fill="x", padx=10, pady=(6, 0))
+
+    _comp_hdr = tk.Frame(comp_lframe)
+    _comp_hdr.pack(fill="x")
+    tk.Label(_comp_hdr, text="Component",   width=24, anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(_comp_hdr, text="Files",       width=8,  anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(_comp_hdr, text="Smooth iter", width=10, anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(_comp_hdr, text="Snapshot",    width=14, anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+
+    comp_rows_frame = tk.Frame(comp_lframe)
+    comp_rows_frame.pack(fill="x")
+
+    # Maps component name -> {smooth_var, snap_var, count_var}
+    _comp_widgets: dict = {}
+    # Component settings from a loaded config; applied on next Load Geometry call
+    _pending_comp_cfg: dict = {}
+
+    _placeholder_lbl = tk.Label(
+        comp_rows_frame, text="(click Load Geometry to populate)", fg="#aaaaaa")
+    _placeholder_lbl.pack(anchor="w", pady=4)
+
+    def _build_comp_row(name: str, count: int) -> None:
+        """Add one component row (or update its file count if it already exists)."""
+        if name in _comp_widgets:
+            _comp_widgets[name]["count_var"].set(str(count))
+            return
+        saved      = _pending_comp_cfg.get(name, {})
+        smooth_var = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
+        snap_var_c = tk.BooleanVar(value=bool(saved.get("save_snapshot", False)))
+        count_var  = tk.StringVar(value=str(count))
+
+        row = tk.Frame(comp_rows_frame)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=name,               width=24, anchor="w").pack(side="left")
+        tk.Label(row, textvariable=count_var,  width=8,  anchor="w", fg="#666666").pack(side="left")
+        tk.Spinbox(row, from_=0, to=20, width=5, textvariable=smooth_var).pack(side="left")
+        tk.Label(row, text="", width=1).pack(side="left")
+        tk.Checkbutton(row, text="Save snapshot", variable=snap_var_c).pack(side="left")
+
+        _comp_widgets[name] = {
+            "smooth_var": smooth_var,
+            "snap_var":   snap_var_c,
+            "count_var":  count_var,
+        }
+
+    def on_load_geometry():
+        # Preserve any user-edited spinbox/checkbox values before rebuilding
+        for name, w in _comp_widgets.items():
+            _pending_comp_cfg[name] = {
+                "smooth_iterations": w["smooth_var"].get(),
+                "save_snapshot":     w["snap_var"].get(),
+            }
+        raw = text_box.get("1.0", "end").strip()
+        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
+        if not dirs:
+            messagebox.showwarning("No directories", "Please add at least one input directory.")
+            return
+        pattern    = pattern_var.get() or "smoothed_results_*.vtp"
+        raw_filter = filter_var.get().strip()
+        terms      = [t.strip() for t in raw_filter.split(",") if t.strip()] if raw_filter else []
+
+        counts: dict = {}
+        log("Load Geometry: scanning...")
+        for d in dirs:
+            p = Path(d)
+            if not p.is_dir():
+                log(f"  [SKIP] not a directory: {d}")
+                continue
+            if p.name.upper().startswith("OUTPUT_"):
+                folders = [s for s in sorted(p.iterdir()) if s.is_dir()]
+            else:
+                folders = [p]
+            for folder in folders:
+                files = sorted(folder.rglob(pattern))
+                if terms:
+                    for t in terms:
+                        matched = [f for f in files if t.lower() in f.stem.lower()]
+                        if matched:
+                            log(f"  [{t}] {folder.name}: {len(matched)} file(s)")
+                            for f in matched:
+                                log(f"    {f.name}")
+                        counts[t] = counts.get(t, 0) + len(matched)
+                else:
+                    if files:
+                        log(f"  [(all)] {folder.name}: {len(files)} file(s)")
+                        for f in files:
+                            log(f"    {f.name}")
+                    counts["(all)"] = counts.get("(all)", 0) + len(files)
+
+        if not any(v > 0 for v in counts.values()):
+            load_geo_status.set("  No matching files found.")
+            return
+
+        for widget in comp_rows_frame.winfo_children():
+            widget.destroy()
+        _comp_widgets.clear()
+
+        total = 0
+        for name, count in counts.items():
+            if count > 0:
+                _build_comp_row(name, count)
+                total += count
+        load_geo_status.set(f"  {len(_comp_widgets)} component(s), {total} file(s)")
+        log(f"Load Geometry done: {len(_comp_widgets)} component(s), {total} file(s).")
+
+    load_geo_btn.configure(command=on_load_geometry)
 
     # ── Config save / load ────────────────────────────────────────────────────
     cfg_frame = tk.Frame(tab1)
@@ -181,12 +282,17 @@ def run_gui():
         raw = text_box.get("1.0", "end").strip()
         dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
         return {
-            "input_dirs":        dirs,
-            "output_folder":     output_folder_var.get(),
-            "pattern":           pattern_var.get() or "smoothed_results_*.vtp",
-            "name_filter":       filter_var.get().strip(),
-            "smooth_iterations": smooth_iter_var.get(),
-            "save_snapshots":    snap_var.get(),
+            "input_dirs":    dirs,
+            "output_folder": output_folder_var.get(),
+            "pattern":       pattern_var.get() or "smoothed_results_*.vtp",
+            "name_filter":   filter_var.get().strip(),
+            "components":    {
+                name: {
+                    "smooth_iterations": w["smooth_var"].get(),
+                    "save_snapshot":     w["snap_var"].get(),
+                }
+                for name, w in _comp_widgets.items()
+            },
             "transform": {
                 "preset":       xfm_preset_var.get(),
                 "unit":         xfm_unit_var.get(),
@@ -212,11 +318,13 @@ def run_gui():
             text_box.insert("1.0", "\n".join(loaded["input_dirs"]))
         pattern_var.set(loaded.get("pattern", "smoothed_results_*.vtp"))
         filter_var.set(loaded.get("name_filter", ""))
-        smooth_iter_var.set(int(loaded.get("smooth_iterations", 1)))
-        snap_var.set(loaded.get("save_snapshots", False))
         out = loaded.get("output_folder", "")
         output_folder_var.set(out)
         output_label_var.set(out or "(script output/ folder)")
+        # Restore per-component settings and rebuild component rows
+        _pending_comp_cfg.clear()
+        _pending_comp_cfg.update(loaded.get("components", {}))
+        root.after(0, on_load_geometry)
         xfm = loaded.get("transform", {})
         if xfm:
             _p = xfm.get("preset", "")
@@ -666,8 +774,24 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
     input_dirs       = cfg["input_dirs"]
     pattern          = cfg["pattern"]
     name_filter      = cfg.get("name_filter", "")
-    smooth_iterations = int(cfg.get("smooth_iterations", 1))
-    save_snapshots   = cfg.get("save_snapshots", False)
+    components       = cfg.get("components", {})
+
+    def _file_settings(filepath: Path) -> tuple:
+        """Return (n_iter, save_snapshot) for a file based on its component name."""
+        stem = filepath.stem.lower()
+        for comp_name, comp_cfg in components.items():
+            if comp_name == "(all)":
+                continue
+            if comp_name.lower() in stem:
+                return (int(comp_cfg.get("smooth_iterations", 1)),
+                        bool(comp_cfg.get("save_snapshot", False)))
+        if "(all)" in components:
+            c = components["(all)"]
+            return (int(c.get("smooth_iterations", 1)),
+                    bool(c.get("save_snapshot", False)))
+        # Legacy fallback for configs without per-component settings
+        return (int(cfg.get("smooth_iterations", 1)),
+                bool(cfg.get("save_snapshots", False)))
 
     # Expand any OUTPUT_* folder into its immediate subfolders
     expanded_dirs = []
@@ -690,8 +814,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
     os.makedirs(out_dir, exist_ok=True)
 
     snap_dir = out_dir / "snapshots"
-    if save_snapshots:
-        snap_dir.mkdir(parents=True, exist_ok=True)
+    # snap_dir is created lazily in stage 3 only when needed
 
     csv_path = out_dir / "max_comparison_batch.csv"
 
@@ -733,14 +856,12 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         log(f"\nTotal: {len(all_files)} file(s) to process")
         log("=" * 80)
 
-        snapshot_only = (smooth_iterations == 0)
-
         # ── Stage 1: Load VTP files (parallel I/O) ───────────────────────
         # ThreadPool.imap_unordered feeds one item per idle worker — at most
         # n_workers files live in memory at once.  I/O-bound work benefits
         # from a pool larger than cpu_count; cap at 12 to stay reasonable.
         n_all     = len(all_files)
-        n_workers = min(os.cpu_count() or 4, n_all, 10)
+        n_workers = min(os.cpu_count() or 4, n_all, 12)
         log(f"\n[1/3] Loading {n_all} VTP file(s) ({n_workers} workers)...")
         loaded: list[tuple] = []
         t0_load = time.perf_counter()
@@ -764,40 +885,50 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
 
         log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0_load:.1f}s")
 
-        # ── Stage 2: Smoothing (skipped when smooth_iterations == 0) ─────
-        processed: list[tuple] = []  # (..., polydata_orig, max_before, polydata_smooth, max_after)
-        if snapshot_only:
-            log("\n[2/3] Smoothing skipped (iterations = 0)")
-            for item in loaded:
-                filepath, output_name, case, scenario, polydata, max_val = item
-                processed.append((filepath, output_name, case, scenario,
-                                   polydata, max_val, polydata, max_val))
-        else:
-            n_loaded = len(loaded)
-            log(f"\n[2/3] Smoothing {n_loaded} file(s) "
-                f"({smooth_iterations} iteration(s), {n_workers} workers)...")
-            t0_smooth = time.perf_counter()
-            smooth_args = [
-                (filepath, output_name, case, scenario, polydata, max_before, smooth_iterations)
-                for filepath, output_name, case, scenario, polydata, max_before in loaded
-            ]
-            with ThreadPool(processes=n_workers) as pool:
+        # Build per-file (n_iter, save_snapshot) lookup from component config
+        _snap_map = {fp: _file_settings(fp) for fp, *_ in loaded}
+
+        # ── Stage 2: Smoothing / passthrough (n_iter=0 files skip smoothing) ──
+        processed: list[tuple] = []
+        n_loaded = len(loaded)
+        n_smooth_workers = max(1, min(n_loaded, n_workers))
+        log(f"\n[2/3] Processing {n_loaded} file(s) ({n_smooth_workers} workers)...")
+        t0_smooth = time.perf_counter()
+        smooth_args = [
+            (filepath, output_name, case, scenario, polydata, max_before,
+             _snap_map[filepath][0], stop_event)
+            for filepath, output_name, case, scenario, polydata, max_before in loaded
+        ]
+        import sys as _sys
+        _prev_interval = _sys.getswitchinterval()
+        _sys.setswitchinterval(0.001)   # 1ms: Tkinter gets CPU 5x more often
+        try:
+            with ThreadPool(processes=n_smooth_workers) as pool:
                 for completed, result in enumerate(
                         pool.imap_unordered(_smooth_one_file, smooth_args), 1):
                     if stopped():
                         pool.terminate()
                         break
                     elapsed = time.perf_counter() - t0_smooth
+                    if result is None:   # worker saw stop_event
+                        continue
                     if isinstance(result, Exception):
                         log(f"  [{completed}/{n_loaded}] ERROR: {result}")
                         continue
                     (filepath, output_name, case, scenario,
                      polydata, max_before, smoothed, max_after) = result
                     processed.append(result)
-                    log(f"  [{completed}/{n_loaded}] {filepath.name}  "
-                        f"(elapsed: {elapsed:.1f}s)  "
-                        f"before={max_before:.4g}  after={max_after:.4g}")
-            log(f"  Smoothing done in {time.perf_counter()-t0_smooth:.1f}s")
+                    n_iter_used = _snap_map[filepath][0]
+                    if n_iter_used > 0:
+                        log(f"  [{completed}/{n_loaded}] {filepath.name}  "
+                            f"(elapsed: {elapsed:.1f}s)  "
+                            f"before={max_before:.4g}  after={max_after:.4g}  ({n_iter_used} iter)")
+                    else:
+                        log(f"  [{completed}/{n_loaded}] {filepath.name}  "
+                            f"(elapsed: {elapsed:.1f}s)  no smoothing")
+        finally:
+            _sys.setswitchinterval(_prev_interval)   # always restore
+        log(f"  Stage 2 done in {time.perf_counter()-t0_smooth:.1f}s")
 
         # ── Write CSV rows ────────────────────────────────────────────────
         for item in processed:
@@ -811,24 +942,20 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
             ])
             total_files += 1
 
-            if not snapshot_only:
-                log(f"  {filepath.name}: before={max_before:.6g}  after={max_after:.6g}  delta={abs(max_after - max_before):.6g}")
-
-        # ── Stage 3: Snapshots (parallel rendering) ─────────────────────────
-        if save_snapshots:
-            n_proc = len(processed)
-            # Rendering is single-threaded: multiple vtkRenderWindow (WGL) contexts
-            # competing for the same GPU command queue starve the Tkinter compositor
-            # and freeze the GUI.  Per-file time is already ~6s (MSAA disabled) so
-            # sequential rendering finishes in acceptable time without GUI instability.
+        # ── Stage 3: Snapshots (per-component; only files with save_snapshot=True) ─
+        snap_items = [item for item in processed if _snap_map[item[0]][1]]
+        if snap_items:
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            n_snap = len(snap_items)
             n_snap_workers = 1
-            log(f"\n[3/3] Saving {n_proc} snapshot(s) ({n_snap_workers} workers)...")
+            log(f"\n[3/3] Saving {n_snap} snapshot(s) ({n_snap_workers} worker)...")
             t0_snap = time.perf_counter()
             snap_args = [
                 (filepath, output_name, case, scenario,
-                 polydata_orig, polydata_smooth, snap_dir, snapshot_only)
+                 polydata_orig, polydata_smooth, snap_dir,
+                 _snap_map[filepath][0] == 0)   # snapshot_only=True when n_iter=0
                 for filepath, output_name, case, scenario,
-                    polydata_orig, _, polydata_smooth, _ in processed
+                    polydata_orig, _, polydata_smooth, _ in snap_items
             ]
             with ThreadPool(processes=n_snap_workers) as pool:
                 for completed, result in enumerate(
@@ -838,10 +965,10 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                         break
                     elapsed = time.perf_counter() - t0_snap
                     if isinstance(result, Exception):
-                        log(f"  [{completed}/{n_proc}] ERROR: {result}")
+                        log(f"  [{completed}/{n_snap}] ERROR: {result}")
                         continue
                     label, file_elapsed = result
-                    log(f"  [{completed}/{n_proc}] {label}  ({file_elapsed:.1f}s)")
+                    log(f"  [{completed}/{n_snap}] {label}  ({file_elapsed:.1f}s)")
             log(f"  Snapshots done in {time.perf_counter()-t0_snap:.1f}s")
         else:
             log("\n[3/3] Snapshots disabled")
@@ -928,7 +1055,7 @@ def run_transform(
 
     # ── Run all files in one shared pool ─────────────────────────────────────
     n_total   = len(all_xfm_args)
-    n_workers = min(os.cpu_count() or 4, n_total, 10)
+    n_workers = min(os.cpu_count() or 4, n_total, 12)
     log(f"\nTransforming {n_total} file(s) total ({n_workers} workers)...")
     log("=" * 80)
 
@@ -1039,11 +1166,19 @@ def _load_one_file(args: tuple) -> tuple:
 
 def _smooth_one_file(args: tuple) -> tuple:
     """Apply edge smoothing to one loaded file.  Called from a thread pool.
-    apply_edge_smooth is pure CPU (numpy + VTK geometry), no GPU — safe to parallelise.
-    Returns the full processed tuple, or an Exception."""
+    Accepts stop_event so it can self-cancel between phases without waiting for
+    the outer imap_unordered loop to get a turn.
+    Returns the full processed tuple, or an Exception, or None if stopped."""
     try:
-        filepath, output_name, case, scenario, polydata, max_before, n_iter = args
-        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter)
+        filepath, output_name, case, scenario, polydata, max_before, n_iter, stop_event = args
+        if stop_event is not None and stop_event.is_set():
+            return None
+        if n_iter == 0:
+            # No smoothing requested for this component — pass through unchanged
+            return filepath, output_name, case, scenario, polydata, max_before, polydata, max_before
+        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter, stop_event=stop_event)
+        if smoothed is None:
+            return None   # cancelled mid-smooth
         max_after = find_max(smoothed, ARRAY_NAME)
         return filepath, output_name, case, scenario, polydata, max_before, smoothed, max_after
     except Exception as exc:
@@ -1150,10 +1285,11 @@ def find_max(polydata, array_name):
 
 
 # ── Smoothing (mirrors Smart_Smooth_EDGE.py) ──────────────────────────────────
-def apply_edge_smooth(src, n_iter: int = 1):
+def apply_edge_smooth(src, n_iter: int = 1, stop_event=None):
     """
     Iterative neighbour-mean smoothing restricted to cells that touch
     boundary or feature edges (angle >= FEATURE_ANGLE degrees).
+    Returns None if stop_event is set mid-computation.
 
     Each iteration averages only the edge-ring cells (identified once before
     the loop), so locality is preserved — interior cells are never touched.
@@ -1162,6 +1298,9 @@ def apply_edge_smooth(src, n_iter: int = 1):
 
     Returns a NEW vtkPolyData — src is never modified.
     """
+    def _cancelled():
+        return stop_event is not None and stop_event.is_set()
+
     out = vtk.vtkPolyData()
     out.DeepCopy(src)                          # independent copy
 
@@ -1184,6 +1323,8 @@ def apply_edge_smooth(src, n_iter: int = 1):
     fe.ManifoldEdgesOff()
     fe.ColoringOff()
     fe.Update()
+    if _cancelled():
+        return None   # stopped after VTK edge extraction
 
     # Step 2 — build integer keys for edge points (numpy, no loop)
     edge_pts  = fe.GetOutput().GetPoints()
@@ -1230,6 +1371,8 @@ def apply_edge_smooth(src, n_iter: int = 1):
     if not edge_cells:
         print("  Nothing to smooth.")
         return out
+    if _cancelled():
+        return None   # stopped after edge-cell identification
 
     # Step 5 — iterative mean of point-connected neighbours (edge-ring only)
     # Pre-build neighbour lists once using numpy connectivity for speed.
@@ -1251,6 +1394,8 @@ def apply_edge_smooth(src, n_iter: int = 1):
     n_iter = max(1, int(n_iter))
     current_vals = np.copy(raw_vals)
     for iteration in range(n_iter):
+        if _cancelled():
+            return None   # stopped between smoothing passes
         next_vals = np.copy(current_vals)
         for cid in edge_cell_list:
             nbrs = cell_neighbours[cid]
