@@ -52,17 +52,41 @@ SETTINGS_FILE = Path(__file__).resolve().parent / "config" / "data_handling_sett
 
 
 def load_settings() -> dict:
+    """Load settings from SETTINGS_FILE, following last_config_path if set."""
+    base: dict = {}
     if SETTINGS_FILE.exists():
         try:
             with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                base = json.load(f)
         except Exception:
             pass
-    return {}
+
+    last = base.get("last_config_path", "")
+    if last and last != str(SETTINGS_FILE):
+        p = Path(last)
+        if p.exists():
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg["last_config_path"] = last   # carry the pointer through
+                return cfg
+            except Exception:
+                pass   # fall through to base
+    return base
 
 
 def save_settings(cfg: dict) -> None:
     try:
+        # Preserve last_config_path so the startup redirect survives a Run press
+        existing: dict = {}
+        if SETTINGS_FILE.exists():
+            try:
+                with SETTINGS_FILE.open("r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception:
+                pass
+        if "last_config_path" in existing:
+            cfg = {**cfg, "last_config_path": existing["last_config_path"]}
         with SETTINGS_FILE.open("w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
@@ -275,7 +299,9 @@ def run_gui():
     cfg_frame.pack(fill="x", padx=10, pady=(8, 8))
 
     tk.Label(cfg_frame, text="Config file:", anchor="w").pack(side="left")
-    cfg_path_var = tk.StringVar(value=str(SETTINGS_FILE))
+    cfg_path_var = tk.StringVar(
+        value=settings.get("last_config_path", str(SETTINGS_FILE))
+    )
     tk.Entry(cfg_frame, textvariable=cfg_path_var, width=55).pack(side="left", padx=(6, 4))
 
     def _current_cfg() -> dict:
@@ -321,10 +347,9 @@ def run_gui():
         out = loaded.get("output_folder", "")
         output_folder_var.set(out)
         output_label_var.set(out or "(script output/ folder)")
-        # Restore per-component settings and rebuild component rows
+        # Restore per-component settings; rows will be built on next Load Geometry press
         _pending_comp_cfg.clear()
         _pending_comp_cfg.update(loaded.get("components", {}))
-        root.after(0, on_load_geometry)
         xfm = loaded.get("transform", {})
         if xfm:
             _p = xfm.get("preset", "")
@@ -347,7 +372,35 @@ def run_gui():
             xfm_mult_var.set(str(xfm.get("mult", "1.0")))
             xfm_ignore_zeros.set(bool(xfm.get("ignore_zeros", False)))
 
+    def _remember_cfg_path(path: str) -> None:
+        """Write last_config_path into SETTINGS_FILE so it survives restarts."""
+        try:
+            existing: dict = {}
+            if SETTINGS_FILE.exists():
+                with SETTINGS_FILE.open("r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            existing["last_config_path"] = path
+            with SETTINGS_FILE.open("w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+        except Exception:
+            pass
+
     def on_save_cfg():
+        """Save directly to the current config path — no dialog."""
+        path = cfg_path_var.get()
+        if not path:
+            path = str(SETTINGS_FILE)
+            cfg_path_var.set(path)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(_current_cfg(), f, indent=2)
+            _remember_cfg_path(path)
+            log(f"Config saved: {path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def on_save_cfg_as():
+        """Open a save dialog to choose a new path, then save."""
         path = filedialog.asksaveasfilename(
             title="Save config as…",
             initialdir=str(Path(cfg_path_var.get()).parent),
@@ -358,6 +411,7 @@ def run_gui():
         if not path:
             return
         cfg_path_var.set(path)
+        _remember_cfg_path(path)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(_current_cfg(), f, indent=2)
@@ -374,6 +428,7 @@ def run_gui():
         if not path:
             return
         cfg_path_var.set(path)
+        _remember_cfg_path(path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -382,16 +437,9 @@ def run_gui():
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
 
-    def _open_cfg_file():
-        path = Path(cfg_path_var.get())
-        if path.exists():
-            os.startfile(str(path))
-        else:
-            messagebox.showinfo("Not found", f"Config file does not exist yet:\n{path}")
-
-    tk.Button(cfg_frame, text="Save config", width=11, command=on_save_cfg).pack(side="left", padx=2)
-    tk.Button(cfg_frame, text="Load config", width=11, command=on_load_cfg).pack(side="left", padx=2)
-    tk.Button(cfg_frame, text="Open file",   width=9,  command=_open_cfg_file).pack(side="left", padx=2)
+    tk.Button(cfg_frame, text="Save config",    width=12, command=on_save_cfg).pack(side="left", padx=2)
+    tk.Button(cfg_frame, text="Save config as…",width=14, command=on_save_cfg_as).pack(side="left", padx=2)
+    tk.Button(cfg_frame, text="Load config",    width=12, command=on_load_cfg).pack(side="left", padx=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 2 — Coordinate Transform
