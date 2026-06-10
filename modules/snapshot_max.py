@@ -140,6 +140,18 @@ def save_max_snapshot(
         diag          = None
 
     # ── Colour map ────────────────────────────────────────────────────────────
+    # Human-readable labels and units for known arrays.
+    _LABEL_MAP = {
+        "Power_Density_W_m2": "Power Density [W/m\u00b2]",
+        "Deposited_Power_W":  "Total Power [W]",
+    }
+    _UNIT_MAP = {
+        "Power_Density_W_m2": "W/m\u00b2",
+        "Deposited_Power_W":  "W",
+    }
+    bar_label  = _LABEL_MAP.get(array_name, array_name)
+    unit_label = _UNIT_MAP.get(array_name, "")
+
     color_min = 0.0
     color_max = float(vmax) if vmax is not None else float(max_val)
 
@@ -162,7 +174,12 @@ def save_max_snapshot(
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
 
-    # ── Max-point sphere marker ───────────────────────────────────────────────
+    # ── Max-point sphere marker + max label (Power Density only) ──────────────
+    # For Total Power the marker and label are omitted: the max-power cell is
+    # typically a large-area edge cell whose location is not physically meaningful
+    # as a "hot spot", so showing it would be misleading.
+    _is_pwr_density = (array_name == "Power_Density_W_m2")
+
     sphere_src = vtk.vtkSphereSource()
     sphere_src.SetCenter(*cell_centroid)
     sphere_src.SetPhiResolution(12)
@@ -172,11 +189,11 @@ def save_max_snapshot(
     sphere_actor = vtk.vtkActor()
     sphere_actor.SetMapper(sphere_mapper)
     sphere_actor.GetProperty().SetColor(0.498, 0.0, 1.0)   # #7F00FF violet
+    sphere_actor.SetVisibility(1 if _is_pwr_density else 0)
 
     # ── Max value label (top-left of mesh viewport) ───────────────────────────
-    # Show the scaled value (color_max) so label matches the CSV and scalar bar.
     max_label = vtk.vtkTextActor()
-    max_label.SetInput(f"[*] Max: {color_max:.6g}")
+    max_label.SetInput(f"[*] Max: {color_max:.6g} {unit_label}")
     ml = max_label.GetTextProperty()
     ml.SetColor(0.498, 0.0, 1.0)
     ml.SetFontSize(18)
@@ -187,6 +204,7 @@ def save_max_snapshot(
     ml.SetBackgroundOpacity(0.85)
     max_label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
     max_label.SetPosition(0.02, 0.94)
+    max_label.SetVisibility(1 if _is_pwr_density else 0)
 
     # ── Left renderer: mesh + axes (75% of image width) ──────────────────────
     _MESH_VP = 0.75   # fraction of total width given to the mesh
@@ -229,7 +247,7 @@ def save_max_snapshot(
 
     # Rotated array-name title on the right edge of the scalar bar panel
     sbar_title = vtk.vtkTextActor()
-    sbar_title.SetInput(array_name)
+    sbar_title.SetInput(bar_label)
     sbt = sbar_title.GetTextProperty()
     sbt.SetColor(0.0, 0.0, 0.0)
     sbt.SetFontSize(16)
