@@ -24,10 +24,31 @@ supplied, otherwise per-file.
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 import numpy as np
 import vtk
 from vtk.util.numpy_support import vtk_to_numpy
+
+
+def _nice_ticks(vmin: float, vmax: float, n: int = 4) -> list:
+    """Return ~n nicely-rounded tick values between vmin and vmax."""
+    if vmax <= vmin or not math.isfinite(vmin) or not math.isfinite(vmax):
+        return [vmin]
+    rng = vmax - vmin
+    if rng == 0:
+        return [vmin]
+    raw_step = rng / n
+    mag = 10 ** math.floor(math.log10(raw_step))
+    candidates = [mag * m for m in (1, 2, 2.5, 5, 10)]
+    step = min(candidates, key=lambda s: abs(s - raw_step))
+    start = math.ceil(vmin / step) * step
+    ticks: list = []
+    v = start
+    while v <= vmax + 1e-9 * rng:
+        ticks.append(round(v, 10))
+        v += step
+    return ticks if ticks else [vmin, vmax]
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -76,6 +97,10 @@ def save_max_snapshot(
 ) -> bool:
     """
     Render *polydata* coloured by *array_name* and save a PNG to *out_path*.
+
+    Layout: image is split into two dedicated renderers so actors never overlap.
+      Left 75%  — mesh renderer: geometry, sphere marker, axes triad, max label
+      Right 25% — scalar-bar panel: colour bar + rotated array-name title
 
     Parameters
     ----------
@@ -137,77 +162,7 @@ def save_max_snapshot(
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
 
-    # ── Scalar bar ────────────────────────────────────────────────────────────
-    # Height 0.44 + bottom at 0.25 = top at 0.69.
-    # The top tick label renders ~0.04 above the bar edge, so the background
-    # panel (which ends at 0.69) needs a gap -- we leave room by starting at
-    # 0.22 and keeping height 0.44 so the panel top is at 0.66 and the label
-    # at 0.69 still sits inside the panel's visual extent.
-    # Simplest reliable fix: use SetTextPad to add internal padding.
-    scalar_bar = vtk.vtkScalarBarActor()
-    scalar_bar.SetLookupTable(lut)
-    scalar_bar.SetTitle("")              # title drawn as a separate rotated actor below
-    scalar_bar.SetNumberOfLabels(5)
-    scalar_bar.SetWidth(0.09)
-    scalar_bar.SetHeight(0.50)
-    scalar_bar.SetPosition(0.82, 0.22)
-    try:
-        scalar_bar.SetTextPad(4)         # pixels of padding inside background (VTK >= 9.1)
-    except AttributeError:
-        pass
-
-    label_prop = scalar_bar.GetLabelTextProperty()
-    label_prop.SetColor(0.0, 0.0, 0.0)
-    label_prop.SetFontSize(12)
-    label_prop.SetFontFamilyToTimes()
-    label_prop.ItalicOff()
-    label_prop.BoldOff()
-    scalar_bar.UnconstrainedFontSizeOn()
-
-    # Frosted white panel behind bar + labels
-    scalar_bar.DrawBackgroundOn()
-    scalar_bar.DrawFrameOn()
-    sb_bg = scalar_bar.GetBackgroundProperty()
-    sb_bg.SetColor(1.0, 1.0, 1.0)
-    sb_bg.SetOpacity(0.80)
-    sb_frame = scalar_bar.GetFrameProperty()
-    sb_frame.SetColor(0.6, 0.6, 0.6)
-    sb_frame.SetOpacity(1.0)
-
-    # ── Scalar bar title: 90° rotated, anchored at bar bottom ─────────────────
-    # vtkTextActor with SetBackgroundColor gives a reliable frosted rectangle.
-    # Position x is just right of the bar+label column; y matches bar bottom.
-    sbar_title = vtk.vtkTextActor()
-    sbar_title.SetInput(array_name)
-    sbt = sbar_title.GetTextProperty()
-    sbt.SetColor(0.0, 0.0, 0.0)
-    sbt.SetFontSize(18)
-    sbt.SetFontFamilyToTimes()
-    sbt.ItalicOn()
-    sbt.BoldOff()
-    sbt.SetOrientation(90)
-    sbt.SetBackgroundColor(1.0, 1.0, 1.0)
-    sbt.SetBackgroundOpacity(0.80)
-    sbar_title.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-    sbar_title.SetPosition(0.96, 0.22)   # matches bar bottom
-
-    # ── Max value: plain vtkTextActor (reliable background) ───────────────────
-    # vtkLegendBoxActor background is unreliable; vtkTextActor.GetTextProperty
-    # SetBackgroundColor/Opacity is composited correctly in offscreen renders.
-    max_label = vtk.vtkTextActor()
-    max_label.SetInput(f"[*] Max: {max_val:.6g}")  # [*] = ASCII stand-in for the max marker
-    ml = max_label.GetTextProperty()
-    ml.SetColor(0.498, 0.0, 1.0)          # violet to match sphere
-    ml.SetFontSize(18)
-    ml.SetFontFamilyToTimes()
-    ml.BoldOn()
-    ml.ItalicOff()
-    ml.SetBackgroundColor(1.0, 1.0, 1.0)
-    ml.SetBackgroundOpacity(0.85)
-    max_label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-    max_label.SetPosition(0.02, 0.94)
-
-    # ── Max-point marker (violet sphere) ─────────────────────────────────────────────────
+    # ── Max-point sphere marker ───────────────────────────────────────────────
     sphere_src = vtk.vtkSphereSource()
     sphere_src.SetCenter(*cell_centroid)
     sphere_src.SetPhiResolution(12)
@@ -218,71 +173,193 @@ def save_max_snapshot(
     sphere_actor.SetMapper(sphere_mapper)
     sphere_actor.GetProperty().SetColor(0.498, 0.0, 1.0)   # #7F00FF violet
 
-    # ── Renderer ──────────────────────────────────────────────────────────────
-    renderer = vtk.vtkRenderer()
-    renderer.SetBackground(1, 1, 1)
-    renderer.AddActor(actor)
-    renderer.AddActor(sphere_actor)
-    renderer.AddActor2D(scalar_bar)
-    renderer.AddActor2D(sbar_title)
-    renderer.AddActor2D(max_label)
+    # ── Max value label (top-left of mesh viewport) ───────────────────────────
+    # Show the scaled value (color_max) so label matches the CSV and scalar bar.
+    max_label = vtk.vtkTextActor()
+    max_label.SetInput(f"[*] Max: {color_max:.6g}")
+    ml = max_label.GetTextProperty()
+    ml.SetColor(0.498, 0.0, 1.0)
+    ml.SetFontSize(18)
+    ml.SetFontFamilyToTimes()
+    ml.BoldOn()
+    ml.ItalicOff()
+    ml.SetBackgroundColor(1.0, 1.0, 1.0)
+    ml.SetBackgroundOpacity(0.85)
+    max_label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+    max_label.SetPosition(0.02, 0.94)
 
-    # ── Axes grid (vtkCubeAxesActor — equivalent of ParaView AxesGrid) ────────
-    bounds = polydata.GetBounds()   # (xmin, xmax, ymin, ymax, zmin, zmax)
-    cube_axes = vtk.vtkCubeAxesActor()
-    cube_axes.SetBounds(bounds)
-    cube_axes.SetFlyModeToStaticEdges()   # axis labels stay on outer edges
-    cube_axes.DrawXGridlinesOn()
-    cube_axes.DrawYGridlinesOn()
-    cube_axes.DrawZGridlinesOn()
-    # Black grid lines & axes
-    _black = (0.0, 0.0, 0.0)
-    for prop in (cube_axes.GetXAxesGridlinesProperty(),
-                 cube_axes.GetYAxesGridlinesProperty(),
-                 cube_axes.GetZAxesGridlinesProperty()):
-        prop.SetColor(*_black)
-    # Label and title text properties — VTK 9.x Python API uses GetLabelTextProperty(i)
-    # and GetTitleTextProperty(i) where i=0/1/2 for X/Y/Z.  The old per-axis named
-    # methods (GetXAxisLabelTextProperty etc.) do not exist in vtkmodules.
-    for axis_idx in range(3):
-        for tp in (cube_axes.GetLabelTextProperty(axis_idx),
-                   cube_axes.GetTitleTextProperty(axis_idx)):
-            tp.SetColor(*_black)
-            tp.SetFontSize(10)
-            tp.BoldOff()
-            tp.ItalicOff()
-    cube_axes.GetXAxesLinesProperty().SetColor(*_black)
-    cube_axes.GetYAxesLinesProperty().SetColor(*_black)
-    cube_axes.GetZAxesLinesProperty().SetColor(*_black)
-    cube_axes.XAxisMinorTickVisibilityOff()
-    cube_axes.YAxisMinorTickVisibilityOff()
-    cube_axes.ZAxisMinorTickVisibilityOff()
-    renderer.AddActor(cube_axes)
+    # ── Left renderer: mesh + axes (75% of image width) ──────────────────────
+    _MESH_VP = 0.75   # fraction of total width given to the mesh
+    mesh_renderer = vtk.vtkRenderer()
+    mesh_renderer.SetViewport(0.0, 0.0, _MESH_VP, 1.0)
+    mesh_renderer.SetBackground(1, 1, 1)
+    mesh_renderer.AddActor(actor)
+    mesh_renderer.AddActor(sphere_actor)
+    mesh_renderer.AddActor2D(max_label)
 
-    # ── Camera placement ──────────────────────────────────────────────────────
+    # ── Right renderer: scalar bar panel (25% of image width) ─────────────────
+    sbar_renderer = vtk.vtkRenderer()
+    sbar_renderer.SetViewport(_MESH_VP, 0.0, 1.0, 1.0)
+    sbar_renderer.SetBackground(0.95, 0.95, 0.95)   # light grey panel
+
+    # Scalar bar fills its dedicated panel — no frosted overlay needed, the
+    # panel background is clean.  Width/height are in sbar_renderer's own
+    # normalised coords (0–1 within that 25% strip).
+    scalar_bar = vtk.vtkScalarBarActor()
+    scalar_bar.SetLookupTable(lut)
+    scalar_bar.SetTitle("")
+    scalar_bar.SetNumberOfLabels(6)
+    scalar_bar.SetWidth(0.40)
+    scalar_bar.SetHeight(0.88)
+    scalar_bar.SetPosition(0.08, 0.06)
+    try:
+        scalar_bar.SetTextPad(4)
+    except AttributeError:
+        pass
+    sb_lbl = scalar_bar.GetLabelTextProperty()
+    sb_lbl.SetColor(0.0, 0.0, 0.0)
+    sb_lbl.SetFontSize(14)
+    sb_lbl.SetFontFamilyToTimes()
+    sb_lbl.ItalicOff()
+    sb_lbl.BoldOff()
+    scalar_bar.UnconstrainedFontSizeOn()
+    scalar_bar.DrawBackgroundOff()
+    scalar_bar.DrawFrameOff()
+    sbar_renderer.AddActor2D(scalar_bar)
+
+    # Rotated array-name title on the right edge of the scalar bar panel
+    sbar_title = vtk.vtkTextActor()
+    sbar_title.SetInput(array_name)
+    sbt = sbar_title.GetTextProperty()
+    sbt.SetColor(0.0, 0.0, 0.0)
+    sbt.SetFontSize(16)
+    sbt.SetFontFamilyToTimes()
+    sbt.ItalicOn()
+    sbt.BoldOff()
+    sbt.SetOrientation(90)
+    sbar_title.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+    sbar_title.SetPosition(0.82, 0.06)
+    sbar_renderer.AddActor2D(sbar_title)
+
+    # ── Camera in mesh renderer ───────────────────────────────────────────────
     if diag is None:
         diag = _bbox_diagonal(polydata)
     cam_pos = _place_camera(
-        renderer, cell_centroid, cell_normal, diag,
+        mesh_renderer, cell_centroid, cell_normal, diag,
         polydata=None if _cam_pos_pre is not None else polydata,
         cam_pos_override=_cam_pos_pre,
     )
+    mesh_renderer.ResetCameraClippingRange()
 
-    # Wire cube_axes to the now-configured camera
-    cube_axes.SetCamera(renderer.GetActiveCamera())
-
-    # Scale sphere radius proportional to camera distance (0.48 % of distance)
     cam_dist = ((cam_pos[0] - cell_centroid[0])**2 +
                 (cam_pos[1] - cell_centroid[1])**2 +
                 (cam_pos[2] - cell_centroid[2])**2) ** 0.5 or diag
     sphere_src.SetRadius(cam_dist * 0.0048)
 
-    # ── Render window (offscreen) -- MSAA disabled for speed ───────────────────
+    # ── Camera-aligned scale bars ─────────────────────────────────────────────
+    # Two L-shaped scale bars drawn in world space along the camera's own right
+    # and up axes — NOT global X/Y/Z.  This means the bars always appear
+    # horizontal and vertical in the rendered image regardless of how the
+    # geometry is oriented in world space.
+    #
+    # Bar length is a nice 1-2-5 rounded number ≈ 20 % of the world-space
+    # viewport width at the focal distance, so it rescales automatically when
+    # the camera is closer to or farther from the geometry.
+    _cam_obj = mesh_renderer.GetActiveCamera()
+    _cam_c   = np.array(_cam_obj.GetPosition(),   dtype=float)
+    _foc_c   = np.array(_cam_obj.GetFocalPoint(),  dtype=float)
+    _up_c    = np.array(_cam_obj.GetViewUp(),      dtype=float)
+
+    _vd_c  = _foc_c - _cam_c
+    _vd_l  = float(np.linalg.norm(_vd_c))
+    _vd_c  = _vd_c / _vd_l if _vd_l > 0 else np.array([0.0, 0.0, -1.0])
+
+    _r_c   = np.cross(_vd_c, _up_c)
+    _r_l   = float(np.linalg.norm(_r_c))
+    _r_c   = _r_c / _r_l if _r_l > 0 else np.array([1.0, 0.0, 0.0])
+
+    _tu_c  = np.cross(_r_c, _vd_c)           # corrected camera-up (perp. to right & view)
+    _tu_l  = float(np.linalg.norm(_tu_c))
+    _tu_c  = _tu_c / _tu_l if _tu_l > 0 else np.array([0.0, 1.0, 0.0])
+
+    # World-space half-extents of the mesh viewport at the focal plane
+    _fd = _vd_l or float(diag)
+    if _cam_obj.GetParallelProjection():
+        _half_h = float(_cam_obj.GetParallelScale())
+    else:
+        _half_h = _fd * math.tan(math.radians(_cam_obj.GetViewAngle() / 2.0))
+    _half_w = _half_h * (image_size[0] * _MESH_VP / image_size[1])
+
+    # Nice 1-2-5 bar length ≈ 20 % of world viewport width
+    _tgt = _half_w * 0.35
+    if _tgt > 0 and math.isfinite(_tgt):
+        _mag = 10 ** math.floor(math.log10(_tgt))
+        _bar = min([_mag * m for m in (1, 2, 2.5, 5, 10)],
+                   key=lambda s: abs(s - _tgt))
+    else:
+        _bar = float(diag) * 0.2
+
+    # Anchor: bottom-left corner of the focal-plane viewport
+    _anc = _foc_c - _half_w * 0.80 * _r_c - _half_h * 0.80 * _tu_c
+    _tk  = _half_h * 0.04          # end-tick arm length
+    _lbl = f"{_bar:.4g} m"
+
+    # Build a single-segment VTK line actor
+    def _sbar_seg(p0, p1, lw):
+        _pts = vtk.vtkPoints()
+        _pts.InsertNextPoint(float(p0[0]), float(p0[1]), float(p0[2]))
+        _pts.InsertNextPoint(float(p1[0]), float(p1[1]), float(p1[2]))
+        _ca = vtk.vtkCellArray()
+        _ca.InsertNextCell(2)
+        _ca.InsertCellPoint(0)
+        _ca.InsertCellPoint(1)
+        _pd = vtk.vtkPolyData()
+        _pd.SetPoints(_pts)
+        _pd.SetLines(_ca)
+        _mp = vtk.vtkPolyDataMapper()
+        _mp.SetInputData(_pd)
+        _ac = vtk.vtkActor()
+        _ac.SetMapper(_mp)
+        _ac.GetProperty().SetColor(0.0, 0.0, 0.0)
+        _ac.GetProperty().SetLineWidth(lw)
+        mesh_renderer.AddActor(_ac)
+
+    def _sbar_lbl(pos, text):
+        _t = vtk.vtkBillboardTextActor3D()
+        _t.SetInput(text)
+        _t.SetPosition(float(pos[0]), float(pos[1]), float(pos[2]))
+        _tp = _t.GetTextProperty()
+        _tp.SetColor(0.0, 0.0, 0.0)
+        _tp.SetFontSize(12)
+        _tp.BoldOn()
+        _tp.ItalicOff()
+        _tp.SetBackgroundColor(1.0, 1.0, 1.0)
+        _tp.SetBackgroundOpacity(0.75)
+        mesh_renderer.AddActor(_t)
+
+    # Horizontal bar (camera-right direction)
+    _h0 = _anc.copy()
+    _h1 = _h0 + _bar * _r_c
+    _sbar_seg(_h0, _h1, 2.5)
+    _sbar_seg(_h0 - _tk * _tu_c, _h0 + _tk * _tu_c, 1.5)   # left tick
+    _sbar_seg(_h1 - _tk * _tu_c, _h1 + _tk * _tu_c, 1.5)   # right tick
+    _sbar_lbl((_h0 + _h1) * 0.5 - _tk * 2.2 * _tu_c, _lbl)
+
+    # Vertical bar (camera-up direction)
+    _v0 = _anc.copy()
+    _v1 = _v0 + _bar * _tu_c
+    _sbar_seg(_v0, _v1, 2.5)
+    _sbar_seg(_v0 - _tk * _r_c, _v0 + _tk * _r_c, 1.5)     # bottom tick
+    _sbar_seg(_v1 - _tk * _r_c, _v1 + _tk * _r_c, 1.5)     # top tick
+    _sbar_lbl((_v0 + _v1) * 0.5 - _tk * 2.2 * _r_c, _lbl)
+
+    # ── Render window (offscreen) — MSAA disabled for speed ───────────────────
     render_window = vtk.vtkRenderWindow()
     render_window.SetOffScreenRendering(1)
-    render_window.SetMultiSamples(0)   # disable MSAA -- cuts render time ~40%
+    render_window.SetMultiSamples(0)
     render_window.SetSize(*image_size)
-    render_window.AddRenderer(renderer)
+    render_window.AddRenderer(mesh_renderer)
+    render_window.AddRenderer(sbar_renderer)
     render_window.Render()
 
     # ── Save PNG ──────────────────────────────────────────────────────────────

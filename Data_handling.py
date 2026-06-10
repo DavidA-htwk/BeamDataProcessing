@@ -190,7 +190,9 @@ def run_gui():
     proximity_var = tk.StringVar(
         value=str(settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))
     )
-    tk.Entry(prox_frame, textvariable=proximity_var, width=8).pack(side="left", padx=(6, 0))
+    prox_entry = tk.Entry(prox_frame, textvariable=proximity_var, width=8)
+    prox_entry.pack(side="left", padx=(6, 0))
+    prox_entry.configure(state="disabled")   # enabled only when ≥1 component has smoothing > 0
     tk.Label(
         prox_frame,
         text="(mesh units; Smoothes around detected edges for that value; 0 = off)",
@@ -221,9 +223,11 @@ def run_gui():
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
     tk.Label(_comp_hdr, text="Smooth iter", width=10, anchor="w",
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Mult factor", width=10, anchor="w",
+    tk.Label(_comp_hdr, text="Mult factor",      width=10, anchor="w",
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Snapshot",    width=14, anchor="w",
+    tk.Label(_comp_hdr, text="Snap pwr dens",    width=14, anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(_comp_hdr, text="Snap total pwr",   width=14, anchor="w",
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
 
     comp_rows_frame = tk.Frame(comp_lframe)
@@ -238,16 +242,28 @@ def run_gui():
         comp_rows_frame, text="(click Load Geometry to populate)", fg="#aaaaaa")
     _placeholder_lbl.pack(anchor="w", pady=4)
 
+    def _update_prox_state(*_):
+        """Enable proximity entry only when at least one component has smooth_iterations > 0."""
+        def _safe_get(var):
+            try:
+                return var.get()
+            except Exception:
+                return 0
+        any_smooth = any(_safe_get(w["smooth_var"]) > 0 for w in _comp_widgets.values())
+        prox_entry.configure(state="normal" if any_smooth else "disabled")
+
     def _build_comp_row(name: str, count: int) -> None:
         """Add one component row (or update its file count if it already exists)."""
         if name in _comp_widgets:
             _comp_widgets[name]["count_var"].set(str(count))
             return
-        saved      = _pending_comp_cfg.get(name, {})
-        smooth_var = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
-        mult_var   = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
-        snap_var_c = tk.BooleanVar(value=bool(saved.get("save_snapshot", False)))
-        count_var  = tk.StringVar(value=str(count))
+        saved       = _pending_comp_cfg.get(name, {})
+        smooth_var  = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
+        smooth_var.trace_add("write", _update_prox_state)
+        mult_var    = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
+        snap_pd_var = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
+        snap_tp_var = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
+        count_var   = tk.StringVar(value=str(count))
 
         row = tk.Frame(comp_rows_frame)
         row.pack(fill="x", pady=1)
@@ -257,22 +273,25 @@ def run_gui():
         tk.Label(row, text="", width=1).pack(side="left")
         tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
         tk.Label(row, text="", width=1).pack(side="left")
-        tk.Checkbutton(row, text="Save snapshot", variable=snap_var_c).pack(side="left")
+        tk.Checkbutton(row, text="Pwr density", variable=snap_pd_var).pack(side="left")
+        tk.Checkbutton(row, text="Total pwr",   variable=snap_tp_var).pack(side="left")
 
         _comp_widgets[name] = {
-            "smooth_var": smooth_var,
-            "mult_var":   mult_var,
-            "snap_var":   snap_var_c,
-            "count_var":  count_var,
+            "smooth_var":  smooth_var,
+            "mult_var":    mult_var,
+            "snap_pd_var": snap_pd_var,
+            "snap_tp_var": snap_tp_var,
+            "count_var":   count_var,
         }
 
     def on_load_geometry():
         # Preserve any user-edited spinbox/checkbox values before rebuilding
         for name, w in _comp_widgets.items():
             _pending_comp_cfg[name] = {
-                "smooth_iterations": w["smooth_var"].get(),
-                "mult_factor":       _safe_float(w["mult_var"].get(), 1.0),
-                "save_snapshot":     w["snap_var"].get(),
+                "smooth_iterations":  w["smooth_var"].get(),
+                "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
+                "save_power_density": w["snap_pd_var"].get(),
+                "save_total_power":   w["snap_tp_var"].get(),
             }
         raw = text_box.get("1.0", "end").strip()
         dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
@@ -325,6 +344,7 @@ def run_gui():
                 _build_comp_row(name, count)
                 total += count
         load_geo_status.set(f"  {len(_comp_widgets)} component(s), {total} file(s)")
+        _update_prox_state()   # re-evaluate now that rows are populated
         log(f"Load Geometry done: {len(_comp_widgets)} component(s), {total} file(s).")
 
     load_geo_btn.configure(command=on_load_geometry)
@@ -350,9 +370,10 @@ def run_gui():
             "proximity_radius": _safe_float(proximity_var.get(), SMOOTH_PROXIMITY_RADIUS),
             "components":    {
                 name: {
-                    "smooth_iterations": w["smooth_var"].get(),
-                    "mult_factor":       _safe_float(w["mult_var"].get(), 1.0),
-                    "save_snapshot":     w["snap_var"].get(),
+                    "smooth_iterations":  w["smooth_var"].get(),
+                    "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
+                    "save_power_density": w["snap_pd_var"].get(),
+                    "save_total_power":   w["snap_tp_var"].get(),
                 }
                 for name, w in _comp_widgets.items()
             },
@@ -682,11 +703,15 @@ def run_gui():
     log_box.pack(side="left", fill="both", expand=True)
     log_scroll.config(command=log_box.yview)
 
+    _log_lines: list[str] = []
+    _run_start_time: list = [None]   # mutable cell so closures can write it
+
     def log(msg: str) -> None:
         log_box.configure(state="normal")
         log_box.insert("end", msg + "\n")
         log_box.see("end")
         log_box.configure(state="disabled")
+        _log_lines.append(msg)
         root.update_idletasks()
 
     # ── Run Both + Stop ───────────────────────────────────────────────────────
@@ -719,6 +744,8 @@ def run_gui():
 
     def _set_busy():
         _stop_event.clear()
+        _log_lines.clear()
+        _run_start_time[0] = time.strftime("%Y-%m-%d_%H-%M-%S")
         stop_btn.configure(state="normal", text="Stop")
         for b in _all_run_btns:
             b.configure(state="disabled")
@@ -733,6 +760,22 @@ def run_gui():
             for b in _all_run_btns:
                 b.configure(state="normal")
             stop_btn.configure(state="disabled", text="Stop")
+            # ── Auto-save log ─────────────────────────────────────────────────
+            out_folder = output_folder_var.get().strip()
+            if not out_folder:
+                out_folder = str(Path(__file__).resolve().parent / "output")
+            try:
+                out_path = Path(out_folder)
+                out_path.mkdir(parents=True, exist_ok=True)
+                ts    = _run_start_time[0] or time.strftime("%Y-%m-%d_%H-%M-%S")
+                stem  = out_path.name
+                fname = f"{stem}_{ts}.log"
+                log_path = out_path / fname
+                with open(log_path, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(_log_lines))
+                log(f"Log saved to:\n  {log_path}")
+            except Exception as e:
+                log(f"[WARN] Could not save log: {e}")
 
     def _get_input_dirs() -> list[str] | None:
         raw = text_box.get("1.0", "end").strip()
@@ -865,24 +908,25 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                                    SMOOTH_PROXIMITY_RADIUS)
 
     def _file_settings(filepath: Path) -> tuple:
-        """Return (n_iter, save_snapshot, mult_factor) for a file based on its component name."""
+        """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor).
+        Both CSVs are always written; the two booleans control snapshot renders only."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
                 continue
             if comp_name.lower() in stem:
                 return (int(comp_cfg.get("smooth_iterations", 1)),
-                        bool(comp_cfg.get("save_snapshot", False)),
+                        bool(comp_cfg.get("save_power_density", True)),
+                        bool(comp_cfg.get("save_total_power", False)),
                         float(comp_cfg.get("mult_factor", 1.0)))
         if "(all)" in components:
             c = components["(all)"]
             return (int(c.get("smooth_iterations", 1)),
-                    bool(c.get("save_snapshot", False)),
+                    bool(c.get("save_power_density", True)),
+                    bool(c.get("save_total_power", False)),
                     float(c.get("mult_factor", 1.0)))
-        # Legacy fallback for configs without per-component settings
-        return (int(cfg.get("smooth_iterations", 1)),
-                bool(cfg.get("save_snapshots", False)),
-                1.0)
+        # Legacy fallback
+        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0)
 
     # Expand any OUTPUT_* folder into its immediate subfolders
     expanded_dirs = []
@@ -1004,7 +1048,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         if _files_needing_smooth:
             log(f"\n  Pre-computing edge geometry per component...")
             _seen_comps: set = set()
-            for fp, output_name_c, case_c, scenario_c, polydata_c, _ in _files_needing_smooth:
+            for fp, output_name_c, case_c, scenario_c, polydata_c, *_ in _files_needing_smooth:
                 comp = next(
                     (name for name in components if name != "(all)"
                      and name.lower() in fp.stem.lower()),
@@ -1070,10 +1114,10 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
             _sys.setswitchinterval(_prev_interval)   # always restore
         log(f"  Stage 2 done in {time.perf_counter()-t0_smooth:.1f}s")
 
-        # ── Write CSV rows ────────────────────────────────────────────────
+        # ── Write CSV rows (always, regardless of snapshot settings) ──────────────
         for item in processed:
             filepath, output_name, case, scenario, _, max_before, _, max_after = item
-            _n_iter, _snap, mult = _snap_map[filepath]
+            _n_iter, snap_pd, snap_tp, mult = _snap_map[filepath]
             mb  = max_before * mult
             ma  = max_after  * mult
             delta       = abs(ma - mb)
@@ -1091,44 +1135,61 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 ])
             total_files += 1
 
-        # ── Stage 3: Snapshots — subprocess-based for Win32/DWM compatibility ────────
-        # vtkRenderWindow on Windows uses WGL; wglMakeCurrent() blocks DWM compositing
-        # of the Tkinter window for the duration of each render (~6 s per PNG).
-        # Separate processes have their own GPU contexts → DWM is never starved.
-        snap_items = [item for item in processed if _snap_map[item[0]][1]]
+        # ── Stage 3: Snapshots ────────────────────────────────────────────────────────
+        # snap_pwr_density ([1]) → render Power_Density_W_m2
+        # snap_total_pwr   ([2]) → render Deposited_Power_W
+        # Both CSVs are always written; these flags only gate snapshot output.
+        snap_items = [item for item in processed
+                      if _snap_map[item[0]][1] or _snap_map[item[0]][2]]
         if snap_items:
             snap_dir.mkdir(parents=True, exist_ok=True)
             n_snap = len(snap_items)
 
-            # Build subprocess args.
-            # Original VTPs are already on disk → pass path directly (no I/O).
-            # Smoothed VTPs need a temp file only when smoothing was applied.
             snap_proc_args: list[tuple] = []
             temp_vtp_files: list[Path] = []
             for (filepath, output_name, case, scenario,
                  polydata_orig, _, polydata_smooth, _) in snap_items:
-                is_snap_only = (_snap_map[filepath][0] == 0)
+                n_iter_f, snap_pd, snap_tp, mult_f = _snap_map[filepath]
+                is_snap_only = (n_iter_f == 0)
                 stem = filepath.stem
                 case_snap_dir = snap_dir / output_name / case
                 case_snap_dir.mkdir(parents=True, exist_ok=True)
 
-                if is_snap_only:
-                    out_paths   = [str(case_snap_dir / f"{scenario}__{stem}.png")]
-                    smooth_path = None
-                else:
-                    out_paths = [
-                        str(case_snap_dir / f"{scenario}__{stem}__before.png"),
-                        str(case_snap_dir / f"{scenario}__{stem}__after.png"),
-                    ]
+                # Write smoothed VTP once; both render jobs share the path.
+                smooth_path = None
+                if not is_snap_only:
                     tmp = snap_dir / f"_tmp_smooth_{os.getpid()}_{len(temp_vtp_files)}.vtp"
                     _write_vtp(polydata_smooth, tmp)
                     temp_vtp_files.append(tmp)
                     smooth_path = str(tmp)
 
-                snap_proc_args.append((
-                    str(filepath), smooth_path,
-                    out_paths, ARRAY_NAME, is_snap_only, stem,
-                ))
+                # Power-density snapshot
+                if snap_pd:
+                    if is_snap_only:
+                        out_paths_pd = [str(case_snap_dir / f"{scenario}__{stem}__pwr_density.png")]
+                    else:
+                        out_paths_pd = [
+                            str(case_snap_dir / f"{scenario}__{stem}__pwr_density__before.png"),
+                            str(case_snap_dir / f"{scenario}__{stem}__pwr_density__after.png"),
+                        ]
+                    snap_proc_args.append((
+                        str(filepath), smooth_path,
+                        out_paths_pd, ARRAY_NAME, is_snap_only, stem, mult_f,
+                    ))
+
+                # Total-power snapshot
+                if snap_tp:
+                    if is_snap_only:
+                        out_paths_tp = [str(case_snap_dir / f"{scenario}__{stem}__total_pwr.png")]
+                    else:
+                        out_paths_tp = [
+                            str(case_snap_dir / f"{scenario}__{stem}__total_pwr__before.png"),
+                            str(case_snap_dir / f"{scenario}__{stem}__total_pwr__after.png"),
+                        ]
+                    snap_proc_args.append((
+                        str(filepath), smooth_path,
+                        out_paths_tp, POWER_ARRAY, is_snap_only, stem, mult_f,
+                    ))
 
             import multiprocessing as _mp
             # Each render subprocess has its own OpenGL context.
@@ -1459,22 +1520,26 @@ def _render_subprocess(args: tuple) -> tuple:
     """
     try:
         (orig_vtp_path, smooth_vtp_path, out_paths,
-         array_name, snapshot_only, label) = args
+         array_name, snapshot_only, label, mult_factor) = args
         t0 = time.perf_counter()
 
         pd_orig = read_vtp(str(orig_vtp_path))
         pre_orig = precompute_snapshot(pd_orig, array_name)
+        # Apply mult_factor: scale vmax so the colour range and max label
+        # match the CSV values rather than the raw VTP array values.
+        vmax_orig = pre_orig["max_val"] * mult_factor if pre_orig and mult_factor != 1.0 else None
 
         if snapshot_only:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              precomputed=pre_orig)
+                              vmax=vmax_orig, precomputed=pre_orig)
         else:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              precomputed=pre_orig)
+                              vmax=vmax_orig, precomputed=pre_orig)
             pd_smooth = read_vtp(str(smooth_vtp_path))
             pre_smooth = precompute_snapshot(pd_smooth, array_name)
+            vmax_smooth = pre_smooth["max_val"] * mult_factor if pre_smooth and mult_factor != 1.0 else None
             save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
-                              precomputed=pre_smooth)
+                              vmax=vmax_smooth, precomputed=pre_smooth)
 
         return label, time.perf_counter() - t0
     except Exception as exc:
