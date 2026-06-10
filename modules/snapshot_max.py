@@ -304,6 +304,17 @@ def save_max_snapshot(
     _tk  = _half_h * 0.04          # end-tick arm length
     _lbl = f"{_bar:.4g} m"
 
+    # ── Scale-bar overlay renderer ────────────────────────────────────────────
+    # Layer 1 renders after the mesh layer.  Clearing the depth buffer for this
+    # layer (but preserving the colour buffer) means scale bars are ALWAYS drawn
+    # in front of the geometry, no matter where they sit in 3-D world space.
+    _overlay_r = vtk.vtkRenderer()
+    _overlay_r.SetViewport(0.0, 0.0, _MESH_VP, 1.0)
+    _overlay_r.SetLayer(1)
+    _overlay_r.SetErase(1)              # clear buffers for this layer
+    _overlay_r.SetPreserveColorBuffer(1)  # …but keep the mesh colours
+    # depth buffer IS cleared (default) → scale bars always win depth test
+
     # Build a single-segment VTK line actor
     def _sbar_seg(p0, p1, lw):
         _pts = vtk.vtkPoints()
@@ -322,7 +333,7 @@ def save_max_snapshot(
         _ac.SetMapper(_mp)
         _ac.GetProperty().SetColor(0.0, 0.0, 0.0)
         _ac.GetProperty().SetLineWidth(lw)
-        mesh_renderer.AddActor(_ac)
+        _overlay_r.AddActor(_ac)
 
     def _sbar_lbl(pos, text):
         _t = vtk.vtkBillboardTextActor3D()
@@ -335,7 +346,7 @@ def save_max_snapshot(
         _tp.ItalicOff()
         _tp.SetBackgroundColor(1.0, 1.0, 1.0)
         _tp.SetBackgroundOpacity(0.75)
-        mesh_renderer.AddActor(_t)
+        _overlay_r.AddActor(_t)
 
     # Horizontal bar (camera-right direction)
     _h0 = _anc.copy()
@@ -353,13 +364,18 @@ def save_max_snapshot(
     _sbar_seg(_v1 - _tk * _r_c, _v1 + _tk * _r_c, 1.5)     # top tick
     _sbar_lbl((_v0 + _v1) * 0.5 - _tk * 2.2 * _r_c, _lbl)
 
+    # Share the exact same camera so world-space bar positions match the mesh view
+    _overlay_r.SetActiveCamera(mesh_renderer.GetActiveCamera())
+
     # ── Render window (offscreen) — MSAA disabled for speed ───────────────────
     render_window = vtk.vtkRenderWindow()
     render_window.SetOffScreenRendering(1)
     render_window.SetMultiSamples(0)
     render_window.SetSize(*image_size)
+    render_window.SetNumberOfLayers(2)
     render_window.AddRenderer(mesh_renderer)
     render_window.AddRenderer(sbar_renderer)
+    render_window.AddRenderer(_overlay_r)
     render_window.Render()
 
     # ── Save PNG ──────────────────────────────────────────────────────────────

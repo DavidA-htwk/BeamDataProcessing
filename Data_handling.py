@@ -1502,6 +1502,31 @@ def _write_vtp(polydata: "vtk.vtkPolyData", path: Path) -> None:
     writer.Write()
 
 
+def _scale_polydata_array(
+        polydata: "vtk.vtkPolyData",
+        array_name: str,
+        factor: float,
+) -> "vtk.vtkPolyData":
+    """Return a copy of *polydata* with *array_name* in cell data multiplied by *factor*.
+
+    Scaling the data (rather than clipping the colour range) means the colour
+    map always spans the full [0, scaled_max] range without saturation.
+    Running in a subprocess so DeepCopy overhead is acceptable.
+    """
+    arr = polydata.GetCellData().GetArray(array_name)
+    if arr is None or factor == 1.0:
+        return polydata
+    scaled_vals = vtk_to_numpy(arr).astype(float) * factor
+    new_arr = numpy_to_vtk(scaled_vals, deep=True, array_type=arr.GetDataType())
+    new_arr.SetName(array_name)
+    pd2 = vtk.vtkPolyData()
+    pd2.DeepCopy(polydata)
+    pd2.GetCellData().RemoveArray(array_name)
+    pd2.GetCellData().AddArray(new_arr)
+    pd2.GetCellData().SetActiveScalars(array_name)
+    return pd2
+
+
 def _render_subprocess(args: tuple) -> tuple:
     """Render and save snapshot(s) for one file.  MUST run in a separate PROCESS.
 
@@ -1524,22 +1549,42 @@ def _render_subprocess(args: tuple) -> tuple:
         t0 = time.perf_counter()
 
         pd_orig = read_vtp(str(orig_vtp_path))
-        pre_orig = precompute_snapshot(pd_orig, array_name)
-        # Apply mult_factor: scale vmax so the colour range and max label
-        # match the CSV values rather than the raw VTP array values.
-        vmax_orig = pre_orig["max_val"] * mult_factor if pre_orig and mult_factor != 1.0 else None
+        # Scale the data array by mult_factor so the colour range spans
+        # [0, scaled_max] with no clipping.  This applies equally to
+        # Power_Density_W_m2 and Deposited_Power_W.
+        pd_orig = _scale_polydata_array(pd_orig, array_name, mult_factor)
+
+        # Camera placement: always use Power_Density_W_m2 for the focal point so
+        # both render types (power density AND deposited power) are viewed from the
+        # same angle — looking at the beam centre, not at a large-area edge cell.
+        # The max label and colour range use the target array's actual max value.
+        def _make_precomputed(pd_scaled, pd_raw_for_cam):
+            pre_arr = precompute_snapshot(pd_scaled, array_name)
+            if array_name == ARRAY_NAME or pre_arr is None:
+                return pre_arr
+            pre_cam = precompute_snapshot(pd_raw_for_cam, ARRAY_NAME)
+            if pre_cam is None:
+                return pre_arr
+            # Use power-density camera; keep deposited-power max for label/colour.
+            return {**pre_cam, "max_val": pre_arr["max_val"]}
+
+        pd_orig_raw = read_vtp(str(orig_vtp_path))  # unscaled — for camera computation
+        pre_orig = _make_precomputed(pd_orig, pd_orig_raw)
 
         if snapshot_only:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=vmax_orig, precomputed=pre_orig)
+                              vmax=None, precomputed=pre_orig)
         else:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=vmax_orig, precomputed=pre_orig)
+                              vmax=None, precomputed=pre_orig)
             pd_smooth = read_vtp(str(smooth_vtp_path))
-            pre_smooth = precompute_snapshot(pd_smooth, array_name)
-            vmax_smooth = pre_smooth["max_val"] * mult_factor if pre_smooth and mult_factor != 1.0 else None
+            pd_smooth_raw = pd_smooth   # reference before scale (DeepCopy inside for factor≠1)
+            pd_smooth = _scale_polydata_array(pd_smooth, array_name, mult_factor)
+            if pd_smooth is pd_smooth_raw:  # factor == 1.0, same object → need explicit raw
+                pd_smooth_raw = read_vtp(str(smooth_vtp_path))
+            pre_smooth = _make_precomputed(pd_smooth, pd_smooth_raw)
             save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
-                              vmax=vmax_smooth, precomputed=pre_smooth)
+                              vmax=None, precomputed=pre_smooth)
 
         return label, time.perf_counter() - t0
     except Exception as exc:
