@@ -227,6 +227,38 @@ def save_max_snapshot(
     renderer.AddActor2D(sbar_title)
     renderer.AddActor2D(max_label)
 
+    # ── Axes grid (vtkCubeAxesActor — equivalent of ParaView AxesGrid) ────────
+    bounds = polydata.GetBounds()   # (xmin, xmax, ymin, ymax, zmin, zmax)
+    cube_axes = vtk.vtkCubeAxesActor()
+    cube_axes.SetBounds(bounds)
+    cube_axes.SetFlyModeToStaticEdges()   # axis labels stay on outer edges
+    cube_axes.DrawXGridlinesOn()
+    cube_axes.DrawYGridlinesOn()
+    cube_axes.DrawZGridlinesOn()
+    # Black grid lines & axes
+    _black = (0.0, 0.0, 0.0)
+    for prop in (cube_axes.GetXAxesGridlinesProperty(),
+                 cube_axes.GetYAxesGridlinesProperty(),
+                 cube_axes.GetZAxesGridlinesProperty()):
+        prop.SetColor(*_black)
+    # Label and title text properties — VTK 9.x Python API uses GetLabelTextProperty(i)
+    # and GetTitleTextProperty(i) where i=0/1/2 for X/Y/Z.  The old per-axis named
+    # methods (GetXAxisLabelTextProperty etc.) do not exist in vtkmodules.
+    for axis_idx in range(3):
+        for tp in (cube_axes.GetLabelTextProperty(axis_idx),
+                   cube_axes.GetTitleTextProperty(axis_idx)):
+            tp.SetColor(*_black)
+            tp.SetFontSize(10)
+            tp.BoldOff()
+            tp.ItalicOff()
+    cube_axes.GetXAxesLinesProperty().SetColor(*_black)
+    cube_axes.GetYAxesLinesProperty().SetColor(*_black)
+    cube_axes.GetZAxesLinesProperty().SetColor(*_black)
+    cube_axes.XAxisMinorTickVisibilityOff()
+    cube_axes.YAxisMinorTickVisibilityOff()
+    cube_axes.ZAxisMinorTickVisibilityOff()
+    renderer.AddActor(cube_axes)
+
     # ── Camera placement ──────────────────────────────────────────────────────
     if diag is None:
         diag = _bbox_diagonal(polydata)
@@ -235,6 +267,9 @@ def save_max_snapshot(
         polydata=None if _cam_pos_pre is not None else polydata,
         cam_pos_override=_cam_pos_pre,
     )
+
+    # Wire cube_axes to the now-configured camera
+    cube_axes.SetCamera(renderer.GetActiveCamera())
 
     # Scale sphere radius proportional to camera distance (0.48 % of distance)
     cam_dist = ((cam_pos[0] - cell_centroid[0])**2 +

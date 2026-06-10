@@ -1091,33 +1091,73 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 ])
             total_files += 1
 
-        # ── Stage 3: Snapshots (per-component; only files with save_snapshot=True) ─
+        # ── Stage 3: Snapshots — subprocess-based for Win32/DWM compatibility ────────
+        # vtkRenderWindow on Windows uses WGL; wglMakeCurrent() blocks DWM compositing
+        # of the Tkinter window for the duration of each render (~6 s per PNG).
+        # Separate processes have their own GPU contexts → DWM is never starved.
         snap_items = [item for item in processed if _snap_map[item[0]][1]]
         if snap_items:
             snap_dir.mkdir(parents=True, exist_ok=True)
             n_snap = len(snap_items)
-            n_snap_workers = 1
-            log(f"\n[3/3] Saving {n_snap} snapshot(s) ({n_snap_workers} worker)...")
+
+            # Build subprocess args.
+            # Original VTPs are already on disk → pass path directly (no I/O).
+            # Smoothed VTPs need a temp file only when smoothing was applied.
+            snap_proc_args: list[tuple] = []
+            temp_vtp_files: list[Path] = []
+            for (filepath, output_name, case, scenario,
+                 polydata_orig, _, polydata_smooth, _) in snap_items:
+                is_snap_only = (_snap_map[filepath][0] == 0)
+                stem = filepath.stem
+                case_snap_dir = snap_dir / output_name / case
+                case_snap_dir.mkdir(parents=True, exist_ok=True)
+
+                if is_snap_only:
+                    out_paths   = [str(case_snap_dir / f"{scenario}__{stem}.png")]
+                    smooth_path = None
+                else:
+                    out_paths = [
+                        str(case_snap_dir / f"{scenario}__{stem}__before.png"),
+                        str(case_snap_dir / f"{scenario}__{stem}__after.png"),
+                    ]
+                    tmp = snap_dir / f"_tmp_smooth_{os.getpid()}_{len(temp_vtp_files)}.vtp"
+                    _write_vtp(polydata_smooth, tmp)
+                    temp_vtp_files.append(tmp)
+                    smooth_path = str(tmp)
+
+                snap_proc_args.append((
+                    str(filepath), smooth_path,
+                    out_paths, ARRAY_NAME, is_snap_only, stem,
+                ))
+
+            import multiprocessing as _mp
+            # Each render subprocess has its own OpenGL context.
+            # GPU load per process is <2% (simple surface mesh, no ray-tracing),
+            # so with 90%+ compute headroom we can run many in parallel.
+            # Bottleneck is CPU (VTP I/O + ray-cast precompute), not GPU.
+            n_snap_workers = min(6, n_snap)
+            log(f"\n[3/3] Saving {n_snap} snapshot(s) "
+                f"({n_snap_workers} render process(es))...")
             t0_snap = time.perf_counter()
-            snap_args = [
-                (filepath, output_name, case, scenario,
-                 polydata_orig, polydata_smooth, snap_dir,
-                 _snap_map[filepath][0] == 0)   # snapshot_only=True when n_iter=0
-                for filepath, output_name, case, scenario,
-                    polydata_orig, _, polydata_smooth, _ in snap_items
-            ]
-            with ThreadPool(processes=n_snap_workers) as pool:
-                for completed, result in enumerate(
-                        pool.imap_unordered(_save_one_snapshot, snap_args), 1):
-                    if stopped():
-                        pool.terminate()
-                        break
-                    elapsed = time.perf_counter() - t0_snap
-                    if isinstance(result, Exception):
-                        log(f"  [{completed}/{n_snap}] ERROR: {result}")
-                        continue
-                    label, file_elapsed = result
-                    log(f"  [{completed}/{n_snap}] {label}  ({file_elapsed:.1f}s)")
+            try:
+                with _mp.Pool(processes=n_snap_workers) as pool:
+                    for completed, result in enumerate(
+                            pool.imap_unordered(_render_subprocess, snap_proc_args), 1):
+                        if stopped():
+                            pool.terminate()
+                            break
+                        elapsed = time.perf_counter() - t0_snap
+                        if isinstance(result, Exception):
+                            log(f"  [{completed}/{n_snap}] ERROR: {result}")
+                            continue
+                        label, file_elapsed = result
+                        log(f"  [{completed}/{n_snap}] {label}  ({file_elapsed:.1f}s)")
+            finally:
+                for tmp in temp_vtp_files:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
             log(f"  Snapshots done in {time.perf_counter()-t0_snap:.1f}s")
         else:
             log("\n[3/3] Snapshots disabled")
@@ -1393,12 +1433,57 @@ def _transform_one_file(args: tuple) -> tuple:
         return exc
 
 
-def _save_one_snapshot(args: tuple) -> tuple:
-    """Render and save snapshot(s) for one processed item.  Called from a thread pool.
+def _write_vtp(polydata: "vtk.vtkPolyData", path: Path) -> None:
+    """Serialize a vtkPolyData to a VTP file (for cross-process transfer)."""
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(path))
+    writer.SetInputData(polydata)
+    writer.Write()
 
-    THREAD SAFETY: DeepCopy is performed FIRST to move polydata ownership into this
-    worker thread.  ALL subsequent VTK operations (precompute + render) run on the
-    local copy, so no cross-thread VTK object access occurs after the initial copy.
+
+def _render_subprocess(args: tuple) -> tuple:
+    """Render and save snapshot(s) for one file.  MUST run in a separate PROCESS.
+
+    Root cause of GUI freeze: vtkRenderWindow on Windows uses the WGL (Windows
+    OpenGL) backend.  Even with SetOffScreenRendering(1) it calls wglMakeCurrent()
+    which acquires a per-process GPU driver lock.  While a render thread holds this
+    lock, the Desktop Window Manager (DWM) cannot composite Tkinter's window,
+    causing the GUI to freeze for the full duration of each render (~6 s).
+
+    Running renders in separate processes gives each its own Win32 address space
+    and GPU context.  WDDM schedules GPU time-slices between processes independently,
+    so Tkinter's DWM compositing is never blocked.
+
+    Parameters are plain strings/booleans (picklable); polydata is passed via temp
+    VTP files that the subprocess reads from disk.
+    """
+    try:
+        (orig_vtp_path, smooth_vtp_path, out_paths,
+         array_name, snapshot_only, label) = args
+        t0 = time.perf_counter()
+
+        pd_orig = read_vtp(str(orig_vtp_path))
+        pre_orig = precompute_snapshot(pd_orig, array_name)
+
+        if snapshot_only:
+            save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
+                              precomputed=pre_orig)
+        else:
+            save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
+                              precomputed=pre_orig)
+            pd_smooth = read_vtp(str(smooth_vtp_path))
+            pre_smooth = precompute_snapshot(pd_smooth, array_name)
+            save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
+                              precomputed=pre_smooth)
+
+        return label, time.perf_counter() - t0
+    except Exception as exc:
+        return exc
+
+
+def _save_one_snapshot(args: tuple) -> tuple:
+    """Legacy thread-based snapshot worker (kept as fallback).
+    Prefer _render_subprocess via multiprocessing.Pool for Win32 responsiveness.
     Returns (label, elapsed_s) or an Exception."""
     try:
         (filepath, output_name, case, scenario,
