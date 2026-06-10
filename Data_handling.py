@@ -45,10 +45,23 @@ from modules import transform_reference_frame as _trf
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARRAY_NAME    = "Power_Density_W_m2"
-FEATURE_ANGLE = 30.0   # degrees — matches Smart_Smooth_EDGE.py
+FEATURE_ANGLE = 30.0   # degrees
+# Spatial radius for proximity-based point flagging (same units as mesh coordinates).
+# Any input point within this distance of a detected feature-edge point is also flagged,
+# catching cells on small steps or closely parallel edges that fall below feature_angle.
+# Set to 0.0 to disable.
+SMOOTH_PROXIMITY_RADIUS = 0.03
 
 
 SETTINGS_FILE = Path(__file__).resolve().parent / "config" / "data_handling_settings.json"
+
+
+def _safe_float(val, default: float) -> float:
+    """Parse val as float, returning default on failure."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_settings() -> dict:
@@ -168,6 +181,20 @@ def run_gui():
     tk.Label(out_frame, textvariable=output_label_var, fg="grey", anchor="w").pack(
         side="left", padx=8
     )
+
+    # ── Proximity radius ──────────────────────────────────────────────────────
+    prox_frame = tk.Frame(tab1)
+    prox_frame.pack(fill="x", padx=10, pady=(6, 0))
+    tk.Label(prox_frame, text="Proximity radius:", anchor="w").pack(side="left")
+    proximity_var = tk.StringVar(
+        value=str(settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))
+    )
+    tk.Entry(prox_frame, textvariable=proximity_var, width=8).pack(side="left", padx=(6, 0))
+    tk.Label(
+        prox_frame,
+        text="(mesh units; Smoothes around detected edges for that value; 0 = off)",
+        fg="#888888",
+    ).pack(side="left", padx=(8, 0))
 
     # ── Load Geometry + per-component settings ────────────────────────────────
     load_geo_frame = tk.Frame(tab1)
@@ -312,6 +339,7 @@ def run_gui():
             "output_folder": output_folder_var.get(),
             "pattern":       pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":   filter_var.get().strip(),
+            "proximity_radius": _safe_float(proximity_var.get(), SMOOTH_PROXIMITY_RADIUS),
             "components":    {
                 name: {
                     "smooth_iterations": w["smooth_var"].get(),
@@ -344,6 +372,7 @@ def run_gui():
             text_box.insert("1.0", "\n".join(loaded["input_dirs"]))
         pattern_var.set(loaded.get("pattern", "smoothed_results_*.vtp"))
         filter_var.set(loaded.get("name_filter", ""))
+        proximity_var.set(str(loaded.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS)))
         out = loaded.get("output_folder", "")
         output_folder_var.set(out)
         output_label_var.set(out or "(script output/ folder)")
@@ -823,6 +852,8 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
     pattern          = cfg["pattern"]
     name_filter      = cfg.get("name_filter", "")
     components       = cfg.get("components", {})
+    proximity_radius = _safe_float(cfg.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS),
+                                   SMOOTH_PROXIMITY_RADIUS)
 
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, save_snapshot) for a file based on its component name."""
@@ -936,6 +967,42 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         # Build per-file (n_iter, save_snapshot) lookup from component config
         _snap_map = {fp: _file_settings(fp) for fp, *_ in loaded}
 
+        # ── Geometry cache: compute edge-ring + neighbour map once per component ─
+        # Steps 1-4 of apply_edge_smooth depend only on mesh topology, which is
+        # identical for all VTP files of the same component (same underlying STL).
+        # We take the first loaded file per component, run precompute_smooth_geometry
+        # once, then share that dict across all files of that component.
+        _geo_cache: dict[str, dict] = {}   # component_name -> geo dict
+        _files_needing_smooth = [
+            (fp, *rest) for fp, *rest in loaded if _snap_map[fp][0] > 0
+        ]
+        if _files_needing_smooth:
+            log(f"\n  Pre-computing edge geometry per component...")
+            _seen_comps: set = set()
+            for fp, output_name_c, case_c, scenario_c, polydata_c, _ in _files_needing_smooth:
+                comp = next(
+                    (name for name in components if name != "(all)"
+                     and name.lower() in fp.stem.lower()),
+                    "(all)",
+                )
+                if comp not in _seen_comps:
+                    _seen_comps.add(comp)
+                    t0_geo = time.perf_counter()
+                    cache = precompute_smooth_geometry(polydata_c, proximity_radius=proximity_radius)
+                    n_ec     = len(cache["edge_cell_list"]) if cache else 0
+                    n_direct = cache.get("n_direct", n_ec) if cache else 0
+                    extra    = n_ec - n_direct
+                    extra_s  = f" (+{extra} via proximity)" if extra else ""
+                    log(f"    [{comp}] {n_direct} direct + {extra} proximity = {n_ec} cells  "
+                        f"({time.perf_counter()-t0_geo:.1f}s)  (from {fp.name})")
+                    _geo_cache[comp] = cache
+
+        def _geo_for(fp: Path) -> dict | None:
+            for name in components:
+                if name != "(all)" and name.lower() in fp.stem.lower():
+                    return _geo_cache.get(name)
+            return _geo_cache.get("(all)")
+
         # ── Stage 2: Smoothing / passthrough (n_iter=0 files skip smoothing) ──
         processed: list[tuple] = []
         n_loaded = len(loaded)
@@ -944,7 +1011,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         t0_smooth = time.perf_counter()
         smooth_args = [
             (filepath, output_name, case, scenario, polydata, max_before,
-             _snap_map[filepath][0], stop_event)
+             _snap_map[filepath][0], stop_event, _geo_for(filepath))
             for filepath, output_name, case, scenario, polydata, max_before in loaded
         ]
         import sys as _sys
@@ -1216,15 +1283,16 @@ def _smooth_one_file(args: tuple) -> tuple:
     """Apply edge smoothing to one loaded file.  Called from a thread pool.
     Accepts stop_event so it can self-cancel between phases without waiting for
     the outer imap_unordered loop to get a turn.
+    geo_cache: optional pre-computed geometry dict from precompute_smooth_geometry().
     Returns the full processed tuple, or an Exception, or None if stopped."""
     try:
-        filepath, output_name, case, scenario, polydata, max_before, n_iter, stop_event = args
+        filepath, output_name, case, scenario, polydata, max_before, n_iter, stop_event, geo_cache = args
         if stop_event is not None and stop_event.is_set():
             return None
         if n_iter == 0:
             # No smoothing requested for this component — pass through unchanged
             return filepath, output_name, case, scenario, polydata, max_before, polydata, max_before
-        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter, stop_event=stop_event)
+        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter, stop_event=stop_event, geo_cache=geo_cache)
         if smoothed is None:
             return None   # cancelled mid-smooth
         max_after = find_max(smoothed, ARRAY_NAME)
@@ -1333,7 +1401,128 @@ def find_max(polydata, array_name):
 
 
 # ── Smoothing (mirrors Smart_Smooth_EDGE.py) ──────────────────────────────────
-def apply_edge_smooth(src, n_iter: int = 1, stop_event=None):
+def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> dict | None:
+    """Compute and return the geometry-only data needed by apply_edge_smooth.
+
+    This is ONLY a function of mesh topology + vertex positions — it is
+    identical for every VTP file that shares the same underlying STL.
+    Call once per component, then pass the result to apply_edge_smooth via
+    geo_cache= to skip the expensive Steps 1-4 for all subsequent files.
+
+    proximity_radius: if > 0, any input point within this distance of a
+    detected feature-edge point is also flagged, catching cells on small
+    steps or closely parallel edges that fall below FEATURE_ANGLE.
+    Defaults to SMOOTH_PROXIMITY_RADIUS when None.
+
+    Returns a dict with keys:
+        edge_cell_list  – list[int]  cells that touch feature/boundary edges
+        cell_neighbours – dict[int, list[int]]  adjacent cell IDs per edge cell
+        n_cells         – int  total cell count (sanity check)
+        n_direct        – int  cells before proximity expansion
+    Returns None if the source has no polygon data.
+    """
+    if proximity_radius is None:
+        proximity_radius = SMOOTH_PROXIMITY_RADIUS
+    n_cells = src.GetCellData().GetNumberOfTuples() if src.GetCellData() else 0
+
+    # Step 1 — extract boundary + feature edges
+    fe = vtk.vtkFeatureEdges()
+    fe.SetInputData(src)
+    fe.BoundaryEdgesOn()
+    fe.FeatureEdgesOn()
+    fe.SetFeatureAngle(FEATURE_ANGLE)
+    fe.NonManifoldEdgesOff()
+    fe.ManifoldEdgesOff()
+    fe.ColoringOff()
+    fe.Update()
+
+    # Step 2 — build integer keys for edge points (numpy, no loop)
+    edge_pts = fe.GetOutput().GetPoints()
+    edge_pt_ids: set = set()
+    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
+        _sc   = np.int64(10 ** 10)
+        ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+        ep_keys = set(map(tuple, ep_np.tolist()))
+
+        # Step 3 — match source point IDs to edge keys (vectorised)
+        src_pts = src.GetPoints()
+        if src_pts:
+            sp_np     = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+            sp_tuples = list(map(tuple, sp_np.tolist()))
+            edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
+
+    # Step 3b — spatial proximity expansion via KD-tree
+    # Flags any input point within proximity_radius of a detected edge point,
+    # catching cells on small steps or parallel faces below FEATURE_ANGLE.
+    if proximity_radius > 0.0 and edge_pts and edge_pts.GetNumberOfPoints() > 0:
+        locator = vtk.vtkKdTreePointLocator()
+        locator.SetDataSet(src)
+        locator.BuildLocator()
+        prox_result = vtk.vtkIdList()
+        n_before_prox = len(edge_pt_ids)
+        for i in range(edge_pts.GetNumberOfPoints()):
+            locator.FindPointsWithinRadius(
+                proximity_radius, edge_pts.GetPoint(i), prox_result
+            )
+            for j in range(prox_result.GetNumberOfIds()):
+                edge_pt_ids.add(prox_result.GetId(j))
+        n_prox_added = len(edge_pt_ids) - n_before_prox
+        if n_prox_added:
+            print(f"  Proximity expansion : +{n_prox_added} points within {proximity_radius} units")
+
+    # Step 4 — flag cells that own at least one edge point
+    edge_cells: set = set()
+    cell_pts = vtk.vtkIdList()
+    if edge_pt_ids:
+        polys = src.GetPolys()
+        if polys is not None and polys.GetNumberOfCells() > 0:
+            conn = vtk_to_numpy(polys.GetConnectivityArray())
+            offs = vtk_to_numpy(polys.GetOffsetsArray())
+            ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
+            mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
+            mask[ep_arr] = True
+            for cid in range(len(offs) - 1):
+                if mask[conn[offs[cid]:offs[cid + 1]]].any():
+                    edge_cells.add(cid)
+        else:
+            for cid in range(n_cells):
+                src.GetCellPoints(cid, cell_pts)
+                for k in range(cell_pts.GetNumberOfIds()):
+                    if cell_pts.GetId(k) in edge_pt_ids:
+                        edge_cells.add(cid)
+                        break
+
+    if not edge_cells:
+        return {"edge_cell_list": [], "cell_neighbours": {}, "n_cells": n_cells,
+                "n_direct": 0}
+
+    n_direct = len(edge_cells)
+
+    # Step 5 pre-build — neighbour map (topology only, no scalar data)
+    edge_cell_list = list(edge_cells)
+    nbr_ids = vtk.vtkIdList()
+    cell_neighbours: dict[int, list[int]] = {}
+    for cid in edge_cell_list:
+        src.GetCellPoints(cid, cell_pts)
+        nbrs: list[int] = []
+        for k in range(cell_pts.GetNumberOfIds()):
+            src.GetPointCells(cell_pts.GetId(k), nbr_ids)
+            for m in range(nbr_ids.GetNumberOfIds()):
+                ncid = nbr_ids.GetId(m)
+                if ncid != cid:
+                    nbrs.append(ncid)
+        cell_neighbours[cid] = nbrs
+
+    return {
+        "edge_cell_list":  edge_cell_list,
+        "cell_neighbours": cell_neighbours,
+        "n_cells":         n_cells,
+        "n_direct":        n_direct,
+    }
+
+
+def apply_edge_smooth(src, n_iter: int = 1, stop_event=None, geo_cache: dict | None = None,
+                      proximity_radius: float | None = None):
     """
     Iterative neighbour-mean smoothing restricted to cells that touch
     boundary or feature edges (angle >= FEATURE_ANGLE degrees).
@@ -1343,6 +1532,11 @@ def apply_edge_smooth(src, n_iter: int = 1, stop_event=None):
     the loop), so locality is preserved — interior cells are never touched.
     n_iter > 1 lets a very high spike diffuse across several rings of
     edge-adjacent cells without spreading into the bulk of the mesh.
+
+    geo_cache: optional dict from precompute_smooth_geometry().  When provided,
+    Steps 1-4 and the neighbour-map build are skipped entirely.
+    proximity_radius: forwarded to precompute_smooth_geometry() when geo_cache
+    is None.  Defaults to SMOOTH_PROXIMITY_RADIUS.
 
     Returns a NEW vtkPolyData — src is never modified.
     """
@@ -1358,87 +1552,112 @@ def apply_edge_smooth(src, n_iter: int = 1, stop_event=None):
         print(f"  [SKIP] Array '{ARRAY_NAME}' not found in cell data.")
         return out
 
-    n_cells  = in_arr.GetNumberOfTuples()
     raw_vals = vtk_to_numpy(in_arr).astype(float, copy=True)
 
-    # Step 1 — extract boundary + feature edges
-    fe = vtk.vtkFeatureEdges()
-    fe.SetInputData(src)
-    fe.BoundaryEdgesOn()
-    fe.FeatureEdgesOn()
-    fe.SetFeatureAngle(FEATURE_ANGLE)
-    fe.NonManifoldEdgesOff()
-    fe.ManifoldEdgesOff()
-    fe.ColoringOff()
-    fe.Update()
-    if _cancelled():
-        return None   # stopped after VTK edge extraction
+    # ── Geometry phase (Steps 1-4 + neighbour build) ──────────────────────────
+    if geo_cache is not None:
+        # Re-use pre-computed topology — nothing to recompute
+        edge_cell_list  = geo_cache["edge_cell_list"]
+        cell_neighbours = geo_cache["cell_neighbours"]
+    else:
+        # Compute geometry from scratch (fallback / standalone use)
+        n_cells  = in_arr.GetNumberOfTuples()
 
-    # Step 2 — build integer keys for edge points (numpy, no loop)
-    edge_pts  = fe.GetOutput().GetPoints()
-    edge_pt_ids: set = set()
-    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
-        _sc   = np.int64(10 ** 10)
-        ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-        # Pack (x,y,z) triples into single int64 keys for O(1) lookup
-        ep_keys = set(map(tuple, ep_np.tolist()))
+        # Step 1 — extract boundary + feature edges
+        fe = vtk.vtkFeatureEdges()
+        fe.SetInputData(src)
+        fe.BoundaryEdgesOn()
+        fe.FeatureEdgesOn()
+        fe.SetFeatureAngle(FEATURE_ANGLE)
+        fe.NonManifoldEdgesOff()
+        fe.ManifoldEdgesOff()
+        fe.ColoringOff()
+        fe.Update()
+        if _cancelled():
+            return None   # stopped after VTK edge extraction
 
-        # Step 3 — find source point IDs whose coords match edge keys (vectorised)
-        src_pts = src.GetPoints()
-        if src_pts:
-            sp_np   = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-            sp_tuples = list(map(tuple, sp_np.tolist()))
-            edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
-    print(f"  Feature-edge points : {len(edge_pt_ids)}")
+        # Step 2 — build integer keys for edge points (numpy, no loop)
+        edge_pts  = fe.GetOutput().GetPoints()
+        edge_pt_ids: set = set()
+        if edge_pts and edge_pts.GetNumberOfPoints() > 0:
+            _sc   = np.int64(10 ** 10)
+            ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+            ep_keys = set(map(tuple, ep_np.tolist()))
 
-    # Step 4 — flag cells that own at least one edge point (numpy connectivity)
-    edge_cells: set = set()
-    cell_pts = vtk.vtkIdList()   # always defined; used in fallback and Step 5
-    if edge_pt_ids:
-        polys = src.GetPolys()
-        if polys is not None and polys.GetNumberOfCells() > 0:
-            from vtk.util.numpy_support import vtk_to_numpy as _v2n
-            conn = _v2n(polys.GetConnectivityArray())
-            offs = _v2n(polys.GetOffsetsArray())
-            ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
-            mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
-            mask[ep_arr] = True
-            for cid in range(len(offs) - 1):
-                pts_in_cell = conn[offs[cid]:offs[cid + 1]]
-                if mask[pts_in_cell].any():
-                    edge_cells.add(cid)
-        else:
-            for cid in range(n_cells):
-                src.GetCellPoints(cid, cell_pts)
-                for k in range(cell_pts.GetNumberOfIds()):
-                    if cell_pts.GetId(k) in edge_pt_ids:
+            # Step 3 — find source point IDs whose coords match edge keys (vectorised)
+            src_pts = src.GetPoints()
+            if src_pts:
+                sp_np   = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
+                sp_tuples = list(map(tuple, sp_np.tolist()))
+                edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
+        print(f"  Feature-edge points : {len(edge_pt_ids)}")
+
+        # Step 3b — spatial proximity expansion
+        _pr = proximity_radius if proximity_radius is not None else SMOOTH_PROXIMITY_RADIUS
+        if _pr > 0.0 and edge_pts and edge_pts.GetNumberOfPoints() > 0:
+            locator = vtk.vtkKdTreePointLocator()
+            locator.SetDataSet(src)
+            locator.BuildLocator()
+            prox_result = vtk.vtkIdList()
+            n_before_prox = len(edge_pt_ids)
+            for i in range(edge_pts.GetNumberOfPoints()):
+                locator.FindPointsWithinRadius(_pr, edge_pts.GetPoint(i), prox_result)
+                for j in range(prox_result.GetNumberOfIds()):
+                    edge_pt_ids.add(prox_result.GetId(j))
+            n_prox_added = len(edge_pt_ids) - n_before_prox
+            if n_prox_added:
+                print(f"  Proximity expansion : +{n_prox_added} points within {_pr} units")
+
+        # Step 4 — flag cells that own at least one edge point (numpy connectivity)
+        edge_cells: set = set()
+        cell_pts = vtk.vtkIdList()
+        if edge_pt_ids:
+            polys = src.GetPolys()
+            if polys is not None and polys.GetNumberOfCells() > 0:
+                conn = vtk_to_numpy(polys.GetConnectivityArray())
+                offs = vtk_to_numpy(polys.GetOffsetsArray())
+                ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
+                mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
+                mask[ep_arr] = True
+                for cid in range(len(offs) - 1):
+                    if mask[conn[offs[cid]:offs[cid + 1]]].any():
                         edge_cells.add(cid)
-                        break
-    print(f"  Edge-ring cells     : {len(edge_cells)}")
+            else:
+                for cid in range(n_cells):
+                    src.GetCellPoints(cid, cell_pts)
+                    for k in range(cell_pts.GetNumberOfIds()):
+                        if cell_pts.GetId(k) in edge_pt_ids:
+                            edge_cells.add(cid)
+                            break
+        print(f"  Edge-ring cells     : {len(edge_cells)}")
 
-    if not edge_cells:
-        print("  Nothing to smooth.")
+        if not edge_cells:
+            print("  Nothing to smooth.")
+            return out
+        if _cancelled():
+            return None   # stopped after edge-cell identification
+
+        # Step 5 pre-build — neighbour map
+        edge_cell_list = list(edge_cells)
+        nbr_ids = vtk.vtkIdList()
+        cell_pts_nb = vtk.vtkIdList()
+        cell_neighbours: dict[int, list[int]] = {}
+        for cid in edge_cell_list:
+            src.GetCellPoints(cid, cell_pts_nb)
+            nbrs: list[int] = []
+            for k in range(cell_pts_nb.GetNumberOfIds()):
+                src.GetPointCells(cell_pts_nb.GetId(k), nbr_ids)
+                for m in range(nbr_ids.GetNumberOfIds()):
+                    ncid = nbr_ids.GetId(m)
+                    if ncid != cid:
+                        nbrs.append(ncid)
+            cell_neighbours[cid] = nbrs
+
+    if not edge_cell_list:
+        print("  Nothing to smooth (empty edge ring).")
         return out
-    if _cancelled():
-        return None   # stopped after edge-cell identification
 
-    # Step 5 — iterative mean of point-connected neighbours (edge-ring only)
-    # Pre-build neighbour lists once using numpy connectivity for speed.
-    nbr_ids      = vtk.vtkIdList()
-    edge_cell_list = list(edge_cells)
-    # Build cell-neighbour map: for each edge cell, list of adjacent cell IDs
-    cell_neighbours: dict[int, list[int]] = {}
-    for cid in edge_cell_list:
-        src.GetCellPoints(cid, cell_pts)
-        nbrs: list[int] = []
-        for k in range(cell_pts.GetNumberOfIds()):
-            src.GetPointCells(cell_pts.GetId(k), nbr_ids)
-            for m in range(nbr_ids.GetNumberOfIds()):
-                ncid = nbr_ids.GetId(m)
-                if ncid != cid:
-                    nbrs.append(ncid)
-        cell_neighbours[cid] = nbrs
-
+    # ── Scalar phase (Step 5 iterations) — per-file, always runs ─────────────
     n_iter = max(1, int(n_iter))
     current_vals = np.copy(raw_vals)
     for iteration in range(n_iter):
