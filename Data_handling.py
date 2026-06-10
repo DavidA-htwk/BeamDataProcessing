@@ -45,6 +45,7 @@ from modules import transform_reference_frame as _trf
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARRAY_NAME    = "Power_Density_W_m2"
+POWER_ARRAY   = "Deposited_Power_W"
 FEATURE_ANGLE = 30.0   # degrees
 # Spatial radius for proximity-based point flagging (same units as mesh coordinates).
 # Any input point within this distance of a detected feature-edge point is also flagged,
@@ -895,15 +896,22 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
     snap_dir = out_dir / "snapshots"
     # snap_dir is created lazily in stage 3 only when needed
 
-    csv_path = out_dir / "max_comparison_batch.csv"
+    csv_path  = out_dir / "max_comparison_batch.csv"
+    pwr_path  = out_dir / "total_power_batch.csv"
 
     total_files = 0
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh, \
+         open(pwr_path,  "w", newline="", encoding="utf-8") as fh_pwr:
+        writer     = csv.writer(fh)
+        writer_pwr = csv.writer(fh_pwr)
         writer.writerow([
             "case", "scenario", "filename",
             "max_before", "max_after",
             "delta", "discrepancy",
+        ])
+        writer_pwr.writerow([
+            "case", "scenario", "filename",
+            "total_power_W",
         ])
 
         # ── Collect all matching files across every folder first ──────────
@@ -955,17 +963,23 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 if isinstance(result, Exception):
                     log(f"  [{completed}/{n_all}] ERROR: {result}")
                     continue
-                filepath, output_name, case, scenario, polydata, max_val = result
+                filepath, output_name, case, scenario, polydata, max_val, total_pwr = result
                 if max_val is None:
                     log(f"  [{completed}/{n_all}] SKIP  {filepath.name}  (no '{ARRAY_NAME}')")
                     continue
-                loaded.append((filepath, output_name, case, scenario, polydata, max_val))
+                loaded.append((filepath, output_name, case, scenario, polydata, max_val, total_pwr))
                 log(f"  [{completed}/{n_all}] {filepath.name}  (elapsed: {elapsed:.1f}s)")
 
         log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0_load:.1f}s")
 
         # Build per-file (n_iter, save_snapshot) lookup from component config
         _snap_map = {fp: _file_settings(fp) for fp, *_ in loaded}
+
+        # Preserve total_power through the pipeline (not affected by smoothing)
+        _power_map: dict = {
+            fp: total_pwr
+            for fp, _on, _c, _s, _pd, _mv, total_pwr in loaded
+        }
 
         # ── Geometry cache: compute edge-ring + neighbour map once per component ─
         # Steps 1-4 of apply_edge_smooth depend only on mesh topology, which is
@@ -1012,7 +1026,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         smooth_args = [
             (filepath, output_name, case, scenario, polydata, max_before,
              _snap_map[filepath][0], stop_event, _geo_for(filepath))
-            for filepath, output_name, case, scenario, polydata, max_before in loaded
+            for filepath, output_name, case, scenario, polydata, max_before, _tpwr in loaded
         ]
         import sys as _sys
         _prev_interval = _sys.getswitchinterval()
@@ -1055,6 +1069,12 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 f"{max_before:.6g}", f"{max_after:.6g}",
                 f"{delta:.6g}", discrepancy,
             ])
+            total_pwr = _power_map.get(filepath)
+            if total_pwr is not None:
+                writer_pwr.writerow([
+                    case, scenario, filepath.name,
+                    f"{total_pwr:.6g}",
+                ])
             total_files += 1
 
         # ── Stage 3: Snapshots (per-component; only files with save_snapshot=True) ─
@@ -1094,6 +1114,7 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
     else:
         log(f"Processed {total_files} file(s) across {len(input_dirs)} folder(s).")
     log(f"CSV log saved to:\n  {csv_path}")
+    log(f"Power CSV saved to:\n  {pwr_path}")
 
 
 def run_transform(
@@ -1203,10 +1224,11 @@ def main():
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 def _looks_like_scenario(name: str) -> bool:
-    """Return True if name looks like a scenario code (e.g. 'dnb_3_+10_+2').
-    Scenarios contain a sign followed immediately by a digit.
+    """Return True if name looks like a scenario code (e.g. 'DNB_10mrad_2tilt_0ori_10Halo_').
+    Scenarios contain digits (beam/tilt/orientation parameters); case/group identifiers
+    like 'DNB_ALL', 'DNB_BTR_COMPARE', 'DNB_BOTTOM' do not.
     """
-    return bool(re.search(r'[+\-]\d', name))
+    return bool(re.search(r'\d', name))
 
 
 def extract_case_scenario(folder):
@@ -1222,14 +1244,25 @@ def extract_case_scenario(folder):
       - 3+ sub-levels → case = sub[-2], scenario = sub[-1]
                          (ignores intermediate grouping folders like 'DNB_ALL')
 
+    Storage-only terminal folder names (e.g. "SMOOTHED") are stripped from the
+    tail of sub before depth logic is applied, so files sitting inside a SMOOTHED
+    sub-folder resolve identically to files in the parent scenario folder.
+
     Falls back to ("snapshots", parts[-2], parts[-1]) if no OUTPUT_* is found.
     """
+    # Folder names that are pure storage artefacts and carry no case/scenario info
+    _STORAGE_FOLDERS = {"SMOOTHED", "RAW", "RESULTS", "OUTPUT"}
+
     parts = Path(folder).parts
     try:
         idx = next(i for i, p in enumerate(parts) if p.upper().startswith("OUTPUT_"))
         output_name   = parts[idx]
         output_suffix = output_name[len("OUTPUT_"):]
         sub = parts[idx + 1:]   # everything after OUTPUT_*
+
+        # Strip trailing storage-only folder names so depth logic is not confused
+        while sub and sub[-1].upper() in _STORAGE_FOLDERS:
+            sub = sub[:-1]
 
         if len(sub) == 0:
             case = output_suffix or "unknown"
@@ -1272,9 +1305,10 @@ def _load_one_file(args: tuple) -> tuple:
     Returns the result tuple, or the Exception on failure (never raises — keeps the pool alive)."""
     try:
         filepath, output_name, case, scenario = args
-        polydata = read_vtp(str(filepath))
-        max_val  = find_max(polydata, ARRAY_NAME)
-        return filepath, output_name, case, scenario, polydata, max_val
+        polydata  = read_vtp(str(filepath))
+        max_val   = find_max(polydata, ARRAY_NAME)
+        total_pwr = find_total(polydata, POWER_ARRAY)
+        return filepath, output_name, case, scenario, polydata, max_val, total_pwr
     except Exception as exc:
         return exc
 
@@ -1389,6 +1423,17 @@ def _save_one_snapshot(args: tuple) -> tuple:
         return exc
 
 
+def find_total(polydata, array_name):
+    """Return the sum of *array_name* in cell data, or None."""
+    arr = polydata.GetCellData().GetArray(array_name)
+    if arr is None:
+        return None
+    n = arr.GetNumberOfTuples()
+    if n == 0:
+        return None
+    return float(vtk_to_numpy(arr).sum())
+
+
 def find_max(polydata, array_name):
     """Return the maximum value of *array_name* in cell data, or None."""
     arr = polydata.GetCellData().GetArray(array_name)
@@ -1454,6 +1499,7 @@ def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> di
     # Step 3b — spatial proximity expansion via KD-tree
     # Flags any input point within proximity_radius of a detected edge point,
     # catching cells on small steps or parallel faces below FEATURE_ANGLE.
+    direct_pt_ids = frozenset(edge_pt_ids)   # snapshot before proximity
     if proximity_radius > 0.0 and edge_pts and edge_pts.GetNumberOfPoints() > 0:
         locator = vtk.vtkKdTreePointLocator()
         locator.SetDataSet(src)
@@ -1484,6 +1530,17 @@ def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> di
             for cid in range(len(offs) - 1):
                 if mask[conn[offs[cid]:offs[cid + 1]]].any():
                     edge_cells.add(cid)
+            # Count direct-only cells (before proximity) using a separate mask
+            if direct_pt_ids != edge_pt_ids:
+                direct_arr = np.fromiter(direct_pt_ids, dtype=np.int64)
+                direct_mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
+                direct_mask[direct_arr] = True
+                n_direct = int(sum(
+                    1 for cid in range(len(offs) - 1)
+                    if direct_mask[conn[offs[cid]:offs[cid + 1]]].any()
+                ))
+            else:
+                n_direct = len(edge_cells)
         else:
             for cid in range(n_cells):
                 src.GetCellPoints(cid, cell_pts)
@@ -1491,12 +1548,24 @@ def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> di
                     if cell_pts.GetId(k) in edge_pt_ids:
                         edge_cells.add(cid)
                         break
+            # Count direct-only cells using set difference
+            if direct_pt_ids != edge_pt_ids:
+                direct_cells: set = set()
+                for cid in range(n_cells):
+                    src.GetCellPoints(cid, cell_pts)
+                    for k in range(cell_pts.GetNumberOfIds()):
+                        if cell_pts.GetId(k) in direct_pt_ids:
+                            direct_cells.add(cid)
+                            break
+                n_direct = len(direct_cells)
+            else:
+                n_direct = len(edge_cells)
+    else:
+        n_direct = 0  # edge_pt_ids was empty
 
     if not edge_cells:
         return {"edge_cell_list": [], "cell_neighbours": {}, "n_cells": n_cells,
                 "n_direct": 0}
-
-    n_direct = len(edge_cells)
 
     # Step 5 pre-build — neighbour map (topology only, no scalar data)
     edge_cell_list = list(edge_cells)
@@ -1513,11 +1582,27 @@ def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> di
                     nbrs.append(ncid)
         cell_neighbours[cid] = nbrs
 
+    # Build CSR (Compressed Sparse Row) arrays for vectorised numpy averaging.
+    # Storing neighbours as flat index array + offsets lets the per-iteration
+    # averaging run as 3 numpy C-ops instead of a Python loop, releasing the
+    # GIL so all 12 worker threads can advance simultaneously.
+    offsets_list: list[int] = [0]
+    nbr_flat_list: list[int] = []
+    for cid in edge_cell_list:
+        nbr_flat_list.extend(cell_neighbours[cid])
+        offsets_list.append(len(nbr_flat_list))
+    csr_offsets  = np.array(offsets_list,  dtype=np.int64)
+    csr_nbr_ids  = np.array(nbr_flat_list, dtype=np.int64)
+    edge_cell_arr = np.array(edge_cell_list, dtype=np.int64)
+
     return {
         "edge_cell_list":  edge_cell_list,
         "cell_neighbours": cell_neighbours,
         "n_cells":         n_cells,
         "n_direct":        n_direct,
+        "edge_cell_arr":   edge_cell_arr,
+        "csr_offsets":     csr_offsets,
+        "csr_nbr_ids":     csr_nbr_ids,
     }
 
 
@@ -1559,6 +1644,9 @@ def apply_edge_smooth(src, n_iter: int = 1, stop_event=None, geo_cache: dict | N
         # Re-use pre-computed topology — nothing to recompute
         edge_cell_list  = geo_cache["edge_cell_list"]
         cell_neighbours = geo_cache["cell_neighbours"]
+        edge_cell_arr   = geo_cache.get("edge_cell_arr")
+        csr_offsets     = geo_cache.get("csr_offsets")
+        csr_nbr_ids     = geo_cache.get("csr_nbr_ids")
     else:
         # Compute geometry from scratch (fallback / standalone use)
         n_cells  = in_arr.GetNumberOfTuples()
@@ -1652,25 +1740,51 @@ def apply_edge_smooth(src, n_iter: int = 1, stop_event=None, geo_cache: dict | N
                     if ncid != cid:
                         nbrs.append(ncid)
             cell_neighbours[cid] = nbrs
+        # Build CSR arrays for this fallback path too
+        offsets_list_fb: list[int] = [0]
+        nbr_flat_list_fb: list[int] = []
+        for cid in edge_cell_list:
+            nbr_flat_list_fb.extend(cell_neighbours[cid])
+            offsets_list_fb.append(len(nbr_flat_list_fb))
+        csr_offsets   = np.array(offsets_list_fb,  dtype=np.int64)
+        csr_nbr_ids   = np.array(nbr_flat_list_fb, dtype=np.int64)
+        edge_cell_arr = np.array(edge_cell_list,   dtype=np.int64)
 
     if not edge_cell_list:
         print("  Nothing to smooth (empty edge ring).")
         return out
 
-    # ── Scalar phase (Step 5 iterations) — per-file, always runs ─────────────
+    # ── Scalar phase (Step 5 iterations) — vectorised via numpy CSR ──────────
+    # np.add.reduceat and fancy indexing are C-level ops that release the GIL,
+    # allowing all 12 worker threads to run truly in parallel on separate cores.
     n_iter = max(1, int(n_iter))
     current_vals = np.copy(raw_vals)
-    for iteration in range(n_iter):
-        if _cancelled():
-            return None   # stopped between smoothing passes
-        next_vals = np.copy(current_vals)
-        for cid in edge_cell_list:
-            nbrs = cell_neighbours[cid]
-            if nbrs:
-                next_vals[cid] = float(np.mean(current_vals[nbrs]))
-        current_vals = next_vals
-        if n_iter > 1:
-            print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
+    if csr_nbr_ids is not None and len(csr_nbr_ids) > 0:
+        csr_counts = np.diff(csr_offsets).astype(np.float64)  # nbr count per edge cell
+        has_nbrs   = csr_counts > 0
+        for iteration in range(n_iter):
+            if _cancelled():
+                return None
+            nbr_vals  = current_vals[csr_nbr_ids]
+            sums      = np.add.reduceat(nbr_vals, csr_offsets[:-1].astype(np.intp))
+            next_vals = np.copy(current_vals)
+            next_vals[edge_cell_arr[has_nbrs]] = sums[has_nbrs] / csr_counts[has_nbrs]
+            current_vals = next_vals
+            if n_iter > 1:
+                print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
+    else:
+        # Fallback: Python loop (no CSR available or all cells have no neighbours)
+        for iteration in range(n_iter):
+            if _cancelled():
+                return None
+            next_vals = np.copy(current_vals)
+            for cid in edge_cell_list:
+                nbrs = cell_neighbours[cid]
+                if nbrs:
+                    next_vals[cid] = float(np.mean(current_vals[nbrs]))
+            current_vals = next_vals
+            if n_iter > 1:
+                print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
 
     # Step 6 — write smoothed values back via numpy_to_vtk (avoids SetValue loop)
     new_arr = numpy_to_vtk(current_vals, deep=True, array_type=out_arr.GetDataType())

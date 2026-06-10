@@ -28,3 +28,4 @@ desktop.ini
 ~$*.xlsx
 *.xlsb
 config/data_handling_settings_CDL.json
+config/data_handling_settings_DNB.json
