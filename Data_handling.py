@@ -221,6 +221,8 @@ def run_gui():
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
     tk.Label(_comp_hdr, text="Smooth iter", width=10, anchor="w",
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(_comp_hdr, text="Mult factor", width=10, anchor="w",
+             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
     tk.Label(_comp_hdr, text="Snapshot",    width=14, anchor="w",
              fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
 
@@ -243,6 +245,7 @@ def run_gui():
             return
         saved      = _pending_comp_cfg.get(name, {})
         smooth_var = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
+        mult_var   = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
         snap_var_c = tk.BooleanVar(value=bool(saved.get("save_snapshot", False)))
         count_var  = tk.StringVar(value=str(count))
 
@@ -252,10 +255,13 @@ def run_gui():
         tk.Label(row, textvariable=count_var,  width=8,  anchor="w", fg="#666666").pack(side="left")
         tk.Spinbox(row, from_=0, to=20, width=5, textvariable=smooth_var).pack(side="left")
         tk.Label(row, text="", width=1).pack(side="left")
+        tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
+        tk.Label(row, text="", width=1).pack(side="left")
         tk.Checkbutton(row, text="Save snapshot", variable=snap_var_c).pack(side="left")
 
         _comp_widgets[name] = {
             "smooth_var": smooth_var,
+            "mult_var":   mult_var,
             "snap_var":   snap_var_c,
             "count_var":  count_var,
         }
@@ -265,6 +271,7 @@ def run_gui():
         for name, w in _comp_widgets.items():
             _pending_comp_cfg[name] = {
                 "smooth_iterations": w["smooth_var"].get(),
+                "mult_factor":       _safe_float(w["mult_var"].get(), 1.0),
                 "save_snapshot":     w["snap_var"].get(),
             }
         raw = text_box.get("1.0", "end").strip()
@@ -344,6 +351,7 @@ def run_gui():
             "components":    {
                 name: {
                     "smooth_iterations": w["smooth_var"].get(),
+                    "mult_factor":       _safe_float(w["mult_var"].get(), 1.0),
                     "save_snapshot":     w["snap_var"].get(),
                 }
                 for name, w in _comp_widgets.items()
@@ -857,21 +865,24 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                                    SMOOTH_PROXIMITY_RADIUS)
 
     def _file_settings(filepath: Path) -> tuple:
-        """Return (n_iter, save_snapshot) for a file based on its component name."""
+        """Return (n_iter, save_snapshot, mult_factor) for a file based on its component name."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
                 continue
             if comp_name.lower() in stem:
                 return (int(comp_cfg.get("smooth_iterations", 1)),
-                        bool(comp_cfg.get("save_snapshot", False)))
+                        bool(comp_cfg.get("save_snapshot", False)),
+                        float(comp_cfg.get("mult_factor", 1.0)))
         if "(all)" in components:
             c = components["(all)"]
             return (int(c.get("smooth_iterations", 1)),
-                    bool(c.get("save_snapshot", False)))
+                    bool(c.get("save_snapshot", False)),
+                    float(c.get("mult_factor", 1.0)))
         # Legacy fallback for configs without per-component settings
         return (int(cfg.get("smooth_iterations", 1)),
-                bool(cfg.get("save_snapshots", False)))
+                bool(cfg.get("save_snapshots", False)),
+                1.0)
 
     # Expand any OUTPUT_* folder into its immediate subfolders
     expanded_dirs = []
@@ -1062,18 +1073,21 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
         # ── Write CSV rows ────────────────────────────────────────────────
         for item in processed:
             filepath, output_name, case, scenario, _, max_before, _, max_after = item
-            delta       = abs(max_after - max_before)
+            _n_iter, _snap, mult = _snap_map[filepath]
+            mb  = max_before * mult
+            ma  = max_after  * mult
+            delta       = abs(ma - mb)
             discrepancy = "YES" if delta > 0.0 else "NO"
             writer.writerow([
                 case, scenario, filepath.name,
-                f"{max_before:.6g}", f"{max_after:.6g}",
+                f"{mb:.6g}", f"{ma:.6g}",
                 f"{delta:.6g}", discrepancy,
             ])
             total_pwr = _power_map.get(filepath)
             if total_pwr is not None:
                 writer_pwr.writerow([
                     case, scenario, filepath.name,
-                    f"{total_pwr:.6g}",
+                    f"{total_pwr * mult:.6g}",
                 ])
             total_files += 1
 
