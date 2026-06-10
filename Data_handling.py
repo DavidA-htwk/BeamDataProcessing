@@ -1152,10 +1152,8 @@ def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) ->
                 n_iter_f, snap_pd, snap_tp, mult_f = _snap_map[filepath]
                 is_snap_only = (n_iter_f == 0)
                 stem = filepath.stem
-                case_snap_dir = snap_dir / output_name / case
+                case_snap_dir = snap_dir / output_name / case / scenario
                 case_snap_dir.mkdir(parents=True, exist_ok=True)
-
-                # Write smoothed VTP once; both render jobs share the path.
                 smooth_path = None
                 if not is_snap_only:
                     tmp = snap_dir / f"_tmp_smooth_{os.getpid()}_{len(temp_vtp_files)}.vtp"
@@ -1610,7 +1608,7 @@ def _save_one_snapshot(args: tuple) -> tuple:
         pre_orig = precompute_snapshot(pd_orig, ARRAY_NAME)
 
         stem = filepath.stem
-        case_snap_dir = snap_dir / output_name / case
+        case_snap_dir = snap_dir / output_name / case / scenario
         case_snap_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.perf_counter()
 
