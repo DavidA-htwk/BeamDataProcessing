@@ -1,695 +1,126 @@
-"""
+﻿"""
 Data_handling.py
 ----------------
-Batch pipeline (no GUI required).  For each file matching the chosen pattern
-inside the selected input folder:
+Entry point.  Launches the GUI and wires together the modules.
 
-  1. Find the max Power_Density_W_m2  (before smoothing)
-  2. Apply the Smart-Smooth-EDGE algorithm in memory
-  3. Find the max again               (after smoothing)
-  4. Append one row per file to a CSV log:
-       case | scenario | filename | max_before | max_after | delta | discrepancy
+All heavy logic lives in the modules/ package:
+  settings.py      - constants & JSON config persistence
+  vtk_io.py        - VTP read/write, find_max, find_total, scaling
+  path_utils.py    - extract_case_scenario
+  smoothing.py     - precompute_smooth_geometry, apply_edge_smooth
+  workers.py       - thread/process worker functions
+  pipeline.py      - run_processing, run_transform
+  gui_tab1.py      - Processing tab builder
+  gui_tab2.py      - Coordinate Transform tab builder
+  snapshot_max.py  - offscreen VTK snapshot rendering
+  generate_report  - per-cell CSV extraction
+  transform_reference_frame - coordinate transforms
 
 Run with:
-    pvpython  Data_handling.py          # ParaView's bundled Python
-    python    Data_handling.py          # regular Python if 'vtk' and 'numpy' are installed
+    python  Data_handling.py
 """
 
-import os
-import re
 import sys
-import glob
-import csv
-import json
 import threading
 import time
-from multiprocessing.pool import ThreadPool
+import ctypes
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, messagebox
+from tkinter import ttk, messagebox
 
 try:
-    import vtk
-    import numpy as np
-    from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
+    import vtk          # noqa: F401 - verify VTK is available before GUI opens
+    import numpy        # noqa: F401
 except ImportError:
     sys.exit(
         "ERROR: vtk and numpy are required.\n"
-        "  Run with pvpython, or:  pip install vtk numpy"
+        "  pip install vtk numpy"
     )
 
-from modules.snapshot_max import save_max_snapshot, precompute_snapshot
-from modules.generate_report import extract_cells_to_csv
-from modules import transform_reference_frame as _trf
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-ARRAY_NAME    = "Power_Density_W_m2"
-POWER_ARRAY   = "Deposited_Power_W"
-FEATURE_ANGLE = 30.0   # degrees
-# Spatial radius for proximity-based point flagging (same units as mesh coordinates).
-# Any input point within this distance of a detected feature-edge point is also flagged,
-# catching cells on small steps or closely parallel edges that fall below feature_angle.
-# Set to 0.0 to disable.
-SMOOTH_PROXIMITY_RADIUS = 0.03
+from modules.core.settings import (
+    load_settings, save_settings, _safe_float, SMOOTH_PROXIMITY_RADIUS,
+)
+from modules.processing.pipeline import run_processing, run_transform
+from modules.gui.gui_tab1 import build_processing_tab
+from modules.gui.gui_tab2 import build_transform_tab
 
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "config" / "data_handling_settings.json"
+# -- GUI -----------------------------------------------------------------------
 
+def run_gui() -> None:
+    settings = load_settings()
 
-def _safe_float(val, default: float) -> float:
-    """Parse val as float, returning default on failure."""
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
-def load_settings() -> dict:
-    """Load settings from SETTINGS_FILE, following last_config_path if set."""
-    base: dict = {}
-    if SETTINGS_FILE.exists():
+    # Must be called BEFORE tk.Tk() so Windows associates the correct
+    # AppUserModelID with the process for taskbar icon grouping.
+    base_dir = Path(__file__).resolve().parent
+    png_icon = base_dir / "Beam.png"
+    ico_icon = base_dir / "Beam.ico"
+    if sys.platform.startswith("win"):
         try:
-            with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                base = json.load(f)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "ValueExtract.DataHandling"
+            )
         except Exception:
             pass
 
-    last = base.get("last_config_path", "")
-    if last and last != str(SETTINGS_FILE):
-        p = Path(last)
-        if p.exists():
-            try:
-                with p.open("r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                cfg["last_config_path"] = last   # carry the pointer through
-                return cfg
-            except Exception:
-                pass   # fall through to base
-    return base
-
-
-def save_settings(cfg: dict) -> None:
-    try:
-        # Preserve last_config_path so the startup redirect survives a Run press
-        existing: dict = {}
-        if SETTINGS_FILE.exists():
-            try:
-                with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except Exception:
-                pass
-        if "last_config_path" in existing:
-            cfg = {**cfg, "last_config_path": existing["last_config_path"]}
-        with SETTINGS_FILE.open("w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:
-        print(f"[WARN] Could not save settings: {e}")
-
-
-# ── GUI ───────────────────────────────────────────────────────────────────────
-def run_gui():
-    settings = load_settings()
-
     root = tk.Tk()
-    root.title("Data Handling")
+    root.withdraw()   # hide main window while splash is shown
+    root.title("Beam Data Handling")
     root.resizable(True, True)
 
-    # ── Notebook ────────────────────────────────────────────────────────────
+    # -- Splash screen ---------------------------------------------------------
+    splash_path = base_dir / "Startup.png"
+    if splash_path.exists():
+        splash = tk.Toplevel(root)
+        splash.overrideredirect(True)   # borderless
+        splash.attributes("-topmost", True)
+        try:
+            splash_img = tk.PhotoImage(file=str(splash_path))
+            img_w, img_h = splash_img.width(), splash_img.height()
+            sw = splash.winfo_screenwidth()
+            sh = splash.winfo_screenheight()
+            x  = (sw - img_w) // 2
+            y  = (sh - img_h) // 2
+            splash.geometry(f"{img_w}x{img_h}+{x}+{y}")
+            tk.Label(splash, image=splash_img, bd=0).pack()
+            splash._img_ref = splash_img  # prevent GC
+        except Exception:
+            splash.destroy()
+            splash = None
+
+        def _close_splash():
+            if splash and splash.winfo_exists():
+                splash.destroy()
+            root.deiconify()
+
+        if splash:
+            splash.bind("<Button-1>", lambda _e: _close_splash())
+            root.after(2500, _close_splash)
+    else:
+        root.deiconify()
+
+    # Apply custom app icon. On Windows use ICO (title bar + taskbar).
+    # On other platforms fall back to PNG via iconphoto.
+    try:
+        if ico_icon.exists() and sys.platform.startswith("win"):
+            root.iconbitmap(str(ico_icon))
+        elif png_icon.exists():
+            app_icon = tk.PhotoImage(file=str(png_icon))
+            root.iconphoto(True, app_icon)
+            root._app_icon_ref = app_icon  # prevent Tk image GC
+    except Exception:
+        # Keep GUI launch robust even if icon loading fails.
+        pass
+
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=False, padx=10, pady=(10, 0))
-
     tab1 = tk.Frame(notebook)
     tab2 = tk.Frame(notebook)
     notebook.add(tab1, text="Processing")
     notebook.add(tab2, text="Coordinate Transform")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # TAB 1 — Processing
-    # ══════════════════════════════════════════════════════════════════════════
-
-    # ── Directory list ────────────────────────────────────────────────────────
-    tk.Label(tab1, text="Paste input directory paths (one per line):", anchor="w").pack(
-        fill="x", padx=10, pady=(10, 2)
-    )
-    text_frame = tk.Frame(tab1)
-    text_frame.pack(fill="both", expand=True, padx=10, pady=2)
-    scrollbar = tk.Scrollbar(text_frame)
-    scrollbar.pack(side="right", fill="y")
-    text_box = tk.Text(
-        text_frame, width=90, height=10,
-        yscrollcommand=scrollbar.set, wrap="none",
-    )
-    text_box.pack(side="left", fill="both", expand=True)
-    scrollbar.config(command=text_box.yview)
-    if settings.get("input_dirs"):
-        text_box.insert("1.0", "\n".join(settings["input_dirs"]))
-
-    # ── Glob pattern & name filter ────────────────────────────────────────────
-    opt_frame = tk.Frame(tab1)
-    opt_frame.pack(fill="x", padx=10, pady=(6, 0))
-
-    tk.Label(opt_frame, text="Glob pattern:", anchor="w").grid(row=0, column=0, sticky="w")
-    pattern_var = tk.StringVar(value=settings.get("pattern", "smoothed_results_*.vtp"))
-    tk.Entry(opt_frame, textvariable=pattern_var, width=40).grid(
-        row=0, column=1, sticky="w", padx=(6, 20)
-    )
-
-    tk.Label(opt_frame, text="Name filter (comma-separated):", anchor="w").grid(
-        row=0, column=2, sticky="w"
-    )
-    filter_var = tk.StringVar(value=settings.get("name_filter", ""))
-    tk.Entry(opt_frame, textvariable=filter_var, width=40).grid(
-        row=0, column=3, sticky="w", padx=6
-    )
-
-    # ── Output folder ─────────────────────────────────────────────────────────
-    out_frame = tk.Frame(tab1)
-    out_frame.pack(fill="x", padx=10, pady=(6, 0))
-
-    output_folder_var = tk.StringVar(value=settings.get("output_folder", ""))
-    output_label_var = tk.StringVar(
-        value=settings.get("output_folder") or "(script output/ folder)"
-    )
-
-    def choose_output():
-        folder = filedialog.askdirectory(title="Select OUTPUT folder for CSV log")
-        if folder:
-            output_folder_var.set(folder)
-            output_label_var.set(folder)
-
-    tk.Button(out_frame, text="Choose output folder…", command=choose_output).pack(side="left")
-    tk.Label(out_frame, textvariable=output_label_var, fg="grey", anchor="w").pack(
-        side="left", padx=8
-    )
-
-    # ── Proximity radius ──────────────────────────────────────────────────────
-    prox_frame = tk.Frame(tab1)
-    prox_frame.pack(fill="x", padx=10, pady=(6, 0))
-    tk.Label(prox_frame, text="Proximity radius:", anchor="w").pack(side="left")
-    proximity_var = tk.StringVar(
-        value=str(settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))
-    )
-    prox_entry = tk.Entry(prox_frame, textvariable=proximity_var, width=8)
-    prox_entry.pack(side="left", padx=(6, 0))
-    prox_entry.configure(state="disabled")   # enabled only when ≥1 component has smoothing > 0
-    tk.Label(
-        prox_frame,
-        text="(mesh units; Smoothes around detected edges for that value; 0 = off)",
-        fg="#888888",
-    ).pack(side="left", padx=(8, 0))
-
-    # ── Load Geometry + per-component settings ────────────────────────────────
-    load_geo_frame = tk.Frame(tab1)
-    load_geo_frame.pack(fill="x", padx=10, pady=(8, 0))
-    load_geo_btn = tk.Button(
-        load_geo_frame, text="Load Geometry", width=16, bg="#005f73", fg="white",
-        font=("Segoe UI", 10, "bold"),
-    )
-    load_geo_btn.pack(side="left")
-    load_geo_status = tk.StringVar(value="  (scan folders to detect components)")
-    tk.Label(load_geo_frame, textvariable=load_geo_status, fg="#555555", anchor="w").pack(
-        side="left", padx=6
-    )
-
-    comp_lframe = tk.LabelFrame(tab1, text="Components", padx=8, pady=4)
-    comp_lframe.pack(fill="x", padx=10, pady=(6, 0))
-
-    _comp_hdr = tk.Frame(comp_lframe)
-    _comp_hdr.pack(fill="x")
-    tk.Label(_comp_hdr, text="Component",   width=24, anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Files",       width=8,  anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Smooth iter", width=10, anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Mult factor",      width=10, anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Snap pwr dens",    width=14, anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(_comp_hdr, text="Snap total pwr",   width=14, anchor="w",
-             fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
-
-    comp_rows_frame = tk.Frame(comp_lframe)
-    comp_rows_frame.pack(fill="x")
-
-    # Maps component name -> {smooth_var, snap_var, count_var}
-    _comp_widgets: dict = {}
-    # Component settings from a loaded config; applied on next Load Geometry call
-    _pending_comp_cfg: dict = {}
-
-    _placeholder_lbl = tk.Label(
-        comp_rows_frame, text="(click Load Geometry to populate)", fg="#aaaaaa")
-    _placeholder_lbl.pack(anchor="w", pady=4)
-
-    def _update_prox_state(*_):
-        """Enable proximity entry only when at least one component has smooth_iterations > 0."""
-        def _safe_get(var):
-            try:
-                return var.get()
-            except Exception:
-                return 0
-        any_smooth = any(_safe_get(w["smooth_var"]) > 0 for w in _comp_widgets.values())
-        prox_entry.configure(state="normal" if any_smooth else "disabled")
-
-    def _build_comp_row(name: str, count: int) -> None:
-        """Add one component row (or update its file count if it already exists)."""
-        if name in _comp_widgets:
-            _comp_widgets[name]["count_var"].set(str(count))
-            return
-        saved       = _pending_comp_cfg.get(name, {})
-        smooth_var  = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
-        smooth_var.trace_add("write", _update_prox_state)
-        mult_var    = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
-        snap_pd_var = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
-        snap_tp_var = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
-        count_var   = tk.StringVar(value=str(count))
-
-        row = tk.Frame(comp_rows_frame)
-        row.pack(fill="x", pady=1)
-        tk.Label(row, text=name,               width=24, anchor="w").pack(side="left")
-        tk.Label(row, textvariable=count_var,  width=8,  anchor="w", fg="#666666").pack(side="left")
-        tk.Spinbox(row, from_=0, to=20, width=5, textvariable=smooth_var).pack(side="left")
-        tk.Label(row, text="", width=1).pack(side="left")
-        tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
-        tk.Label(row, text="", width=1).pack(side="left")
-        tk.Checkbutton(row, text="Pwr density", variable=snap_pd_var).pack(side="left")
-        tk.Checkbutton(row, text="Total pwr",   variable=snap_tp_var).pack(side="left")
-
-        _comp_widgets[name] = {
-            "smooth_var":  smooth_var,
-            "mult_var":    mult_var,
-            "snap_pd_var": snap_pd_var,
-            "snap_tp_var": snap_tp_var,
-            "count_var":   count_var,
-        }
-
-    def on_load_geometry():
-        # Preserve any user-edited spinbox/checkbox values before rebuilding
-        for name, w in _comp_widgets.items():
-            _pending_comp_cfg[name] = {
-                "smooth_iterations":  w["smooth_var"].get(),
-                "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
-                "save_power_density": w["snap_pd_var"].get(),
-                "save_total_power":   w["snap_tp_var"].get(),
-            }
-        raw = text_box.get("1.0", "end").strip()
-        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
-        if not dirs:
-            messagebox.showwarning("No directories", "Please add at least one input directory.")
-            return
-        pattern    = pattern_var.get() or "smoothed_results_*.vtp"
-        raw_filter = filter_var.get().strip()
-        terms      = [t.strip() for t in raw_filter.split(",") if t.strip()] if raw_filter else []
-
-        counts: dict = {}
-        log("Load Geometry: scanning...")
-        for d in dirs:
-            p = Path(d)
-            if not p.is_dir():
-                log(f"  [SKIP] not a directory: {d}")
-                continue
-            if p.name.upper().startswith("OUTPUT_"):
-                folders = [s for s in sorted(p.iterdir()) if s.is_dir()]
-            else:
-                folders = [p]
-            for folder in folders:
-                files = sorted(folder.rglob(pattern))
-                if terms:
-                    for t in terms:
-                        matched = [f for f in files if t.lower() in f.stem.lower()]
-                        if matched:
-                            log(f"  [{t}] {folder.name}: {len(matched)} file(s)")
-                            for f in matched:
-                                log(f"    {f.name}")
-                        counts[t] = counts.get(t, 0) + len(matched)
-                else:
-                    if files:
-                        log(f"  [(all)] {folder.name}: {len(files)} file(s)")
-                        for f in files:
-                            log(f"    {f.name}")
-                    counts["(all)"] = counts.get("(all)", 0) + len(files)
-
-        if not any(v > 0 for v in counts.values()):
-            load_geo_status.set("  No matching files found.")
-            return
-
-        for widget in comp_rows_frame.winfo_children():
-            widget.destroy()
-        _comp_widgets.clear()
-
-        total = 0
-        for name, count in counts.items():
-            if count > 0:
-                _build_comp_row(name, count)
-                total += count
-        load_geo_status.set(f"  {len(_comp_widgets)} component(s), {total} file(s)")
-        _update_prox_state()   # re-evaluate now that rows are populated
-        log(f"Load Geometry done: {len(_comp_widgets)} component(s), {total} file(s).")
-
-    load_geo_btn.configure(command=on_load_geometry)
-
-    # ── Config save / load ────────────────────────────────────────────────────
-    cfg_frame = tk.Frame(tab1)
-    cfg_frame.pack(fill="x", padx=10, pady=(8, 8))
-
-    tk.Label(cfg_frame, text="Config file:", anchor="w").pack(side="left")
-    cfg_path_var = tk.StringVar(
-        value=settings.get("last_config_path", str(SETTINGS_FILE))
-    )
-    tk.Entry(cfg_frame, textvariable=cfg_path_var, width=55).pack(side="left", padx=(6, 4))
-
-    def _current_cfg() -> dict:
-        raw = text_box.get("1.0", "end").strip()
-        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
-        return {
-            "input_dirs":    dirs,
-            "output_folder": output_folder_var.get(),
-            "pattern":       pattern_var.get() or "smoothed_results_*.vtp",
-            "name_filter":   filter_var.get().strip(),
-            "proximity_radius": _safe_float(proximity_var.get(), SMOOTH_PROXIMITY_RADIUS),
-            "components":    {
-                name: {
-                    "smooth_iterations":  w["smooth_var"].get(),
-                    "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
-                    "save_power_density": w["snap_pd_var"].get(),
-                    "save_total_power":   w["snap_tp_var"].get(),
-                }
-                for name, w in _comp_widgets.items()
-            },
-            "transform": {
-                "preset":       xfm_preset_var.get(),
-                "unit":         xfm_unit_var.get(),
-                "output_unit":  xfm_out_unit_var.get(),
-                "angle_deg":    xfm_angle_var.get(),
-                "dx":           xfm_dx_var.get(),
-                "dy":           xfm_dy_var.get(),
-                "dz":           xfm_dz_var.get(),
-                "pattern":      xfm_pattern_var.get(),
-                "name_filter":  xfm_filter_var.get(),
-                "export_geom":  xfm_export_geom.get(),
-                "export_area":  xfm_export_area.get(),
-                "export_power": xfm_export_power.get(),
-                "export_pload": xfm_export_pload.get(),
-                "mult":         xfm_mult_var.get(),
-                "ignore_zeros": xfm_ignore_zeros.get(),
-            },
-        }
-
-    def _apply_cfg(loaded: dict) -> None:
-        text_box.delete("1.0", "end")
-        if loaded.get("input_dirs"):
-            text_box.insert("1.0", "\n".join(loaded["input_dirs"]))
-        pattern_var.set(loaded.get("pattern", "smoothed_results_*.vtp"))
-        filter_var.set(loaded.get("name_filter", ""))
-        proximity_var.set(str(loaded.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS)))
-        out = loaded.get("output_folder", "")
-        output_folder_var.set(out)
-        output_label_var.set(out or "(script output/ folder)")
-        # Restore per-component settings; rows will be built on next Load Geometry press
-        _pending_comp_cfg.clear()
-        _pending_comp_cfg.update(loaded.get("components", {}))
-        xfm = loaded.get("transform", {})
-        if xfm:
-            _p = xfm.get("preset", "")
-            if _p not in _trf.TRANSFORM_PRESETS:
-                _p = list(_trf.TRANSFORM_PRESETS.keys())[0]
-            xfm_preset_var.set(_p)
-            on_preset_selected()
-            xfm_unit_var.set(xfm.get("unit", "m"))
-            xfm_out_unit_var.set(xfm.get("output_unit", xfm.get("unit", "m")))
-            xfm_angle_var.set(xfm.get("angle_deg", "-116.0"))
-            xfm_dx_var.set(xfm.get("dx", "11.410436"))
-            xfm_dy_var.set(xfm.get("dy", "26.617882"))
-            xfm_dz_var.set(xfm.get("dz", "0.920"))
-            xfm_pattern_var.set(xfm.get("pattern", "smoothed_results_*.vtp"))
-            xfm_filter_var.set(xfm.get("name_filter", ""))
-            xfm_export_geom.set(bool(xfm.get("export_geom", True)))
-            xfm_export_area.set(bool(xfm.get("export_area", True)))
-            xfm_export_power.set(bool(xfm.get("export_power", True)))
-            xfm_export_pload.set(bool(xfm.get("export_pload", True)))
-            xfm_mult_var.set(str(xfm.get("mult", "1.0")))
-            xfm_ignore_zeros.set(bool(xfm.get("ignore_zeros", False)))
-
-    def _remember_cfg_path(path: str) -> None:
-        """Write last_config_path into SETTINGS_FILE so it survives restarts."""
-        try:
-            existing: dict = {}
-            if SETTINGS_FILE.exists():
-                with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            existing["last_config_path"] = path
-            with SETTINGS_FILE.open("w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
-        except Exception:
-            pass
-
-    def on_save_cfg():
-        """Save directly to the current config path — no dialog."""
-        path = cfg_path_var.get()
-        if not path:
-            path = str(SETTINGS_FILE)
-            cfg_path_var.set(path)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(_current_cfg(), f, indent=2)
-            _remember_cfg_path(path)
-            log(f"Config saved: {path}")
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e))
-
-    def on_save_cfg_as():
-        """Open a save dialog to choose a new path, then save."""
-        path = filedialog.asksaveasfilename(
-            title="Save config as…",
-            initialdir=str(Path(cfg_path_var.get()).parent),
-            initialfile=Path(cfg_path_var.get()).name,
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        cfg_path_var.set(path)
-        _remember_cfg_path(path)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(_current_cfg(), f, indent=2)
-            log(f"Config saved: {path}")
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e))
-
-    def on_load_cfg():
-        path = filedialog.askopenfilename(
-            title="Load config…",
-            initialdir=str(Path(cfg_path_var.get()).parent),
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        cfg_path_var.set(path)
-        _remember_cfg_path(path)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            _apply_cfg(loaded)
-            log(f"Config loaded: {path}")
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
-
-    tk.Button(cfg_frame, text="Save config",    width=12, command=on_save_cfg).pack(side="left", padx=2)
-    tk.Button(cfg_frame, text="Save config as…",width=14, command=on_save_cfg_as).pack(side="left", padx=2)
-    tk.Button(cfg_frame, text="Load config",    width=12, command=on_load_cfg).pack(side="left", padx=2)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # TAB 2 — Coordinate Transform
-    # ══════════════════════════════════════════════════════════════════════════
-    xfm_s = settings.get("transform", {})
-
-    # ── Run button for tab 1 ───────────────────────────────────────────────────
-    tab1_btn_frame = tk.Frame(tab1)
-    tab1_btn_frame.pack(pady=(6, 10))
-    tab1_run_btn = tk.Button(
-        tab1_btn_frame, text="Run Processing", width=16, bg="#d4000e", fg="white",
-        font=("Segoe UI", 10, "bold"),
-    )
-    tab1_run_btn.pack(side="left", padx=6)
-
-    # ── Preset selector (two-row radio grid) ───────────────────────────────
-
-    _first_preset = list(_trf.TRANSFORM_PRESETS.keys())[0]
-    _saved_preset = xfm_s.get("preset", _first_preset)
-    if _saved_preset not in _trf.TRANSFORM_PRESETS:
-        _saved_preset = _first_preset
-    xfm_preset_var = tk.StringVar(value=_saved_preset)
-
-    # Hidden vars — updated by preset, consumed by _get_transform_params
-    xfm_angle_var = tk.StringVar(value=xfm_s.get("angle_deg", str(_trf.DEFAULT_ANGLE_DEG)))
-    xfm_dx_var    = tk.StringVar(value=xfm_s.get("dx",        str(_trf.DEFAULT_DX)))
-    xfm_dy_var    = tk.StringVar(value=xfm_s.get("dy",        str(_trf.DEFAULT_DY)))
-    xfm_dz_var    = tk.StringVar(value=xfm_s.get("dz",        str(_trf.DEFAULT_DZ)))
-    xfm_unit_var  = tk.StringVar(value=xfm_s.get("unit", "m"))
-
-    xfm_summary_var = tk.StringVar(value="")
-
-    def on_preset_selected(event=None):
-        name = xfm_preset_var.get()
-        if name not in _trf.TRANSFORM_PRESETS:
-            return
-        p = _trf.TRANSFORM_PRESETS[name]
-        xfm_angle_var.set(str(p["angle_deg"]))
-        xfm_dx_var.set(str(p["dx"]))
-        xfm_dy_var.set(str(p["dy"]))
-        xfm_dz_var.set(str(p["dz"]))
-        xfm_unit_var.set(p["unit"])
-        xfm_summary_var.set(
-            f"θz = {p['angle_deg']}°   Δx = {p['dx']} m   Δy = {p['dy']} m   Δz = {p['dz']} m"
-        )
-
-    on_preset_selected()  # sync hidden vars with selected preset on startup
-
-    _presets_row0 = ["DNB → Tokamak",  "HNB1 → Tokamak", "HNB2 → Tokamak", "HNB3 → Tokamak"]
-    _presets_row1 = ["Tokamak → DNB",  "Tokamak → HNB1", "Tokamak → HNB2", "Tokamak → HNB3"]
-    _presets_row2 = ["No Transformation"]
-
-    preset_lframe = tk.LabelFrame(tab2, text="Coordinate Transform Preset", padx=8, pady=6)
-    preset_lframe.pack(fill="x", padx=10, pady=(8, 4))
-
-    _radio_frame = tk.Frame(preset_lframe)
-    _radio_frame.grid(row=0, column=0, sticky="nw", padx=(0, 8))
-
-    tk.Label(_radio_frame, text="→ Tokamak:", fg="#444444", width=10, anchor="e").grid(
-        row=0, column=0, sticky="e", padx=(0, 6)
-    )
-    for col, name in enumerate(_presets_row0):
-        tk.Radiobutton(
-            _radio_frame, text=name, variable=xfm_preset_var, value=name,
-            command=on_preset_selected,
-        ).grid(row=0, column=col + 1, sticky="w", padx=(0, 10))
-
-    tk.Label(_radio_frame, text="Tokamak →:", fg="#444444", width=10, anchor="e").grid(
-        row=1, column=0, sticky="e", padx=(0, 6)
-    )
-    for col, name in enumerate(_presets_row1):
-        tk.Radiobutton(
-            _radio_frame, text=name, variable=xfm_preset_var, value=name,
-            command=on_preset_selected,
-        ).grid(row=1, column=col + 1, sticky="w", padx=(0, 10))
-
-    tk.Label(_radio_frame, text="Other:", fg="#444444", width=10, anchor="e").grid(
-        row=2, column=0, sticky="e", padx=(0, 6)
-    )
-    for col, name in enumerate(_presets_row2):
-        tk.Radiobutton(
-            _radio_frame, text=name, variable=xfm_preset_var, value=name,
-            command=on_preset_selected,
-        ).grid(row=2, column=col + 1, sticky="w", padx=(0, 10))
-
-    tk.Label(_radio_frame, text="", width=10).grid(row=3, column=0)
-    tk.Label(
-        _radio_frame, textvariable=xfm_summary_var,
-        fg="#555555", font=("Consolas", 8), anchor="w",
-    ).grid(row=3, column=1, columnspan=4, sticky="w", pady=(4, 0))
-
-    # Coordinate image on the right inside preset_lframe
-    _coord_img_path = str(Path(__file__).resolve().parent / "coordinates.png")
-    _coord_photo = None
-    try:
-        from PIL import Image as _PILImage, ImageTk as _PILImageTk
-        _pil = _PILImage.open(_coord_img_path)
-        _target_h = 70
-        _target_w = int(_target_h * _pil.width / _pil.height)
-        _pil = _pil.resize((_target_w, _target_h), _PILImage.LANCZOS)
-        _coord_photo = _PILImageTk.PhotoImage(_pil)
-    except Exception:
-        try:
-            _raw = tk.PhotoImage(file=_coord_img_path)
-            _factor = max(1, _raw.height() // 70)
-            _coord_photo = _raw.subsample(_factor, _factor)
-        except Exception:
-            _coord_photo = None
-
-    if _coord_photo is not None:
-        _img_lbl = tk.Label(preset_lframe, image=_coord_photo)
-        _img_lbl.image = _coord_photo
-        _img_lbl.grid(row=0, column=1, padx=(16, 4), pady=2, sticky="ns")
-
-    # ── Unit ──────────────────────────────────────────────────────────────────
-    unit_frame = tk.Frame(tab2)
-    unit_frame.pack(fill="x", padx=10, pady=(4, 0))
-    tk.Label(unit_frame, text="Input coordinate unit:", anchor="w", width=22).pack(side="left")
-    for unit_label in ("mm", "m"):
-        tk.Radiobutton(
-            unit_frame, text=unit_label, variable=xfm_unit_var, value=unit_label
-        ).pack(side="left", padx=4)
-
-    out_unit_frame = tk.Frame(tab2)
-    out_unit_frame.pack(fill="x", padx=10, pady=(2, 0))
-    tk.Label(out_unit_frame, text="Output coordinate unit:", anchor="w", width=22).pack(side="left")
-    xfm_out_unit_var = tk.StringVar(value=xfm_s.get("output_unit", xfm_s.get("unit", "m")))
-    for unit_label in ("mm", "m"):
-        tk.Radiobutton(
-            out_unit_frame, text=unit_label, variable=xfm_out_unit_var, value=unit_label
-        ).pack(side="left", padx=4)
-    tk.Label(out_unit_frame, text="(no conversion = same as input)",
-             fg="#888888").pack(side="left", padx=(8, 0))
-
-
-    # ── File selection ────────────────────────────────────────────────────────
-    xfm_opt_frame = tk.Frame(tab2)
-    xfm_opt_frame.pack(fill="x", padx=10, pady=(8, 0))
-    tk.Label(xfm_opt_frame, text="Glob pattern:", anchor="w").grid(row=0, column=0, sticky="w")
-    xfm_pattern_var = tk.StringVar(value=xfm_s.get("pattern", "smoothed_results_*.vtp"))
-    tk.Entry(xfm_opt_frame, textvariable=xfm_pattern_var, width=40).grid(
-        row=0, column=1, sticky="w", padx=(6, 20)
-    )
-    tk.Label(xfm_opt_frame, text="Name filter (comma-separated):", anchor="w").grid(
-        row=0, column=2, sticky="w"
-    )
-    xfm_filter_var = tk.StringVar(value=xfm_s.get("name_filter", ""))
-    tk.Entry(xfm_opt_frame, textvariable=xfm_filter_var, width=40).grid(
-        row=0, column=3, sticky="w", padx=6
-    )
-
-    # ── Export options ────────────────────────────────────────────────────────
-    export_lframe = tk.LabelFrame(tab2, text="Properties to export", padx=8, pady=4)
-    export_lframe.pack(fill="x", padx=10, pady=(8, 4))
-    _exp_row = tk.Frame(export_lframe)
-    _exp_row.pack(fill="x")
-    xfm_export_geom = tk.BooleanVar(value=bool(xfm_s.get("export_geom", True)))
-    tk.Checkbutton(_exp_row, text="Geometry (X, Y, Z)",
-                   variable=xfm_export_geom).pack(side="left", padx=(0, 12))
-    xfm_export_area = tk.BooleanVar(value=bool(xfm_s.get("export_area", True)))
-    tk.Checkbutton(_exp_row, text="Cell area",
-                   variable=xfm_export_area).pack(side="left", padx=(0, 12))
-    xfm_export_power = tk.BooleanVar(value=bool(xfm_s.get("export_power", True)))
-    tk.Checkbutton(_exp_row, text="Power (Deposited_Power_W)",
-                   variable=xfm_export_power).pack(side="left", padx=(0, 12))
-    xfm_export_pload = tk.BooleanVar(value=bool(xfm_s.get("export_pload", True)))
-    tk.Checkbutton(_exp_row, text="Power load (Power_Density_W_m2)",
-                   variable=xfm_export_pload).pack(side="left")
-
-    xfm_misc_frame = tk.Frame(tab2)
-    xfm_misc_frame.pack(fill="x", padx=10, pady=(2, 4))
-    tk.Label(xfm_misc_frame, text="Multiplication factor:",
-             font=("Segoe UI", 9, "bold")).pack(side="left")
-    xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult", "1.0")))
-    tk.Entry(xfm_misc_frame, textvariable=xfm_mult_var, width=10).pack(side="left", padx=(8, 0))
-    tk.Label(xfm_misc_frame, text="(applied to power & power load)",
-             fg="#64748b").pack(side="left", padx=(8, 20))
-    xfm_ignore_zeros = tk.BooleanVar(value=bool(xfm_s.get("ignore_zeros", False)))
-    tk.Checkbutton(xfm_misc_frame, text="Ignore zero-valued rows",
-                   variable=xfm_ignore_zeros).pack(side="left")
-
-    # ── Run button for tab 2 ─────────────────────────────────────────────────
-    tab2_btn_frame = tk.Frame(tab2)
-    tab2_btn_frame.pack(pady=(8, 10))
-    tab2_run_btn = tk.Button(
-        tab2_btn_frame, text="Run Transform", width=16, bg="#0060c0", fg="white",
-        font=("Segoe UI", 10, "bold"),
-    )
-    tab2_run_btn.pack(side="left", padx=6)
-
-    # ── Shared Log area ───────────────────────────────────────────────────────
+    # -- Log area (created early so log_fn can be passed to tab builders) ------
     tk.Label(root, text="Log:", anchor="w").pack(fill="x", padx=10, pady=(10, 2))
     log_frame = tk.Frame(root)
     log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
@@ -704,7 +135,7 @@ def run_gui():
     log_scroll.config(command=log_box.yview)
 
     _log_lines: list[str] = []
-    _run_start_time: list = [None]   # mutable cell so closures can write it
+    _run_start_time: list = [None]
 
     def log(msg: str) -> None:
         log_box.configure(state="normal")
@@ -714,33 +145,91 @@ def run_gui():
         _log_lines.append(msg)
         root.update_idletasks()
 
-    # ── Run Both + Stop ───────────────────────────────────────────────────────
-    _stop_event = threading.Event()
-    _active_workers = [0]   # mutable counter shared across closures
+    # -- Build tabs ------------------------------------------------------------
+    t1 = build_processing_tab(tab1, settings, log)
+    t2 = build_transform_tab(tab2, settings)
+
+    # Unpack frequently-used widgets from tab-state dicts
+    text_box          = t1["text_box"]
+    output_folder_var = t1["output_folder_var"]
+    comp_widgets      = t1["comp_widgets"]
+    pending_comp_cfg  = t1["pending_comp_cfg"]
+    proximity_var     = t1["proximity_var"]
+    pattern_var       = t1["pattern_var"]
+    filter_var        = t1["filter_var"]
+    cfg_path_var      = t1["cfg_path_var"]
+    tab1_run_btn      = t1["tab1_run_btn"]
+
+    tab2_run_btn           = t2["tab2_run_btn"]
+    get_transform_params   = t2["get_transform_params"]
+    get_xfm_cfg_dict       = t2["get_xfm_cfg_dict"]
+    apply_xfm_cfg          = t2["apply_xfm_cfg"]
+
+    # -- Full-config helpers (used by config save/load in tab1) ----------------
+    def _current_cfg() -> dict:
+        raw  = text_box.get("1.0", "end").strip()
+        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
+        return {
+            "input_dirs":      dirs,
+            "output_folder":   output_folder_var.get(),
+            "pattern":         pattern_var.get() or "smoothed_results_*.vtp",
+            "name_filter":     filter_var.get().strip(),
+            "proximity_radius": _safe_float(proximity_var.get(), SMOOTH_PROXIMITY_RADIUS),
+            "components":      t1["_get_comp_dict"](),
+            "transform":       get_xfm_cfg_dict(),
+        }
+
+    def _apply_cfg(loaded: dict) -> None:
+        text_box.delete("1.0", "end")
+        if loaded.get("input_dirs"):
+            text_box.insert("1.0", "\n".join(loaded["input_dirs"]))
+        pattern_var.set(loaded.get("pattern", "smoothed_results_*.vtp"))
+        filter_var.set(loaded.get("name_filter", ""))
+        proximity_var.set(str(loaded.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS)))
+        out = loaded.get("output_folder", "")
+        output_folder_var.set(out)
+        t1["output_label_var"].set(out or "(script output/ folder)")
+        pending_comp_cfg.clear()
+        pending_comp_cfg.update(loaded.get("components", {}))
+        apply_xfm_cfg(loaded.get("transform", {}))
+
+    # Wire config callbacks into tab1 so Save/Load buttons work
+    t1["_xfm_cfg_fn"][0] = _current_cfg   # used by save button
+    # Reuse slot for apply (load button calls _xfm_cfg_fn[0](loaded))
+    # -> swap to apply when called with a dict arg
+    _orig_get = _current_cfg
+
+    def _cfg_dispatch(arg=None):
+        if arg is None:
+            return _orig_get()
+        _apply_cfg(arg)
+
+    t1["_xfm_cfg_fn"][0] = _cfg_dispatch
+
+    # -- Run Both + Stop buttons -----------------------------------------------
+    _stop_event    = threading.Event()
+    _active_workers = [0]
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=(4, 10))
-
     run_both_btn = tk.Button(
         btn_frame, text="Run Both", width=12, bg="#6a0dad", fg="white",
         font=("Segoe UI", 10, "bold"),
     )
     run_both_btn.pack(side="left", padx=6)
-
     stop_btn = tk.Button(
         btn_frame, text="Stop", width=12, bg="#555555", fg="white",
         font=("Segoe UI", 10, "bold"), state="disabled",
     )
     stop_btn.pack(side="left", padx=6)
 
+    _all_run_btns = [tab1_run_btn, tab2_run_btn, run_both_btn]
+
     def on_stop():
         _stop_event.set()
-        stop_btn.configure(state="disabled", text="Stopping…")
+        stop_btn.configure(state="disabled", text="Stopping...")
 
     stop_btn.configure(command=on_stop)
-
-    # ── All run buttons list (for bulk disable/enable) ────────────────────────
-    _all_run_btns = [tab1_run_btn, tab2_run_btn, run_both_btn]
 
     def _set_busy():
         _stop_event.clear()
@@ -755,79 +244,26 @@ def run_gui():
 
     def _on_worker_done():
         _active_workers[0] -= 1
-        if _active_workers[0] <= 0:
-            _active_workers[0] = 0
-            for b in _all_run_btns:
-                b.configure(state="normal")
-            stop_btn.configure(state="disabled", text="Stop")
-            # ── Auto-save log ─────────────────────────────────────────────────
-            out_folder = output_folder_var.get().strip()
-            if not out_folder:
-                out_folder = str(Path(__file__).resolve().parent / "output")
-            try:
-                out_path = Path(out_folder)
-                out_path.mkdir(parents=True, exist_ok=True)
-                ts    = _run_start_time[0] or time.strftime("%Y-%m-%d_%H-%M-%S")
-                stem  = out_path.name
-                fname = f"{stem}_{ts}.log"
-                log_path = out_path / fname
-                with open(log_path, "w", encoding="utf-8") as fh:
-                    fh.write("\n".join(_log_lines))
-                log(f"Log saved to:\n  {log_path}")
-            except Exception as e:
-                log(f"[WARN] Could not save log: {e}")
-
-    def _get_input_dirs() -> list[str] | None:
-        raw = text_box.get("1.0", "end").strip()
-        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
-        if not dirs:
-            messagebox.showwarning("No directories", "Please paste at least one directory path.")
-            return None
-        return dirs
-
-    def _get_transform_params() -> dict | None:
+        if _active_workers[0] > 0:
+            return
+        _active_workers[0] = 0
+        for b in _all_run_btns:
+            b.configure(state="normal")
+        stop_btn.configure(state="disabled", text="Stop")
+        out_folder = output_folder_var.get().strip() or str(
+            Path(__file__).resolve().parent / "output")
         try:
-            angle = float(xfm_angle_var.get())
-            dx    = float(xfm_dx_var.get())
-            dy    = float(xfm_dy_var.get())
-            dz    = float(xfm_dz_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Transform parameters must be numeric.")
-            return None
-        try:
-            mult = float(xfm_mult_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Multiplication factor must be a number.")
-            return None
-        exp_geom  = xfm_export_geom.get()
-        exp_area  = xfm_export_area.get()
-        exp_power = xfm_export_power.get()
-        exp_pload = xfm_export_pload.get()
-        if not any([exp_geom, exp_area, exp_power, exp_pload]):
-            messagebox.showwarning("Nothing selected",
-                                   "Select at least one property to export.")
-            return None
-        unit = xfm_unit_var.get()
-        output_unit = xfm_out_unit_var.get()
-        # Scale factor: convert from input_unit to output_unit
-        unit_to_m = {"m": 1.0, "mm": 0.001}
-        coord_scale = unit_to_m[unit] / unit_to_m[output_unit]
-        return {
-            "angle_deg":    angle,
-            "dx": dx, "dy": dy, "dz": dz,
-            "unit":         unit,
-            "output_unit":  output_unit,
-            "coord_scale":  coord_scale,
-            "pattern":      xfm_pattern_var.get() or "smoothed_results_*.vtp",
-            "name_filter":  xfm_filter_var.get().strip(),
-            "export_geom":  exp_geom,
-            "export_area":  exp_area,
-            "export_power": exp_power,
-            "export_pload": exp_pload,
-            "mult":         mult,
-            "ignore_zeros": xfm_ignore_zeros.get(),
-        }
+            out_path = Path(out_folder)
+            out_path.mkdir(parents=True, exist_ok=True)
+            ts    = _run_start_time[0] or time.strftime("%Y-%m-%d_%H-%M-%S")
+            fname = f"{out_path.name}_{ts}.log"
+            with open(out_path / fname, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(_log_lines))
+            log(f"Log saved to:\n  {out_path / fname}")
+        except Exception as e:
+            log(f"[WARN] Could not save log: {e}")
 
+    # -- Launch helpers --------------------------------------------------------
     def _launch_processing(cfg: dict) -> None:
         def worker():
             try:
@@ -840,25 +276,29 @@ def run_gui():
     def _launch_transform(input_dirs: list, xfm_params: dict, out_folder: str) -> None:
         def worker():
             try:
-                run_transform(
-                    input_dirs=input_dirs,
-                    xfm_params=xfm_params,
-                    output_folder=out_folder,
-                    log=log,
-                    stop_event=_stop_event,
-                )
+                run_transform(input_dirs=input_dirs, xfm_params=xfm_params,
+                              output_folder=out_folder, log=log, stop_event=_stop_event)
             finally:
                 root.after(0, _on_worker_done)
         _active_workers[0] += 1
         threading.Thread(target=worker, daemon=True).start()
 
+    def _get_input_dirs() -> list[str] | None:
+        raw  = text_box.get("1.0", "end").strip()
+        dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
+        if not dirs:
+            messagebox.showwarning("No directories", "Please paste at least one directory path.")
+            return None
+        return dirs
+
+    # -- Run callbacks ---------------------------------------------------------
     def on_run_processing():
         cfg = _current_cfg()
         if not cfg["input_dirs"]:
             messagebox.showwarning("No directories", "Please paste at least one directory path.")
             return
-        if not _comp_widgets:
-            log("[!] No geometry loaded — please click \"Load Geometry\" before running.")
+        if not comp_widgets:
+            log('[!] No geometry loaded - please click "Load Geometry" before running.')
             return
         save_settings(cfg)
         _set_busy()
@@ -868,11 +308,10 @@ def run_gui():
         input_dirs = _get_input_dirs()
         if input_dirs is None:
             return
-        xfm_params = _get_transform_params()
+        xfm_params = get_transform_params()
         if xfm_params is None:
             return
-        cfg = _current_cfg()
-        save_settings(cfg)
+        save_settings(_current_cfg())
         _set_busy()
         _launch_transform(input_dirs, xfm_params, output_folder_var.get())
 
@@ -880,15 +319,15 @@ def run_gui():
         input_dirs = _get_input_dirs()
         if input_dirs is None:
             return
-        xfm_params = _get_transform_params()
+        xfm_params = get_transform_params()
         if xfm_params is None:
             return
         cfg = _current_cfg()
         if not cfg["input_dirs"]:
             messagebox.showwarning("No directories", "Please paste at least one directory path.")
             return
-        if not _comp_widgets:
-            log("[!] No geometry loaded — please click \"Load Geometry\" before running.")
+        if not comp_widgets:
+            log('[!] No geometry loaded - please click "Load Geometry" before running.')
             return
         save_settings(cfg)
         _set_busy()
@@ -901,1116 +340,12 @@ def run_gui():
     root.mainloop()
 
 
+# -- Entry point ---------------------------------------------------------------
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def run_processing(cfg: dict, log, stop_event: threading.Event | None = None) -> None:
-    def stopped() -> bool:
-        return stop_event is not None and stop_event.is_set()
-    input_dirs       = cfg["input_dirs"]
-    pattern          = cfg["pattern"]
-    name_filter      = cfg.get("name_filter", "")
-    components       = cfg.get("components", {})
-    proximity_radius = _safe_float(cfg.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS),
-                                   SMOOTH_PROXIMITY_RADIUS)
-
-    def _file_settings(filepath: Path) -> tuple:
-        """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor).
-        Both CSVs are always written; the two booleans control snapshot renders only."""
-        stem = filepath.stem.lower()
-        for comp_name, comp_cfg in components.items():
-            if comp_name == "(all)":
-                continue
-            if comp_name.lower() in stem:
-                return (int(comp_cfg.get("smooth_iterations", 1)),
-                        bool(comp_cfg.get("save_power_density", True)),
-                        bool(comp_cfg.get("save_total_power", False)),
-                        float(comp_cfg.get("mult_factor", 1.0)))
-        if "(all)" in components:
-            c = components["(all)"]
-            return (int(c.get("smooth_iterations", 1)),
-                    bool(c.get("save_power_density", True)),
-                    bool(c.get("save_total_power", False)),
-                    float(c.get("mult_factor", 1.0)))
-        # Legacy fallback
-        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0)
-
-    # Expand any OUTPUT_* folder into its immediate subfolders
-    expanded_dirs = []
-    for d in input_dirs:
-        p = Path(d)
-        if p.is_dir() and p.name.upper().startswith("OUTPUT_"):
-            subfolders = [s for s in sorted(p.iterdir()) if s.is_dir()]
-            if subfolders:
-                log(f"Expanding {p.name} into {len(subfolders)} subfolder(s).")
-                expanded_dirs.extend(subfolders)
-            else:
-                log(f"[WARN] {p.name} folder is empty: {p}")
-        else:
-            expanded_dirs.append(p)
-    input_dirs = expanded_dirs
-
-    # Output folder: user choice, or fall back to script's own output/ folder
-    script_dir = Path(__file__).resolve().parent
-    out_dir = Path(cfg["output_folder"]) if cfg["output_folder"] else script_dir / "output"
-    os.makedirs(out_dir, exist_ok=True)
-
-    snap_dir = out_dir / "snapshots"
-    # snap_dir is created lazily in stage 3 only when needed
-
-    csv_path  = out_dir / "max_comparison_batch.csv"
-    pwr_path  = out_dir / "total_power_batch.csv"
-
-    total_files = 0
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh, \
-         open(pwr_path,  "w", newline="", encoding="utf-8") as fh_pwr:
-        writer     = csv.writer(fh)
-        writer_pwr = csv.writer(fh_pwr)
-        writer.writerow([
-            "case", "scenario", "filename",
-            "max_before", "max_after",
-            "delta", "discrepancy",
-        ])
-        writer_pwr.writerow([
-            "case", "scenario", "filename",
-            "total_power_W",
-        ])
-
-        # ── Collect all matching files across every folder first ──────────
-        all_files: list[tuple[Path, str, str, str]] = []  # (path, output_name, case, scenario)
-        for input_folder in input_dirs:
-            if stopped():
-                break
-            input_path = Path(input_folder)
-            output_name, folder_case, _ = extract_case_scenario(str(input_path))
-
-            files = sorted(input_path.rglob(pattern))
-            if name_filter:
-                terms = [t.strip().lower() for t in name_filter.split(",") if t.strip()]
-                files = [f for f in files if any(t in f.stem.lower() for t in terms)]
-            if not files:
-                filter_note = f" containing '{name_filter}'" if name_filter else ""
-                log(f"[SKIP] No files matching '{pattern}'{filter_note} in (or below):\n  {input_path}")
-                continue
-
-            log(f"  {folder_case}: {len(files)} file(s) found")
-            for filepath in files:
-                _, case, scenario = extract_case_scenario(str(filepath.parent))
-                all_files.append((filepath, output_name, case, scenario))
-
-        if not all_files:
-            log("No files found.")
-            return
-
-        log(f"\nTotal: {len(all_files)} file(s) to process")
-        log("=" * 80)
-
-        # ── Stage 1: Load VTP files (parallel I/O) ───────────────────────
-        # ThreadPool.imap_unordered feeds one item per idle worker — at most
-        # n_workers files live in memory at once.  I/O-bound work benefits
-        # from a pool larger than cpu_count; cap at 12 to stay reasonable.
-        n_all     = len(all_files)
-        n_workers = min(os.cpu_count() or 4, n_all, 12)
-        log(f"\n[1/3] Loading {n_all} VTP file(s) ({n_workers} workers)...")
-        loaded: list[tuple] = []
-        t0_load = time.perf_counter()
-
-        with ThreadPool(processes=n_workers) as pool:
-            for completed, result in enumerate(
-                    pool.imap_unordered(_load_one_file, all_files), 1):
-                if stopped():
-                    pool.terminate()
-                    break
-                elapsed = time.perf_counter() - t0_load
-                if isinstance(result, Exception):
-                    log(f"  [{completed}/{n_all}] ERROR: {result}")
-                    continue
-                filepath, output_name, case, scenario, polydata, max_val, total_pwr = result
-                if max_val is None:
-                    log(f"  [{completed}/{n_all}] SKIP  {filepath.name}  (no '{ARRAY_NAME}')")
-                    continue
-                loaded.append((filepath, output_name, case, scenario, polydata, max_val, total_pwr))
-                log(f"  [{completed}/{n_all}] {filepath.name}  (elapsed: {elapsed:.1f}s)")
-
-        log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0_load:.1f}s")
-
-        # Build per-file (n_iter, save_snapshot) lookup from component config
-        _snap_map = {fp: _file_settings(fp) for fp, *_ in loaded}
-
-        # Preserve total_power through the pipeline (not affected by smoothing)
-        _power_map: dict = {
-            fp: total_pwr
-            for fp, _on, _c, _s, _pd, _mv, total_pwr in loaded
-        }
-
-        # ── Geometry cache: compute edge-ring + neighbour map once per component ─
-        # Steps 1-4 of apply_edge_smooth depend only on mesh topology, which is
-        # identical for all VTP files of the same component (same underlying STL).
-        # We take the first loaded file per component, run precompute_smooth_geometry
-        # once, then share that dict across all files of that component.
-        _geo_cache: dict[str, dict] = {}   # component_name -> geo dict
-        _files_needing_smooth = [
-            (fp, *rest) for fp, *rest in loaded if _snap_map[fp][0] > 0
-        ]
-        if _files_needing_smooth:
-            log(f"\n  Pre-computing edge geometry per component...")
-            _seen_comps: set = set()
-            for fp, output_name_c, case_c, scenario_c, polydata_c, *_ in _files_needing_smooth:
-                comp = next(
-                    (name for name in components if name != "(all)"
-                     and name.lower() in fp.stem.lower()),
-                    "(all)",
-                )
-                if comp not in _seen_comps:
-                    _seen_comps.add(comp)
-                    t0_geo = time.perf_counter()
-                    cache = precompute_smooth_geometry(polydata_c, proximity_radius=proximity_radius)
-                    n_ec     = len(cache["edge_cell_list"]) if cache else 0
-                    n_direct = cache.get("n_direct", n_ec) if cache else 0
-                    extra    = n_ec - n_direct
-                    extra_s  = f" (+{extra} via proximity)" if extra else ""
-                    log(f"    [{comp}] {n_direct} direct + {extra} proximity = {n_ec} cells  "
-                        f"({time.perf_counter()-t0_geo:.1f}s)  (from {fp.name})")
-                    _geo_cache[comp] = cache
-
-        def _geo_for(fp: Path) -> dict | None:
-            for name in components:
-                if name != "(all)" and name.lower() in fp.stem.lower():
-                    return _geo_cache.get(name)
-            return _geo_cache.get("(all)")
-
-        # ── Stage 2: Smoothing / passthrough (n_iter=0 files skip smoothing) ──
-        processed: list[tuple] = []
-        n_loaded = len(loaded)
-        n_smooth_workers = max(1, min(n_loaded, n_workers))
-        log(f"\n[2/3] Processing {n_loaded} file(s) ({n_smooth_workers} workers)...")
-        t0_smooth = time.perf_counter()
-        smooth_args = [
-            (filepath, output_name, case, scenario, polydata, max_before,
-             _snap_map[filepath][0], stop_event, _geo_for(filepath))
-            for filepath, output_name, case, scenario, polydata, max_before, _tpwr in loaded
-        ]
-        import sys as _sys
-        _prev_interval = _sys.getswitchinterval()
-        _sys.setswitchinterval(0.001)   # 1ms: Tkinter gets CPU 5x more often
-        try:
-            with ThreadPool(processes=n_smooth_workers) as pool:
-                for completed, result in enumerate(
-                        pool.imap_unordered(_smooth_one_file, smooth_args), 1):
-                    if stopped():
-                        pool.terminate()
-                        break
-                    elapsed = time.perf_counter() - t0_smooth
-                    if result is None:   # worker saw stop_event
-                        continue
-                    if isinstance(result, Exception):
-                        log(f"  [{completed}/{n_loaded}] ERROR: {result}")
-                        continue
-                    (filepath, output_name, case, scenario,
-                     polydata, max_before, smoothed, max_after) = result
-                    processed.append(result)
-                    n_iter_used = _snap_map[filepath][0]
-                    if n_iter_used > 0:
-                        log(f"  [{completed}/{n_loaded}] {filepath.name}  "
-                            f"(elapsed: {elapsed:.1f}s)  "
-                            f"before={max_before:.4g}  after={max_after:.4g}  ({n_iter_used} iter)")
-                    else:
-                        log(f"  [{completed}/{n_loaded}] {filepath.name}  "
-                            f"(elapsed: {elapsed:.1f}s)  no smoothing")
-        finally:
-            _sys.setswitchinterval(_prev_interval)   # always restore
-        log(f"  Stage 2 done in {time.perf_counter()-t0_smooth:.1f}s")
-
-        # ── Write CSV rows (always, regardless of snapshot settings) ──────────────
-        for item in processed:
-            filepath, output_name, case, scenario, _, max_before, _, max_after = item
-            _n_iter, snap_pd, snap_tp, mult = _snap_map[filepath]
-            mb  = max_before * mult
-            ma  = max_after  * mult
-            delta       = abs(ma - mb)
-            discrepancy = "YES" if delta > 0.0 else "NO"
-            writer.writerow([
-                case, scenario, filepath.name,
-                f"{mb:.6g}", f"{ma:.6g}",
-                f"{delta:.6g}", discrepancy,
-            ])
-            total_pwr = _power_map.get(filepath)
-            if total_pwr is not None:
-                writer_pwr.writerow([
-                    case, scenario, filepath.name,
-                    f"{total_pwr * mult:.6g}",
-                ])
-            total_files += 1
-
-        # ── Stage 3: Snapshots ────────────────────────────────────────────────────────
-        # snap_pwr_density ([1]) → render Power_Density_W_m2
-        # snap_total_pwr   ([2]) → render Deposited_Power_W
-        # Both CSVs are always written; these flags only gate snapshot output.
-        snap_items = [item for item in processed
-                      if _snap_map[item[0]][1] or _snap_map[item[0]][2]]
-        if snap_items:
-            snap_dir.mkdir(parents=True, exist_ok=True)
-            n_snap = len(snap_items)
-
-            snap_proc_args: list[tuple] = []
-            temp_vtp_files: list[Path] = []
-            for (filepath, output_name, case, scenario,
-                 polydata_orig, _, polydata_smooth, _) in snap_items:
-                n_iter_f, snap_pd, snap_tp, mult_f = _snap_map[filepath]
-                is_snap_only = (n_iter_f == 0)
-                stem = filepath.stem
-                case_snap_dir = snap_dir / output_name / case / scenario
-                case_snap_dir.mkdir(parents=True, exist_ok=True)
-                smooth_path = None
-                if not is_snap_only:
-                    tmp = snap_dir / f"_tmp_smooth_{os.getpid()}_{len(temp_vtp_files)}.vtp"
-                    _write_vtp(polydata_smooth, tmp)
-                    temp_vtp_files.append(tmp)
-                    smooth_path = str(tmp)
-
-                # Power-density snapshot
-                if snap_pd:
-                    if is_snap_only:
-                        out_paths_pd = [str(case_snap_dir / f"{scenario}__{stem}__pwr_density.png")]
-                    else:
-                        out_paths_pd = [
-                            str(case_snap_dir / f"{scenario}__{stem}__pwr_density__before.png"),
-                            str(case_snap_dir / f"{scenario}__{stem}__pwr_density__after.png"),
-                        ]
-                    snap_proc_args.append((
-                        str(filepath), smooth_path,
-                        out_paths_pd, ARRAY_NAME, is_snap_only, stem, mult_f,
-                    ))
-
-                # Total-power snapshot
-                if snap_tp:
-                    if is_snap_only:
-                        out_paths_tp = [str(case_snap_dir / f"{scenario}__{stem}__total_pwr.png")]
-                    else:
-                        out_paths_tp = [
-                            str(case_snap_dir / f"{scenario}__{stem}__total_pwr__before.png"),
-                            str(case_snap_dir / f"{scenario}__{stem}__total_pwr__after.png"),
-                        ]
-                    snap_proc_args.append((
-                        str(filepath), smooth_path,
-                        out_paths_tp, POWER_ARRAY, is_snap_only, stem, mult_f,
-                    ))
-
-            import multiprocessing as _mp
-            # Each render subprocess has its own OpenGL context.
-            # GPU load per process is <2% (simple surface mesh, no ray-tracing),
-            # so with 90%+ compute headroom we can run many in parallel.
-            # Bottleneck is CPU (VTP I/O + ray-cast precompute), not GPU.
-            n_snap_workers = min(6, n_snap)
-            log(f"\n[3/3] Saving {n_snap} snapshot(s) "
-                f"({n_snap_workers} render process(es))...")
-            t0_snap = time.perf_counter()
-            try:
-                with _mp.Pool(processes=n_snap_workers) as pool:
-                    for completed, result in enumerate(
-                            pool.imap_unordered(_render_subprocess, snap_proc_args), 1):
-                        if stopped():
-                            pool.terminate()
-                            break
-                        elapsed = time.perf_counter() - t0_snap
-                        if isinstance(result, Exception):
-                            log(f"  [{completed}/{n_snap}] ERROR: {result}")
-                            continue
-                        label, file_elapsed = result
-                        log(f"  [{completed}/{n_snap}] {label}  ({file_elapsed:.1f}s)")
-            finally:
-                for tmp in temp_vtp_files:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            log(f"  Snapshots done in {time.perf_counter()-t0_snap:.1f}s")
-        else:
-            log("\n[3/3] Snapshots disabled")
-
-    log("\n" + "=" * 80)
-    if stopped():
-        log(f"STOPPED by user after {total_files} file(s).")
-    else:
-        log(f"Processed {total_files} file(s) across {len(input_dirs)} folder(s).")
-    log(f"CSV log saved to:\n  {csv_path}")
-    log(f"Power CSV saved to:\n  {pwr_path}")
-
-
-def run_transform(
-    input_dirs: list,
-    xfm_params: dict,
-    output_folder: str,
-    log,
-    stop_event: threading.Event | None = None,
-) -> None:
-    """
-    For each matching .vtp file:
-      1. Extract per-cell data (X, Y, Z, Area, Deposited_Power_W,
-         Power_Density_W_m2) to an intermediate CSV via generate_report.
-      2. Transform the X/Y/Z coordinates using transform_reference_frame
-         and write the final CSV to the output folder.
-    """
-
-    def stopped() -> bool:
-        return stop_event is not None and stop_event.is_set()
-
-    pattern       = xfm_params["pattern"]
-    name_filter   = xfm_params["name_filter"]
-    angle_deg     = xfm_params["angle_deg"]
-    dx            = xfm_params["dx"]
-    dy            = xfm_params["dy"]
-    dz            = xfm_params["dz"]
-    export_geom   = xfm_params.get("export_geom",  True)
-    export_area   = xfm_params.get("export_area",  True)
-    export_power  = xfm_params.get("export_power", True)
-    export_pload  = xfm_params.get("export_pload", True)
-    mult          = float(xfm_params.get("mult", 1.0))
-    ignore_zeros  = xfm_params.get("ignore_zeros", False)
-    coord_scale   = float(xfm_params.get("coord_scale", 1.0))
-
-    # Expand OUTPUT_* dirs
-    expanded = []
-    for d in input_dirs:
-        p = Path(d)
-        if p.is_dir() and p.name.upper().startswith("OUTPUT_"):
-            subs = [s for s in sorted(p.iterdir()) if s.is_dir()]
-            if subs:
-                log(f"Expanding {p.name} into {len(subs)} subfolder(s).")
-                expanded.extend(subs)
-            else:
-                log(f"[WARN] {p.name} is empty: {p}")
-        else:
-            expanded.append(p)
-
-    script_dir = Path(__file__).resolve().parent
-    out_root = Path(output_folder) if output_folder else script_dir / "output"
-
-    # ── Collect all work items across every folder ────────────────────────────
-    all_xfm_args = []
-    for folder in expanded:
-        if stopped():
-            break
-        folder = Path(folder)
-        output_name, folder_case, folder_scenario = extract_case_scenario(str(folder))
-
-        files = sorted(folder.rglob(pattern))
-        if name_filter:
-            terms = [t.strip().lower() for t in name_filter.split(",") if t.strip()]
-            files = [f for f in files if any(t in f.stem.lower() for t in terms)]
-        if not files:
-            note = f" containing '{name_filter}'" if name_filter else ""
-            log(f"[SKIP] No files matching '{pattern}'{note} in:\n  {folder}")
-            continue
-
-        log(f"  {folder_case}/{folder_scenario}: {len(files)} file(s)")
-        for filepath in files:
-            _, case, scenario = extract_case_scenario(str(filepath.parent))
-            dest_dir = out_root / "transformed" / output_name / case
-            all_xfm_args.append((filepath, dest_dir, scenario, xfm_params))
-
-    # ── Run all files in one shared pool ─────────────────────────────────────
-    n_total   = len(all_xfm_args)
-    n_workers = min(os.cpu_count() or 4, n_total, 12)
-    log(f"\nTransforming {n_total} file(s) total ({n_workers} workers)...")
-    log("=" * 80)
-
-    total = 0
-    with ThreadPool(processes=n_workers) as pool:
-        for completed, result in enumerate(
-                pool.imap_unordered(_transform_one_file, all_xfm_args), 1):
-            if stopped():
-                pool.terminate()
-                break
-            if isinstance(result, Exception):
-                log(f"  [{completed}/{n_total}] ERROR: {result}")
-                continue
-            filepath, out_path, _ = result
-            log(f"  [{completed}/{n_total}] {filepath.name} -> {out_path.name}")
-            total += 1
-
-    log("\n" + "=" * 80)
-    if stopped():
-        log(f"STOPPED after {total} file(s) transformed.")
-    else:
-        log(f"Transformed {total} file(s).")
-    log(f"Output root: {out_root / 'transformed'}")
-
-
-def main():
+def main() -> None:
     run_gui()
-
-
-
-# ── Path helpers ──────────────────────────────────────────────────────────────
-def _looks_like_scenario(name: str) -> bool:
-    """Return True if name looks like a scenario code (e.g. 'DNB_10mrad_2tilt_0ori_10Halo_').
-    Scenarios contain digits (beam/tilt/orientation parameters); case/group identifiers
-    like 'DNB_ALL', 'DNB_BTR_COMPARE', 'DNB_BOTTOM' do not.
-    """
-    return bool(re.search(r'\d', name))
-
-
-def extract_case_scenario(folder):
-    """
-    Find the OUTPUT_* ancestor and return (output_name, case, scenario).
-
-    Handles any depth of nesting below OUTPUT_* with a bottom-up rule:
-      - 0 sub-levels  → case = scenario = output_suffix
-      - 1 sub-level   → case = suffix if it looks like a scenario, else sub[0];
-                         scenario = sub[0]
-      - 2 sub-levels  → case = sub[0] unless sub[0] looks like a scenario
-                         (in which case case = output_suffix); scenario = sub[0]
-      - 3+ sub-levels → case = sub[-2], scenario = sub[-1]
-                         (ignores intermediate grouping folders like 'DNB_ALL')
-
-    Storage-only terminal folder names (e.g. "SMOOTHED") are stripped from the
-    tail of sub before depth logic is applied, so files sitting inside a SMOOTHED
-    sub-folder resolve identically to files in the parent scenario folder.
-
-    Falls back to ("snapshots", parts[-2], parts[-1]) if no OUTPUT_* is found.
-    """
-    # Folder names that are pure storage artefacts and carry no case/scenario info
-    _STORAGE_FOLDERS = {"SMOOTHED", "RAW", "RESULTS", "OUTPUT"}
-
-    parts = Path(folder).parts
-    try:
-        idx = next(i for i, p in enumerate(parts) if p.upper().startswith("OUTPUT_"))
-        output_name   = parts[idx]
-        output_suffix = output_name[len("OUTPUT_"):]
-        sub = parts[idx + 1:]   # everything after OUTPUT_*
-
-        # Strip trailing storage-only folder names so depth logic is not confused
-        while sub and sub[-1].upper() in _STORAGE_FOLDERS:
-            sub = sub[:-1]
-
-        if len(sub) == 0:
-            case = output_suffix or "unknown"
-            scenario = case
-        elif len(sub) == 1:
-            if _looks_like_scenario(sub[0]):
-                case = output_suffix or sub[0]
-            else:
-                case = sub[0]
-            scenario = sub[0]
-        elif len(sub) == 2:
-            if _looks_like_scenario(sub[0]):
-                # OUTPUT_FFTC / dnb_3_+10_+2 / ...
-                case     = output_suffix or sub[0]
-                scenario = sub[0]
-            else:
-                case     = sub[0]
-                scenario = sub[1]
-        else:
-            # 3+ levels: skip intermediate grouping folders; use last two
-            case     = sub[-2]
-            scenario = sub[-1]
-    except StopIteration:
-        output_name = "snapshots"
-        case        = parts[-2] if len(parts) >= 2 else "unknown"
-        scenario    = parts[-1] if len(parts) >= 1 else "unknown"
-    return output_name, case, scenario
-
-
-# ── VTK I/O ───────────────────────────────────────────────────────────────────
-def read_vtp(filepath):
-    reader = vtk.vtkXMLPolyDataReader()
-    reader.SetFileName(filepath)
-    reader.Update()
-    return reader.GetOutput()
-
-
-def _load_one_file(args: tuple) -> tuple:
-    """Load one VTP file and extract the max scalar value.  Called from a thread pool.
-    Returns the result tuple, or the Exception on failure (never raises — keeps the pool alive)."""
-    try:
-        filepath, output_name, case, scenario = args
-        polydata  = read_vtp(str(filepath))
-        max_val   = find_max(polydata, ARRAY_NAME)
-        total_pwr = find_total(polydata, POWER_ARRAY)
-        return filepath, output_name, case, scenario, polydata, max_val, total_pwr
-    except Exception as exc:
-        return exc
-
-
-def _smooth_one_file(args: tuple) -> tuple:
-    """Apply edge smoothing to one loaded file.  Called from a thread pool.
-    Accepts stop_event so it can self-cancel between phases without waiting for
-    the outer imap_unordered loop to get a turn.
-    geo_cache: optional pre-computed geometry dict from precompute_smooth_geometry().
-    Returns the full processed tuple, or an Exception, or None if stopped."""
-    try:
-        filepath, output_name, case, scenario, polydata, max_before, n_iter, stop_event, geo_cache = args
-        if stop_event is not None and stop_event.is_set():
-            return None
-        if n_iter == 0:
-            # No smoothing requested for this component — pass through unchanged
-            return filepath, output_name, case, scenario, polydata, max_before, polydata, max_before
-        smoothed  = apply_edge_smooth(polydata, n_iter=n_iter, stop_event=stop_event, geo_cache=geo_cache)
-        if smoothed is None:
-            return None   # cancelled mid-smooth
-        max_after = find_max(smoothed, ARRAY_NAME)
-        return filepath, output_name, case, scenario, polydata, max_before, smoothed, max_after
-    except Exception as exc:
-        return exc
-
-
-def _transform_one_file(args: tuple) -> tuple:
-    """Extract cells to CSV and apply coordinate transform for one VTP file.
-    Pure I/O + CPU, no shared state — safe to run in a thread pool.
-    Returns (filepath, out_path, log_lines) or an Exception."""
-    try:
-        (filepath, dest_dir, scenario, xfm_params) = args
-        angle_deg    = xfm_params["angle_deg"]
-        dx           = xfm_params["dx"]
-        dy           = xfm_params["dy"]
-        dz           = xfm_params["dz"]
-        export_geom  = xfm_params.get("export_geom",  True)
-        export_area  = xfm_params.get("export_area",  True)
-        export_power = xfm_params.get("export_power", True)
-        export_pload = xfm_params.get("export_pload", True)
-        mult         = float(xfm_params.get("mult", 1.0))
-        ignore_zeros = xfm_params.get("ignore_zeros", False)
-        coord_scale  = float(xfm_params.get("coord_scale", 1.0))
-
-        dest_dir = Path(dest_dir)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        # Prefix filename with scenario so parallel files with the same stem
-        # land in the same folder without colliding.
-        csv_name = f"{scenario}__{filepath.stem}.csv"
-        out_path = dest_dir / csv_name
-        tmp_csv  = dest_dir / f"{scenario}__{filepath.stem}.tmp.csv"
-
-        extract_cells_to_csv(
-            str(filepath), str(tmp_csv),
-            export_geom=export_geom, export_area=export_area,
-            export_power=export_power, export_pload=export_pload,
-            mult=mult, ignore_zeros=ignore_zeros,
-        )
-        _trf.process_file(
-            input_path=tmp_csv, output_path=out_path,
-            x_col=None, y_col=None, z_col=None,
-            angle_deg=angle_deg, dx=dx, dy=dy, dz=dz,
-            coord_scale=coord_scale,
-        )
-        tmp_csv.unlink(missing_ok=True)
-        return filepath, out_path, None   # None = no error
-    except Exception as exc:
-        return exc
-
-
-def _write_vtp(polydata: "vtk.vtkPolyData", path: Path) -> None:
-    """Serialize a vtkPolyData to a VTP file (for cross-process transfer)."""
-    writer = vtk.vtkXMLPolyDataWriter()
-    writer.SetFileName(str(path))
-    writer.SetInputData(polydata)
-    writer.Write()
-
-
-def _scale_polydata_array(
-        polydata: "vtk.vtkPolyData",
-        array_name: str,
-        factor: float,
-) -> "vtk.vtkPolyData":
-    """Return a copy of *polydata* with *array_name* in cell data multiplied by *factor*.
-
-    Scaling the data (rather than clipping the colour range) means the colour
-    map always spans the full [0, scaled_max] range without saturation.
-    Running in a subprocess so DeepCopy overhead is acceptable.
-    """
-    arr = polydata.GetCellData().GetArray(array_name)
-    if arr is None or factor == 1.0:
-        return polydata
-    scaled_vals = vtk_to_numpy(arr).astype(float) * factor
-    new_arr = numpy_to_vtk(scaled_vals, deep=True, array_type=arr.GetDataType())
-    new_arr.SetName(array_name)
-    pd2 = vtk.vtkPolyData()
-    pd2.DeepCopy(polydata)
-    pd2.GetCellData().RemoveArray(array_name)
-    pd2.GetCellData().AddArray(new_arr)
-    pd2.GetCellData().SetActiveScalars(array_name)
-    return pd2
-
-
-def _render_subprocess(args: tuple) -> tuple:
-    """Render and save snapshot(s) for one file.  MUST run in a separate PROCESS.
-
-    Root cause of GUI freeze: vtkRenderWindow on Windows uses the WGL (Windows
-    OpenGL) backend.  Even with SetOffScreenRendering(1) it calls wglMakeCurrent()
-    which acquires a per-process GPU driver lock.  While a render thread holds this
-    lock, the Desktop Window Manager (DWM) cannot composite Tkinter's window,
-    causing the GUI to freeze for the full duration of each render (~6 s).
-
-    Running renders in separate processes gives each its own Win32 address space
-    and GPU context.  WDDM schedules GPU time-slices between processes independently,
-    so Tkinter's DWM compositing is never blocked.
-
-    Parameters are plain strings/booleans (picklable); polydata is passed via temp
-    VTP files that the subprocess reads from disk.
-    """
-    try:
-        (orig_vtp_path, smooth_vtp_path, out_paths,
-         array_name, snapshot_only, label, mult_factor) = args
-        t0 = time.perf_counter()
-
-        pd_orig = read_vtp(str(orig_vtp_path))
-        # Scale the data array by mult_factor so the colour range spans
-        # [0, scaled_max] with no clipping.  This applies equally to
-        # Power_Density_W_m2 and Deposited_Power_W.
-        pd_orig = _scale_polydata_array(pd_orig, array_name, mult_factor)
-
-        # Camera placement: always use Power_Density_W_m2 for the focal point so
-        # both render types (power density AND deposited power) are viewed from the
-        # same angle — looking at the beam centre, not at a large-area edge cell.
-        # The max label and colour range use the target array's actual max value.
-        def _make_precomputed(pd_scaled, pd_raw_for_cam):
-            pre_arr = precompute_snapshot(pd_scaled, array_name)
-            if array_name == ARRAY_NAME or pre_arr is None:
-                return pre_arr
-            pre_cam = precompute_snapshot(pd_raw_for_cam, ARRAY_NAME)
-            if pre_cam is None:
-                return pre_arr
-            # Use power-density camera; keep deposited-power max for label/colour.
-            return {**pre_cam, "max_val": pre_arr["max_val"]}
-
-        pd_orig_raw = read_vtp(str(orig_vtp_path))  # unscaled — for camera + total power
-        # Total deposited power of the component (original, pre-smoothing, scaled by mult_factor)
-        _raw_total = find_total(pd_orig_raw, POWER_ARRAY)
-        _total_pwr = (_raw_total * mult_factor) if _raw_total is not None else None
-        pre_orig = _make_precomputed(pd_orig, pd_orig_raw)
-
-        if snapshot_only:
-            save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
-        else:
-            save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
-            pd_smooth = read_vtp(str(smooth_vtp_path))
-            pd_smooth_raw = pd_smooth   # reference before scale (DeepCopy inside for factor≠1)
-            pd_smooth = _scale_polydata_array(pd_smooth, array_name, mult_factor)
-            if pd_smooth is pd_smooth_raw:  # factor == 1.0, same object → need explicit raw
-                pd_smooth_raw = read_vtp(str(smooth_vtp_path))
-            pre_smooth = _make_precomputed(pd_smooth, pd_smooth_raw)
-            save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
-                              vmax=None, precomputed=pre_smooth, total_power_W=_total_pwr)
-
-        return label, time.perf_counter() - t0
-    except Exception as exc:
-        return exc
-
-
-def _save_one_snapshot(args: tuple) -> tuple:
-    """Legacy thread-based snapshot worker (kept as fallback).
-    Prefer _render_subprocess via multiprocessing.Pool for Win32 responsiveness.
-    Returns (label, elapsed_s) or an Exception."""
-    try:
-        (filepath, output_name, case, scenario,
-         polydata_orig, polydata_smooth, snap_dir, snapshot_only) = args
-
-        # ── Step 1: DeepCopy into this thread first (minimal cross-thread touch) ──
-        # vtkCellLocator.SetDataSet() increments the ref-count on its polydata arg,
-        # which is a write — not safe to do on cross-thread VTK objects.  DeepCopy is
-        # the only cross-thread VTK call and is safe as a single read operation.
-        pd_orig = vtk.vtkPolyData()
-        pd_orig.DeepCopy(polydata_orig)
-
-        # ── Step 2: Pre-compute on the local copy (CPU, no GPU, single thread) ──
-        pre_orig = precompute_snapshot(pd_orig, ARRAY_NAME)
-
-        stem = filepath.stem
-        case_snap_dir = snap_dir / output_name / case / scenario
-        case_snap_dir.mkdir(parents=True, exist_ok=True)
-        t0 = time.perf_counter()
-
-        # ── Step 3: Render from the local copy ───────────────────────────────────
-        if snapshot_only:
-            png_snap = case_snap_dir / f"{scenario}__{stem}.png"
-            save_max_snapshot(pd_orig, ARRAY_NAME, png_snap, precomputed=pre_orig)
-            return png_snap.name, time.perf_counter() - t0
-        else:
-            pd_smooth = vtk.vtkPolyData()
-            pd_smooth.DeepCopy(polydata_smooth)
-            pre_smooth = precompute_snapshot(pd_smooth, ARRAY_NAME)
-            png_before = case_snap_dir / f"{scenario}__{stem}__before.png"
-            save_max_snapshot(pd_orig, ARRAY_NAME, png_before, precomputed=pre_orig)
-            png_after  = case_snap_dir / f"{scenario}__{stem}__after.png"
-            save_max_snapshot(pd_smooth, ARRAY_NAME, png_after, precomputed=pre_smooth)
-            return stem, time.perf_counter() - t0
-    except Exception as exc:
-        return exc
-
-
-def find_total(polydata, array_name):
-    """Return the sum of *array_name* in cell data, or None."""
-    arr = polydata.GetCellData().GetArray(array_name)
-    if arr is None:
-        return None
-    n = arr.GetNumberOfTuples()
-    if n == 0:
-        return None
-    return float(vtk_to_numpy(arr).sum())
-
-
-def find_max(polydata, array_name):
-    """Return the maximum value of *array_name* in cell data, or None."""
-    arr = polydata.GetCellData().GetArray(array_name)
-    if arr is None:
-        return None
-    n = arr.GetNumberOfTuples()
-    if n == 0:
-        return None
-    return float(vtk_to_numpy(arr).max())
-
-
-# ── Smoothing (mirrors Smart_Smooth_EDGE.py) ──────────────────────────────────
-def precompute_smooth_geometry(src, proximity_radius: float | None = None) -> dict | None:
-    """Compute and return the geometry-only data needed by apply_edge_smooth.
-
-    This is ONLY a function of mesh topology + vertex positions — it is
-    identical for every VTP file that shares the same underlying STL.
-    Call once per component, then pass the result to apply_edge_smooth via
-    geo_cache= to skip the expensive Steps 1-4 for all subsequent files.
-
-    proximity_radius: if > 0, any input point within this distance of a
-    detected feature-edge point is also flagged, catching cells on small
-    steps or closely parallel edges that fall below FEATURE_ANGLE.
-    Defaults to SMOOTH_PROXIMITY_RADIUS when None.
-
-    Returns a dict with keys:
-        edge_cell_list  – list[int]  cells that touch feature/boundary edges
-        cell_neighbours – dict[int, list[int]]  adjacent cell IDs per edge cell
-        n_cells         – int  total cell count (sanity check)
-        n_direct        – int  cells before proximity expansion
-    Returns None if the source has no polygon data.
-    """
-    if proximity_radius is None:
-        proximity_radius = SMOOTH_PROXIMITY_RADIUS
-    n_cells = src.GetCellData().GetNumberOfTuples() if src.GetCellData() else 0
-
-    # Step 1 — extract boundary + feature edges
-    fe = vtk.vtkFeatureEdges()
-    fe.SetInputData(src)
-    fe.BoundaryEdgesOn()
-    fe.FeatureEdgesOn()
-    fe.SetFeatureAngle(FEATURE_ANGLE)
-    fe.NonManifoldEdgesOff()
-    fe.ManifoldEdgesOff()
-    fe.ColoringOff()
-    fe.Update()
-
-    # Step 2 — build integer keys for edge points (numpy, no loop)
-    edge_pts = fe.GetOutput().GetPoints()
-    edge_pt_ids: set = set()
-    if edge_pts and edge_pts.GetNumberOfPoints() > 0:
-        _sc   = np.int64(10 ** 10)
-        ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-        ep_keys = set(map(tuple, ep_np.tolist()))
-
-        # Step 3 — match source point IDs to edge keys (vectorised)
-        src_pts = src.GetPoints()
-        if src_pts:
-            sp_np     = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-            sp_tuples = list(map(tuple, sp_np.tolist()))
-            edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
-
-    # Step 3b — spatial proximity expansion via KD-tree
-    # Flags any input point within proximity_radius of a detected edge point,
-    # catching cells on small steps or parallel faces below FEATURE_ANGLE.
-    direct_pt_ids = frozenset(edge_pt_ids)   # snapshot before proximity
-    if proximity_radius > 0.0 and edge_pts and edge_pts.GetNumberOfPoints() > 0:
-        locator = vtk.vtkKdTreePointLocator()
-        locator.SetDataSet(src)
-        locator.BuildLocator()
-        prox_result = vtk.vtkIdList()
-        n_before_prox = len(edge_pt_ids)
-        for i in range(edge_pts.GetNumberOfPoints()):
-            locator.FindPointsWithinRadius(
-                proximity_radius, edge_pts.GetPoint(i), prox_result
-            )
-            for j in range(prox_result.GetNumberOfIds()):
-                edge_pt_ids.add(prox_result.GetId(j))
-        n_prox_added = len(edge_pt_ids) - n_before_prox
-        if n_prox_added:
-            print(f"  Proximity expansion : +{n_prox_added} points within {proximity_radius} units")
-
-    # Step 4 — flag cells that own at least one edge point
-    edge_cells: set = set()
-    cell_pts = vtk.vtkIdList()
-    if edge_pt_ids:
-        polys = src.GetPolys()
-        if polys is not None and polys.GetNumberOfCells() > 0:
-            conn = vtk_to_numpy(polys.GetConnectivityArray())
-            offs = vtk_to_numpy(polys.GetOffsetsArray())
-            ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
-            mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
-            mask[ep_arr] = True
-            for cid in range(len(offs) - 1):
-                if mask[conn[offs[cid]:offs[cid + 1]]].any():
-                    edge_cells.add(cid)
-            # Count direct-only cells (before proximity) using a separate mask
-            if direct_pt_ids != edge_pt_ids:
-                direct_arr = np.fromiter(direct_pt_ids, dtype=np.int64)
-                direct_mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
-                direct_mask[direct_arr] = True
-                n_direct = int(sum(
-                    1 for cid in range(len(offs) - 1)
-                    if direct_mask[conn[offs[cid]:offs[cid + 1]]].any()
-                ))
-            else:
-                n_direct = len(edge_cells)
-        else:
-            for cid in range(n_cells):
-                src.GetCellPoints(cid, cell_pts)
-                for k in range(cell_pts.GetNumberOfIds()):
-                    if cell_pts.GetId(k) in edge_pt_ids:
-                        edge_cells.add(cid)
-                        break
-            # Count direct-only cells using set difference
-            if direct_pt_ids != edge_pt_ids:
-                direct_cells: set = set()
-                for cid in range(n_cells):
-                    src.GetCellPoints(cid, cell_pts)
-                    for k in range(cell_pts.GetNumberOfIds()):
-                        if cell_pts.GetId(k) in direct_pt_ids:
-                            direct_cells.add(cid)
-                            break
-                n_direct = len(direct_cells)
-            else:
-                n_direct = len(edge_cells)
-    else:
-        n_direct = 0  # edge_pt_ids was empty
-
-    if not edge_cells:
-        return {"edge_cell_list": [], "cell_neighbours": {}, "n_cells": n_cells,
-                "n_direct": 0}
-
-    # Step 5 pre-build — neighbour map (topology only, no scalar data)
-    edge_cell_list = list(edge_cells)
-    nbr_ids = vtk.vtkIdList()
-    cell_neighbours: dict[int, list[int]] = {}
-    for cid in edge_cell_list:
-        src.GetCellPoints(cid, cell_pts)
-        nbrs: list[int] = []
-        for k in range(cell_pts.GetNumberOfIds()):
-            src.GetPointCells(cell_pts.GetId(k), nbr_ids)
-            for m in range(nbr_ids.GetNumberOfIds()):
-                ncid = nbr_ids.GetId(m)
-                if ncid != cid:
-                    nbrs.append(ncid)
-        cell_neighbours[cid] = nbrs
-
-    # Build CSR (Compressed Sparse Row) arrays for vectorised numpy averaging.
-    # Storing neighbours as flat index array + offsets lets the per-iteration
-    # averaging run as 3 numpy C-ops instead of a Python loop, releasing the
-    # GIL so all 12 worker threads can advance simultaneously.
-    offsets_list: list[int] = [0]
-    nbr_flat_list: list[int] = []
-    for cid in edge_cell_list:
-        nbr_flat_list.extend(cell_neighbours[cid])
-        offsets_list.append(len(nbr_flat_list))
-    csr_offsets  = np.array(offsets_list,  dtype=np.int64)
-    csr_nbr_ids  = np.array(nbr_flat_list, dtype=np.int64)
-    edge_cell_arr = np.array(edge_cell_list, dtype=np.int64)
-
-    return {
-        "edge_cell_list":  edge_cell_list,
-        "cell_neighbours": cell_neighbours,
-        "n_cells":         n_cells,
-        "n_direct":        n_direct,
-        "edge_cell_arr":   edge_cell_arr,
-        "csr_offsets":     csr_offsets,
-        "csr_nbr_ids":     csr_nbr_ids,
-    }
-
-
-def apply_edge_smooth(src, n_iter: int = 1, stop_event=None, geo_cache: dict | None = None,
-                      proximity_radius: float | None = None):
-    """
-    Iterative neighbour-mean smoothing restricted to cells that touch
-    boundary or feature edges (angle >= FEATURE_ANGLE degrees).
-    Returns None if stop_event is set mid-computation.
-
-    Each iteration averages only the edge-ring cells (identified once before
-    the loop), so locality is preserved — interior cells are never touched.
-    n_iter > 1 lets a very high spike diffuse across several rings of
-    edge-adjacent cells without spreading into the bulk of the mesh.
-
-    geo_cache: optional dict from precompute_smooth_geometry().  When provided,
-    Steps 1-4 and the neighbour-map build are skipped entirely.
-    proximity_radius: forwarded to precompute_smooth_geometry() when geo_cache
-    is None.  Defaults to SMOOTH_PROXIMITY_RADIUS.
-
-    Returns a NEW vtkPolyData — src is never modified.
-    """
-    def _cancelled():
-        return stop_event is not None and stop_event.is_set()
-
-    out = vtk.vtkPolyData()
-    out.DeepCopy(src)                          # independent copy
-
-    in_arr  = src.GetCellData().GetArray(ARRAY_NAME)
-    out_arr = out.GetCellData().GetArray(ARRAY_NAME)
-    if in_arr is None or out_arr is None:
-        print(f"  [SKIP] Array '{ARRAY_NAME}' not found in cell data.")
-        return out
-
-    raw_vals = vtk_to_numpy(in_arr).astype(float, copy=True)
-
-    # ── Geometry phase (Steps 1-4 + neighbour build) ──────────────────────────
-    if geo_cache is not None:
-        # Re-use pre-computed topology — nothing to recompute
-        edge_cell_list  = geo_cache["edge_cell_list"]
-        cell_neighbours = geo_cache["cell_neighbours"]
-        edge_cell_arr   = geo_cache.get("edge_cell_arr")
-        csr_offsets     = geo_cache.get("csr_offsets")
-        csr_nbr_ids     = geo_cache.get("csr_nbr_ids")
-    else:
-        # Compute geometry from scratch (fallback / standalone use)
-        n_cells  = in_arr.GetNumberOfTuples()
-
-        # Step 1 — extract boundary + feature edges
-        fe = vtk.vtkFeatureEdges()
-        fe.SetInputData(src)
-        fe.BoundaryEdgesOn()
-        fe.FeatureEdgesOn()
-        fe.SetFeatureAngle(FEATURE_ANGLE)
-        fe.NonManifoldEdgesOff()
-        fe.ManifoldEdgesOff()
-        fe.ColoringOff()
-        fe.Update()
-        if _cancelled():
-            return None   # stopped after VTK edge extraction
-
-        # Step 2 — build integer keys for edge points (numpy, no loop)
-        edge_pts  = fe.GetOutput().GetPoints()
-        edge_pt_ids: set = set()
-        if edge_pts and edge_pts.GetNumberOfPoints() > 0:
-            _sc   = np.int64(10 ** 10)
-            ep_np = np.round(vtk_to_numpy(edge_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-            ep_keys = set(map(tuple, ep_np.tolist()))
-
-            # Step 3 — find source point IDs whose coords match edge keys (vectorised)
-            src_pts = src.GetPoints()
-            if src_pts:
-                sp_np   = np.round(vtk_to_numpy(src_pts.GetData()).reshape(-1, 3) * _sc).astype(np.int64)
-                sp_tuples = list(map(tuple, sp_np.tolist()))
-                edge_pt_ids = {pid for pid, key in enumerate(sp_tuples) if key in ep_keys}
-        print(f"  Feature-edge points : {len(edge_pt_ids)}")
-
-        # Step 3b — spatial proximity expansion
-        _pr = proximity_radius if proximity_radius is not None else SMOOTH_PROXIMITY_RADIUS
-        if _pr > 0.0 and edge_pts and edge_pts.GetNumberOfPoints() > 0:
-            locator = vtk.vtkKdTreePointLocator()
-            locator.SetDataSet(src)
-            locator.BuildLocator()
-            prox_result = vtk.vtkIdList()
-            n_before_prox = len(edge_pt_ids)
-            for i in range(edge_pts.GetNumberOfPoints()):
-                locator.FindPointsWithinRadius(_pr, edge_pts.GetPoint(i), prox_result)
-                for j in range(prox_result.GetNumberOfIds()):
-                    edge_pt_ids.add(prox_result.GetId(j))
-            n_prox_added = len(edge_pt_ids) - n_before_prox
-            if n_prox_added:
-                print(f"  Proximity expansion : +{n_prox_added} points within {_pr} units")
-
-        # Step 4 — flag cells that own at least one edge point (numpy connectivity)
-        edge_cells: set = set()
-        cell_pts = vtk.vtkIdList()
-        if edge_pt_ids:
-            polys = src.GetPolys()
-            if polys is not None and polys.GetNumberOfCells() > 0:
-                conn = vtk_to_numpy(polys.GetConnectivityArray())
-                offs = vtk_to_numpy(polys.GetOffsetsArray())
-                ep_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
-                mask = np.zeros(src.GetNumberOfPoints(), dtype=bool)
-                mask[ep_arr] = True
-                for cid in range(len(offs) - 1):
-                    if mask[conn[offs[cid]:offs[cid + 1]]].any():
-                        edge_cells.add(cid)
-            else:
-                for cid in range(n_cells):
-                    src.GetCellPoints(cid, cell_pts)
-                    for k in range(cell_pts.GetNumberOfIds()):
-                        if cell_pts.GetId(k) in edge_pt_ids:
-                            edge_cells.add(cid)
-                            break
-        print(f"  Edge-ring cells     : {len(edge_cells)}")
-
-        if not edge_cells:
-            print("  Nothing to smooth.")
-            return out
-        if _cancelled():
-            return None   # stopped after edge-cell identification
-
-        # Step 5 pre-build — neighbour map
-        edge_cell_list = list(edge_cells)
-        nbr_ids = vtk.vtkIdList()
-        cell_pts_nb = vtk.vtkIdList()
-        cell_neighbours: dict[int, list[int]] = {}
-        for cid in edge_cell_list:
-            src.GetCellPoints(cid, cell_pts_nb)
-            nbrs: list[int] = []
-            for k in range(cell_pts_nb.GetNumberOfIds()):
-                src.GetPointCells(cell_pts_nb.GetId(k), nbr_ids)
-                for m in range(nbr_ids.GetNumberOfIds()):
-                    ncid = nbr_ids.GetId(m)
-                    if ncid != cid:
-                        nbrs.append(ncid)
-            cell_neighbours[cid] = nbrs
-        # Build CSR arrays for this fallback path too
-        offsets_list_fb: list[int] = [0]
-        nbr_flat_list_fb: list[int] = []
-        for cid in edge_cell_list:
-            nbr_flat_list_fb.extend(cell_neighbours[cid])
-            offsets_list_fb.append(len(nbr_flat_list_fb))
-        csr_offsets   = np.array(offsets_list_fb,  dtype=np.int64)
-        csr_nbr_ids   = np.array(nbr_flat_list_fb, dtype=np.int64)
-        edge_cell_arr = np.array(edge_cell_list,   dtype=np.int64)
-
-    if not edge_cell_list:
-        print("  Nothing to smooth (empty edge ring).")
-        return out
-
-    # ── Scalar phase (Step 5 iterations) — vectorised via numpy CSR ──────────
-    # np.add.reduceat and fancy indexing are C-level ops that release the GIL,
-    # allowing all 12 worker threads to run truly in parallel on separate cores.
-    n_iter = max(1, int(n_iter))
-    current_vals = np.copy(raw_vals)
-    if csr_nbr_ids is not None and len(csr_nbr_ids) > 0:
-        csr_counts = np.diff(csr_offsets).astype(np.float64)  # nbr count per edge cell
-        has_nbrs   = csr_counts > 0
-        for iteration in range(n_iter):
-            if _cancelled():
-                return None
-            nbr_vals  = current_vals[csr_nbr_ids]
-            sums      = np.add.reduceat(nbr_vals, csr_offsets[:-1].astype(np.intp))
-            next_vals = np.copy(current_vals)
-            next_vals[edge_cell_arr[has_nbrs]] = sums[has_nbrs] / csr_counts[has_nbrs]
-            current_vals = next_vals
-            if n_iter > 1:
-                print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
-    else:
-        # Fallback: Python loop (no CSR available or all cells have no neighbours)
-        for iteration in range(n_iter):
-            if _cancelled():
-                return None
-            next_vals = np.copy(current_vals)
-            for cid in edge_cell_list:
-                nbrs = cell_neighbours[cid]
-                if nbrs:
-                    next_vals[cid] = float(np.mean(current_vals[nbrs]))
-            current_vals = next_vals
-            if n_iter > 1:
-                print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
-
-    # Step 6 — write smoothed values back via numpy_to_vtk (avoids SetValue loop)
-    new_arr = numpy_to_vtk(current_vals, deep=True, array_type=out_arr.GetDataType())
-    new_arr.SetName(ARRAY_NAME)
-    out.GetCellData().RemoveArray(ARRAY_NAME)
-    out.GetCellData().AddArray(new_arr)
-    out.GetCellData().SetActiveScalars(ARRAY_NAME)   # restore active scalar after replace
-
-    return out
 
 
 if __name__ == "__main__":
     main()
+
