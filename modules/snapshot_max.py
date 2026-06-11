@@ -94,6 +94,7 @@ def save_max_snapshot(
     vmax: float | None = None,
     image_size: tuple[int, int] = (1200, 900),
     precomputed: dict | None = None,
+    total_power_W: float | None = None,
 ) -> bool:
     """
     Render *polydata* coloured by *array_name* and save a PNG to *out_path*.
@@ -143,7 +144,7 @@ def save_max_snapshot(
     # Human-readable labels and units for known arrays.
     _LABEL_MAP = {
         "Power_Density_W_m2": "Power Density [W/m\u00b2]",
-        "Deposited_Power_W":  "Total Power [W]",
+        "Deposited_Power_W":  "Power [W]",
     }
     _UNIT_MAP = {
         "Power_Density_W_m2": "W/m\u00b2",
@@ -206,7 +207,27 @@ def save_max_snapshot(
     max_label.SetPosition(0.02, 0.94)
     max_label.SetVisibility(1 if _is_pwr_density else 0)
 
-    # ── Left renderer: mesh + axes (75% of image width) ──────────────────────
+    # ── Total-power title (top-centre, always visible) ────────────────────────
+    if total_power_W is not None:
+        if abs(total_power_W) >= 1000.0:
+            _tp_str = f"Tot. Power = {total_power_W / 1000:.4g} kW"
+        else:
+            _tp_str = f"Tot. Power = {total_power_W:.4g} W"
+        tot_pwr_label = vtk.vtkTextActor()
+        tot_pwr_label.SetInput(_tp_str)
+        tpl = tot_pwr_label.GetTextProperty()
+        tpl.SetColor(0.1, 0.1, 0.1)
+        tpl.SetFontSize(18)
+        tpl.SetFontFamilyToTimes()
+        tpl.BoldOn()
+        tpl.ItalicOff()
+        tpl.SetJustificationToCentered()
+        tpl.SetBackgroundColor(1.0, 1.0, 1.0)
+        tpl.SetBackgroundOpacity(0.80)
+        tot_pwr_label.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+        tot_pwr_label.SetPosition(0.50, 0.96)
+    else:
+        tot_pwr_label = None
     _MESH_VP = 0.75   # fraction of total width given to the mesh
     mesh_renderer = vtk.vtkRenderer()
     mesh_renderer.SetViewport(0.0, 0.0, _MESH_VP, 1.0)
@@ -214,6 +235,8 @@ def save_max_snapshot(
     mesh_renderer.AddActor(actor)
     mesh_renderer.AddActor(sphere_actor)
     mesh_renderer.AddActor2D(max_label)
+    if tot_pwr_label is not None:
+        mesh_renderer.AddActor2D(tot_pwr_label)
 
     # ── Right renderer: scalar bar panel (25% of image width) ─────────────────
     sbar_renderer = vtk.vtkRenderer()

@@ -857,6 +857,9 @@ def run_gui():
         if not cfg["input_dirs"]:
             messagebox.showwarning("No directories", "Please paste at least one directory path.")
             return
+        if not _comp_widgets:
+            log("[!] No geometry loaded — please click \"Load Geometry\" before running.")
+            return
         save_settings(cfg)
         _set_busy()
         _launch_processing(cfg)
@@ -883,6 +886,9 @@ def run_gui():
         cfg = _current_cfg()
         if not cfg["input_dirs"]:
             messagebox.showwarning("No directories", "Please paste at least one directory path.")
+            return
+        if not _comp_widgets:
+            log("[!] No geometry loaded — please click \"Load Geometry\" before running.")
             return
         save_settings(cfg)
         _set_busy()
@@ -1566,15 +1572,18 @@ def _render_subprocess(args: tuple) -> tuple:
             # Use power-density camera; keep deposited-power max for label/colour.
             return {**pre_cam, "max_val": pre_arr["max_val"]}
 
-        pd_orig_raw = read_vtp(str(orig_vtp_path))  # unscaled — for camera computation
+        pd_orig_raw = read_vtp(str(orig_vtp_path))  # unscaled — for camera + total power
+        # Total deposited power of the component (original, pre-smoothing, scaled by mult_factor)
+        _raw_total = find_total(pd_orig_raw, POWER_ARRAY)
+        _total_pwr = (_raw_total * mult_factor) if _raw_total is not None else None
         pre_orig = _make_precomputed(pd_orig, pd_orig_raw)
 
         if snapshot_only:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=None, precomputed=pre_orig)
+                              vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
         else:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
-                              vmax=None, precomputed=pre_orig)
+                              vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
             pd_smooth = read_vtp(str(smooth_vtp_path))
             pd_smooth_raw = pd_smooth   # reference before scale (DeepCopy inside for factor≠1)
             pd_smooth = _scale_polydata_array(pd_smooth, array_name, mult_factor)
@@ -1582,7 +1591,7 @@ def _render_subprocess(args: tuple) -> tuple:
                 pd_smooth_raw = read_vtp(str(smooth_vtp_path))
             pre_smooth = _make_precomputed(pd_smooth, pd_smooth_raw)
             save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
-                              vmax=None, precomputed=pre_smooth)
+                              vmax=None, precomputed=pre_smooth, total_power_W=_total_pwr)
 
         return label, time.perf_counter() - t0
     except Exception as exc:
