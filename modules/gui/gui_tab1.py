@@ -74,17 +74,9 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     tk.Label(out_frame, textvariable=output_label_var, fg="grey", anchor="w").pack(
         side="left", padx=8)
 
-    # ── Proximity radius (global default, edge mode only) ──────────────────────
-    prox_frame = tk.Frame(tab1)
-    prox_frame.pack(fill="x", padx=10, pady=(6, 0))
-    tk.Label(prox_frame, text="Default proximity radius (edge mode):", anchor="w").pack(side="left")
+    # ── Proximity radius (hidden StringVar kept for config file compatibility) ─
     proximity_var = tk.StringVar(
         value=str(settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS)))
-    prox_entry = tk.Entry(prox_frame, textvariable=proximity_var, width=8)
-    prox_entry.pack(side="left", padx=(6, 0))
-    tk.Label(prox_frame,
-             text="(mesh units; used by 'edge' mode only — AUTO uses k-ring instead; 0 = off)",
-             fg="#888888").pack(side="left", padx=(8, 0))
 
     # ── Load Geometry ─────────────────────────────────────────────────────────
     load_geo_frame = tk.Frame(tab1)
@@ -101,32 +93,26 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     comp_lframe = tk.LabelFrame(tab1, text="Components", padx=8, pady=4)
     comp_lframe.pack(fill="x", padx=10, pady=(6, 0))
 
-    _comp_hdr = tk.Frame(comp_lframe)
-    _comp_hdr.pack(fill="x")
-    for txt, w in [("Component", 24), ("Files", 8), ("Smooth iter", 10),
-                   ("Mode", 8), ("Sigma", 6), ("Prox (edge)", 10),
-                   ("Mult factor", 10),
-                   ("Snap pwr dens", 14), ("Snap total pwr", 14)]:
-        tk.Label(_comp_hdr, text=txt, width=w, anchor="w",
-                 fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
+    # Single grid for header row + all data rows so columns align automatically.
+    comp_grid = tk.Frame(comp_lframe)
+    comp_grid.pack(fill="x")
 
-    comp_rows_frame = tk.Frame(comp_lframe)
-    comp_rows_frame.pack(fill="x")
+    _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
+            "Prox (edge)", "Mult", "Pwr density", "Total pwr"]
+    for _c, _txt in enumerate(_HDR):
+        tk.Label(comp_grid, text=_txt, anchor="w",
+                 fg="#444444", font=("Segoe UI", 8, "bold"),
+                 padx=3).grid(row=0, column=_c, sticky="w")
+
+    _placeholder_lbl = tk.Label(comp_grid,
+                                text="(click Load Geometry to populate)",
+                                fg="#aaaaaa")
+    _placeholder_lbl.grid(row=1, column=0, columnspan=len(_HDR), sticky="w", pady=4)
+
+    _next_row = [1]   # mutable row counter for data rows
 
     comp_widgets:     dict = {}
     pending_comp_cfg: dict = dict(settings.get("components", {}))
-
-    tk.Label(comp_rows_frame, text="(click Load Geometry to populate)",
-             fg="#aaaaaa").pack(anchor="w", pady=4)
-
-    def _update_prox_state(*_):
-        def _safe_get(var):
-            try:
-                return var.get()
-            except Exception:
-                return 0
-        any_smooth = any(_safe_get(w["smooth_var"]) > 0 for w in comp_widgets.values())
-        prox_entry.configure(state="normal" if any_smooth else "disabled")
 
     def _build_comp_row(name: str, count: int) -> None:
         if name in comp_widgets:
@@ -134,7 +120,6 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
             return
         saved            = pending_comp_cfg.get(name, {})
         smooth_var       = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
-        smooth_var.trace_add("write", _update_prox_state)
         smooth_mode_var  = tk.StringVar(value=str(saved.get("smooth_mode", "auto")))
         spike_sigma_var  = tk.StringVar(value=str(saved.get("spike_sigma", SPIKE_SIGMA)))
         prox_var         = tk.StringVar(value=str(saved.get(
@@ -144,19 +129,28 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         snap_tp_var      = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
         count_var        = tk.StringVar(value=str(count))
 
-        row = tk.Frame(comp_rows_frame)
-        row.pack(fill="x", pady=1)
-        tk.Label(row, text=name,               width=24, anchor="w").pack(side="left")
-        tk.Label(row, textvariable=count_var,  width=8,  anchor="w", fg="#666666").pack(side="left")
-        tk.Spinbox(row, from_=0, to=20, width=5, textvariable=smooth_var).pack(side="left")
-        tk.Label(row, text="", width=1).pack(side="left")
-        mode_menu = tk.OptionMenu(row, smooth_mode_var, "edge", "auto")
+        r = _next_row[0]
+        _next_row[0] += 1
+
+        tk.Label(comp_grid, text=name, anchor="w").grid(
+            row=r, column=0, sticky="w", padx=(0, 8))
+        tk.Label(comp_grid, textvariable=count_var, anchor="w",
+                 fg="#666666").grid(row=r, column=1, sticky="w", padx=(0, 6))
+        tk.Spinbox(comp_grid, from_=0, to=20, width=4,
+                   textvariable=smooth_var).grid(row=r, column=2, sticky="w", padx=(0, 4))
+        mode_menu = tk.OptionMenu(comp_grid, smooth_mode_var, "edge", "auto")
         mode_menu.config(width=5)
-        mode_menu.pack(side="left")
-        sigma_entry = tk.Entry(row, textvariable=spike_sigma_var, width=5)
-        sigma_entry.pack(side="left", padx=(2, 0))
-        prox_entry_row = tk.Entry(row, textvariable=prox_var, width=7)
-        prox_entry_row.pack(side="left", padx=(4, 0))
+        mode_menu.grid(row=r, column=3, sticky="w", padx=(0, 2))
+        sigma_entry = tk.Entry(comp_grid, textvariable=spike_sigma_var, width=5)
+        sigma_entry.grid(row=r, column=4, sticky="w", padx=(0, 4))
+        prox_entry_row = tk.Entry(comp_grid, textvariable=prox_var, width=6)
+        prox_entry_row.grid(row=r, column=5, sticky="w", padx=(0, 4))
+        tk.Entry(comp_grid, textvariable=mult_var, width=6).grid(
+            row=r, column=6, sticky="w", padx=(0, 4))
+        tk.Checkbutton(comp_grid, text="Pwr density",
+                       variable=snap_pd_var).grid(row=r, column=7, sticky="w")
+        tk.Checkbutton(comp_grid, text="Total pwr",
+                       variable=snap_tp_var).grid(row=r, column=8, sticky="w")
 
         def _update_mode_state(*_,
                                _menu=mode_menu, _sig=sigma_entry,
@@ -180,12 +174,6 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         _update_mode_state()
         smooth_var.trace_add("write", _update_mode_state)
         smooth_mode_var.trace_add("write", _update_mode_state)
-
-        tk.Label(row, text="", width=1).pack(side="left")
-        tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
-        tk.Label(row, text="", width=1).pack(side="left")
-        tk.Checkbutton(row, text="Pwr density", variable=snap_pd_var).pack(side="left")
-        tk.Checkbutton(row, text="Total pwr",   variable=snap_tp_var).pack(side="left")
 
         comp_widgets[name] = {
             "smooth_var":       smooth_var,       "smooth_mode_var": smooth_mode_var,
@@ -245,9 +233,12 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         if not any(v > 0 for v in counts.values()):
             load_geo_status.set("  No matching files found."); return
 
-        for widget in comp_rows_frame.winfo_children():
-            widget.destroy()
+        for widget in comp_grid.winfo_children():
+            info = widget.grid_info()
+            if info and int(info.get("row", 0)) >= 1:
+                widget.destroy()
         comp_widgets.clear()
+        _next_row[0] = 1
 
         total = 0
         for name, count in counts.items():
@@ -255,7 +246,6 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 _build_comp_row(name, count)
                 total += count
         load_geo_status.set(f"  {len(comp_widgets)} component(s), {total} file(s)")
-        _update_prox_state()
         log_fn(f"Load Geometry done: {len(comp_widgets)} component(s), {total} file(s).")
 
     load_geo_btn.configure(command=on_load_geometry)
@@ -361,12 +351,11 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         "output_folder_var": output_folder_var,
         "output_label_var":  output_label_var,
         "proximity_var":     proximity_var,
-        "prox_entry":        prox_entry,
         "comp_widgets":      comp_widgets,
         "pending_comp_cfg":  pending_comp_cfg,
         "load_geo_status":   load_geo_status,
         "cfg_path_var":      cfg_path_var,
         "tab1_run_btn":      tab1_run_btn,
-        "_xfm_cfg_fn":       _xfm_cfg_fn,   # caller injects get_full_cfg / apply_cfg
+        "_xfm_cfg_fn":       _xfm_cfg_fn,
         "_get_comp_dict":    _get_comp_dict,
     }

@@ -74,6 +74,78 @@ def _smooth_one_file(args: tuple) -> tuple:
         return exc
 
 
+def _load_smooth_write_one_file(args: tuple) -> tuple:
+    """Load, smooth, and optionally write a temp VTP for one file.
+
+    This combined worker is the memory-efficient path: polydata is loaded,
+    processed, and freed entirely within this function.  Only scalar metadata
+    (floats, paths) is returned to the caller, so the main process never
+    accumulates more than n_workers mesh objects in RAM simultaneously.
+
+    Returns (filepath, output_name, case, scenario, max_before, max_after,
+             total_pwr, smooth_vtp_path) or an Exception or None if stopped.
+    smooth_vtp_path is None when n_iter==0 or snapshots are not needed.
+    """
+    try:
+        import hashlib
+        (fp, on, c, s,
+         n_iter, stop_event, geo_cache,
+         smooth_mode, spike_sigma, proximity_radius,
+         needs_snap, snap_dir_str, pid) = args
+
+        if stop_event is not None and stop_event.is_set():
+            return None
+
+        # ── Load ──────────────────────────────────────────────────────────────
+        polydata   = read_vtp(str(fp))
+        max_before = find_max(polydata, ARRAY_NAME)
+        total_pwr  = find_total(polydata, POWER_ARRAY)
+
+        if max_before is None:
+            del polydata
+            return Exception(f"Array '{ARRAY_NAME}' not found in {fp.name}")
+
+        if stop_event is not None and stop_event.is_set():
+            del polydata
+            return None
+
+        # ── Smooth ────────────────────────────────────────────────────────────
+        smooth_vtp_path: str | None = None
+        if n_iter > 0:
+            if smooth_mode == "auto":
+                smoothed = smart_smooth_auto(
+                    polydata, n_iter=n_iter, stop_event=stop_event,
+                    geo_cache=geo_cache, spike_sigma=spike_sigma,
+                    proximity_radius=proximity_radius,
+                )
+            else:
+                smoothed = apply_edge_smooth(
+                    polydata, n_iter=n_iter,
+                    stop_event=stop_event, geo_cache=geo_cache,
+                )
+            del polydata   # free original immediately after smoothing
+            if smoothed is None:
+                return None
+            max_after = find_max(smoothed, ARRAY_NAME)
+
+            # ── Write temp VTP ─────────────────────────────────────────────
+            if needs_snap:
+                h   = hashlib.md5(str(fp).encode()).hexdigest()[:12]
+                tmp = Path(snap_dir_str) / f"_tmp_smooth_{pid}_{h}.vtp"
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                _write_vtp(smoothed, tmp)
+                smooth_vtp_path = str(tmp)
+            del smoothed   # free smoothed immediately after writing
+        else:
+            del polydata
+            max_after = max_before
+
+        return fp, on, c, s, max_before, max_after, total_pwr, smooth_vtp_path
+
+    except Exception as exc:
+        return exc
+
+
 def _transform_one_file(args: tuple) -> tuple:
     """Extract cells to CSV and apply coordinate transform for one VTP file.
 

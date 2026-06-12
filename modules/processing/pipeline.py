@@ -21,11 +21,12 @@ from pathlib import Path
 from modules.core.settings import (
     ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, _safe_float,
 )
-from modules.vtk.vtk_io import _write_vtp
+from modules.vtk.vtk_io import _write_vtp, read_vtp
 from modules.core.path_utils import extract_case_scenario
 from modules.vtk.smoothing import precompute_smooth_geometry
 from modules.processing.workers import (
     _load_one_file, _smooth_one_file, _transform_one_file, _render_subprocess,
+    _load_smooth_write_one_file,
 )
 
 
@@ -111,8 +112,8 @@ def run_processing(
                          "max_before", "max_after", "delta", "discrepancy"])
         writer_pwr.writerow(["case", "scenario", "filename", "total_power_W"])
 
-        # ── Collect all matching files ────────────────────────────────────────
-        all_files: list[tuple] = []
+        # ── Phase 0: Collect all matching file paths (no loading) ────────────
+        all_meta: list[tuple] = []   # (filepath, output_name, case, scenario)
         for input_folder in input_dirs:
             if stopped():
                 break
@@ -129,64 +130,52 @@ def run_processing(
             log(f"  {folder_case}: {len(files)} file(s) found")
             for filepath in files:
                 _, case, scenario = extract_case_scenario(str(filepath.parent))
-                all_files.append((filepath, output_name, case, scenario))
+                all_meta.append((filepath, output_name, case, scenario))
 
-        if not all_files:
+        if not all_meta:
             log("No files found.")
             return
 
-        log(f"\nTotal: {len(all_files)} file(s) to process")
+        n_all     = len(all_meta)
+        n_workers = min(os.cpu_count() or 4, n_all, 12)
+        log(f"\nTotal: {n_all} file(s) to process")
         log("=" * 80)
 
-        # ── Stage 1: Load ─────────────────────────────────────────────────────
-        n_all     = len(all_files)
-        n_workers = min(os.cpu_count() or 4, n_all, 12)
-        log(f"\n[1/3] Loading {n_all} VTP file(s) ({n_workers} workers)...")
-        loaded: list[tuple] = []
-        t0 = time.perf_counter()
-        with ThreadPool(processes=n_workers) as pool:
-            for done, result in enumerate(pool.imap_unordered(_load_one_file, all_files), 1):
-                if stopped():
-                    pool.terminate(); break
-                if isinstance(result, Exception):
-                    log(f"  [{done}/{n_all}] ERROR: {result}"); continue
-                fp, on, c, s, pd, mv, tp = result
-                if mv is None:
-                    log(f"  [{done}/{n_all}] SKIP  {fp.name}  (no '{ARRAY_NAME}')"); continue
-                loaded.append(result)
-                log(f"  [{done}/{n_all}] {fp.name}  (elapsed: {time.perf_counter()-t0:.1f}s)")
-        log(f"  Loading done: {len(loaded)} file(s) in {time.perf_counter()-t0:.1f}s")
+        _snap_map = {fp: _file_settings(fp) for fp, *_ in all_meta}
 
-        _snap_map  = {fp: _file_settings(fp) for fp, *_ in loaded}
-        _power_map = {fp: tp for fp, _on, _c, _s, _pd, _mv, tp in loaded}
-
-        # ── Geometry cache ────────────────────────────────────────────────────
+        # ── Phase 1: Geo-cache precompute (load one file per component, free) ─
+        # Polydata is created, used to build the cache, then immediately deleted.
+        # The cache itself holds only numpy arrays (~1 GB per component) and stays
+        # in RAM for the full run; no VTK objects are retained.
         _geo_cache: dict[str, dict] = {}
-        _needs_smooth = [(fp, *rest) for fp, *rest in loaded if _snap_map[fp][0] > 0]
+        _needs_smooth = [(fp, on, c, s) for fp, on, c, s in all_meta
+                         if _snap_map[fp][0] > 0]
         if _needs_smooth:
             log("\n  Pre-computing edge geometry per component...")
             seen: set = set()
-            for fp, on_c, c_c, s_c, pd_c, *_ in _needs_smooth:
+            for fp, on_c, c_c, s_c in _needs_smooth:
                 comp = next(
                     (n for n in components if n != "(all)" and n.lower() in fp.stem.lower()),
                     "(all)",
                 )
                 if comp not in seen:
                     seen.add(comp)
-                    t0g = time.perf_counter()
-                    # Determine mode for this component from the first matching file.
-                    comp_mode  = _snap_map[fp][4]  # index 4 = smooth_mode
-                    comp_prox  = _snap_map[fp][6]  # index 6 = per-component proximity_radius
-                    cache   = precompute_smooth_geometry(
-                        pd_c,
+                    t0g       = time.perf_counter()
+                    comp_mode = _snap_map[fp][4]
+                    comp_prox = _snap_map[fp][6]
+                    pd_tmp    = read_vtp(str(fp))           # load for cache only
+                    cache     = precompute_smooth_geometry(
+                        pd_tmp,
                         proximity_radius=comp_prox,
                         log_fn=log,
                         skip_edge_expansion=(comp_mode == "auto"),
                     )
-                    n_ec    = cache.get("n_direct", 0) if cache else 0
-                    n_ep    = len(cache.get("edge_pt_ids_arr", [])) if cache else 0
+                    del pd_tmp                              # free immediately
+                    n_ec = cache.get("n_direct", 0) if cache else 0
+                    n_ep = len(cache.get("edge_pt_ids_arr", [])) if cache else 0
                     if comp_mode == "auto":
-                        log(f"    [{comp}] {n_ep:,} edge points cached (cell flagging skipped)  "
+                        log(f"    [{comp}] {n_ep:,} edge points cached "
+                            f"(cell flagging skipped)  "
                             f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
                             f"  [mode=auto]")
                     else:
@@ -201,108 +190,114 @@ def run_processing(
                     return _geo_cache.get(name)
             return _geo_cache.get("(all)")
 
-        # ── Stage 2: Smooth ───────────────────────────────────────────────────
-        processed: list[tuple] = []
-        n_loaded = len(loaded)
-        log(f"\n[2/3] Processing {n_loaded} file(s) ({min(n_loaded, n_workers)} workers)...")
-        smooth_args = [
-            (fp, on, c, s, pd, mb, _snap_map[fp][0], stop_event, _geo_for(fp),
-             _snap_map[fp][4], _snap_map[fp][5], _snap_map[fp][6])
-            for fp, on, c, s, pd, mb, _tp in loaded
+        # ── Phase 2: Stream load → smooth → write temp VTP → free ────────────
+        # Each worker loads its own file, smooths, writes the temp VTP if
+        # snapshots are needed, then frees both polydata objects before returning.
+        # At any moment only n_workers meshes exist in RAM (inside the worker
+        # threads), regardless of the total file count.
+        pid = os.getpid()
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        needs_snap_map = {fp: (_snap_map[fp][1] or _snap_map[fp][2])
+                          for fp, *_ in all_meta}
+        proc_args = [
+            (fp, on, c, s,
+             _snap_map[fp][0],            # n_iter
+             stop_event,
+             _geo_for(fp),                # geo cache (numpy arrays, shared read-only)
+             _snap_map[fp][4],            # smooth_mode
+             _snap_map[fp][5],            # spike_sigma
+             _snap_map[fp][6],            # proximity_radius
+             needs_snap_map[fp],          # write temp VTP?
+             str(snap_dir),
+             pid,
+            )
+            for fp, on, c, s in all_meta
         ]
+
+        snap_proc_args: list[tuple] = []
+        temp_vtp_files: list[Path]  = []
+
+        log(f"\n[1/2] Processing {n_all} file(s) ({n_workers} workers)...")
         _prev = sys.getswitchinterval()
         sys.setswitchinterval(0.001)
         t0 = time.perf_counter()
         try:
-            with ThreadPool(processes=min(n_loaded, n_workers)) as pool:
+            with ThreadPool(processes=n_workers) as pool:
                 for done, result in enumerate(
-                        pool.imap_unordered(_smooth_one_file, smooth_args), 1):
+                        pool.imap_unordered(_load_smooth_write_one_file, proc_args), 1):
                     if stopped():
                         pool.terminate(); break
                     if result is None:
                         continue
                     if isinstance(result, Exception):
-                        log(f"  [{done}/{n_loaded}] ERROR: {result}"); continue
-                    fp, on, c, s, pd, mb, sm, ma = result
-                    processed.append(result)
-                    ni   = _snap_map[fp][0]
-                    mode = _snap_map[fp][4]
+                        log(f"  [{done}/{n_all}] ERROR: {result}"); continue
+
+                    fp, on, c, s, mb, ma, tp, smooth_path = result
+                    ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
+
+                    # Write CSV rows immediately (no accumulation needed)
+                    mbs   = mb * mult
+                    mas   = ma * mult
+                    delta = abs(mas - mbs)
+                    writer.writerow([c, s, fp.name,
+                                     f"{mbs:.6g}", f"{mas:.6g}",
+                                     f"{delta:.6g}", "YES" if delta > 0.0 else "NO"])
+                    if tp is not None:
+                        writer_pwr.writerow([c, s, fp.name, f"{tp * mult:.6g}"])
+                    total_files += 1
+
                     if ni > 0:
-                        log(f"  [{done}/{n_loaded}] {fp.name}  "
+                        log(f"  [{done}/{n_all}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  "
                             f"before={mb:.4g}  after={ma:.4g}  "
                             f"({ni} iter, mode={mode})")
                     else:
-                        log(f"  [{done}/{n_loaded}] {fp.name}  "
+                        log(f"  [{done}/{n_all}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  no smoothing")
+
+                    # Queue snapshot args using paths only (no polydata)
+                    if snap_pd or snap_tp:
+                        is_snap_only  = (ni == 0)
+                        stem          = fp.stem
+                        case_snap_dir = snap_dir / on / c / s
+                        case_snap_dir.mkdir(parents=True, exist_ok=True)
+                        if smooth_path:
+                            temp_vtp_files.append(Path(smooth_path))
+
+                        if snap_pd:
+                            if is_snap_only:
+                                paths_pd = [str(case_snap_dir / f"{s}__{stem}__pwr_density.png")]
+                            else:
+                                paths_pd = [
+                                    str(case_snap_dir / f"{s}__{stem}__pwr_density__before.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__pwr_density__after.png"),
+                                ]
+                            snap_proc_args.append(
+                                (str(fp), smooth_path, paths_pd,
+                                 ARRAY_NAME, is_snap_only, stem, mult))
+
+                        if snap_tp:
+                            if is_snap_only:
+                                paths_tp = [str(case_snap_dir / f"{s}__{stem}__total_pwr.png")]
+                            else:
+                                paths_tp = [
+                                    str(case_snap_dir / f"{s}__{stem}__total_pwr__before.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__total_pwr__after.png"),
+                                ]
+                            snap_proc_args.append(
+                                (str(fp), smooth_path, paths_tp,
+                                 POWER_ARRAY, is_snap_only, stem, mult))
         finally:
             sys.setswitchinterval(_prev)
-        log(f"  Stage 2 done in {time.perf_counter()-t0:.1f}s")
+        log(f"  Processing done in {time.perf_counter()-t0:.1f}s")
 
-        # ── Write CSVs ────────────────────────────────────────────────────────
-        for item in processed:
-            fp, on, c, s, _, mb, _, ma = item
-            _, snap_pd, snap_tp, mult, *_ = _snap_map[fp]
-            mbs = mb * mult; mas = ma * mult
-            delta = abs(mas - mbs)
-            writer.writerow([c, s, fp.name,
-                             f"{mbs:.6g}", f"{mas:.6g}",
-                             f"{delta:.6g}", "YES" if delta > 0.0 else "NO"])
-            tp = _power_map.get(fp)
-            if tp is not None:
-                writer_pwr.writerow([c, s, fp.name, f"{tp * mult:.6g}"])
-            total_files += 1
-
-        # ── Stage 3: Snapshots ────────────────────────────────────────────────
-        snap_items = [item for item in processed
-                      if _snap_map[item[0]][1] or _snap_map[item[0]][2]]
-        if snap_items:
-            snap_dir.mkdir(parents=True, exist_ok=True)
-            snap_proc_args: list[tuple] = []
-            temp_vtp_files: list[Path] = []
-
-            for fp, on, c, s, pd_orig, _, pd_smooth, _ in snap_items:
-                n_iter_f, snap_pd, snap_tp, mult_f, *_ = _snap_map[fp]
-                is_snap_only  = (n_iter_f == 0)
-                stem          = fp.stem
-                case_snap_dir = snap_dir / on / c / s
-                case_snap_dir.mkdir(parents=True, exist_ok=True)
-
-                smooth_path = None
-                if not is_snap_only:
-                    tmp = snap_dir / f"_tmp_smooth_{os.getpid()}_{len(temp_vtp_files)}.vtp"
-                    log(f"  Writing temp VTP for {fp.name}...")
-                    t_vtp = time.perf_counter()
-                    _write_vtp(pd_smooth, tmp)
-                    log(f"  Temp VTP written in {time.perf_counter()-t_vtp:.1f}s")
-                    temp_vtp_files.append(tmp)
-                    smooth_path = str(tmp)
-
-                if snap_pd:
-                    if is_snap_only:
-                        paths_pd = [str(case_snap_dir / f"{s}__{stem}__pwr_density.png")]
-                    else:
-                        paths_pd = [
-                            str(case_snap_dir / f"{s}__{stem}__pwr_density__before.png"),
-                            str(case_snap_dir / f"{s}__{stem}__pwr_density__after.png"),
-                        ]
-                    snap_proc_args.append(
-                        (str(fp), smooth_path, paths_pd, ARRAY_NAME, is_snap_only, stem, mult_f))
-
-                if snap_tp:
-                    if is_snap_only:
-                        paths_tp = [str(case_snap_dir / f"{s}__{stem}__total_pwr.png")]
-                    else:
-                        paths_tp = [
-                            str(case_snap_dir / f"{s}__{stem}__total_pwr__before.png"),
-                            str(case_snap_dir / f"{s}__{stem}__total_pwr__after.png"),
-                        ]
-                    snap_proc_args.append(
-                        (str(fp), smooth_path, paths_tp, POWER_ARRAY, is_snap_only, stem, mult_f))
-
-            n_snap        = len(snap_proc_args)
+        # ── Phase 3: Snapshots (render subprocesses read from temp VTPs) ──────
+        if snap_proc_args:
+            n_snap         = len(snap_proc_args)
             n_snap_workers = min(6, n_snap)
-            log(f"\n[3/3] Saving {n_snap} snapshot(s) ({n_snap_workers} render process(es))...")
+            log(f"\n[2/2] Saving {n_snap} snapshot(s) "
+                f"({n_snap_workers} render process(es))...")
             t0 = time.perf_counter()
             try:
                 with multiprocessing.Pool(processes=n_snap_workers) as pool:
@@ -322,7 +317,7 @@ def run_processing(
                         pass
             log(f"  Snapshots done in {time.perf_counter()-t0:.1f}s")
         else:
-            log("\n[3/3] Snapshots disabled")
+            log("\n[2/2] Snapshots disabled")
 
     log("\n" + "=" * 80)
     if stopped():
