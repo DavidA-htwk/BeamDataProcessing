@@ -19,7 +19,7 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 from modules.core.settings import (
-    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, _safe_float,
+    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, _safe_float,
 )
 from modules.vtk.vtk_io import _write_vtp
 from modules.core.path_utils import extract_case_scenario
@@ -50,7 +50,8 @@ def run_processing(
     )
 
     def _file_settings(filepath: Path) -> tuple:
-        """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor)."""
+        """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
+                   smooth_mode, spike_sigma)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -61,6 +62,8 @@ def run_processing(
                     bool(comp_cfg.get("save_power_density", True)),
                     bool(comp_cfg.get("save_total_power",   False)),
                     float(comp_cfg.get("mult_factor", 1.0)),
+                    str(comp_cfg.get("smooth_mode", "edge")),
+                    float(comp_cfg.get("spike_sigma", SPIKE_SIGMA)),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -69,8 +72,10 @@ def run_processing(
                 bool(c.get("save_power_density", True)),
                 bool(c.get("save_total_power",   False)),
                 float(c.get("mult_factor", 1.0)),
+                str(c.get("smooth_mode", "edge")),
+                float(c.get("spike_sigma", SPIKE_SIGMA)),
             )
-        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0)
+        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "edge", SPIKE_SIGMA)
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -167,11 +172,24 @@ def run_processing(
                 if comp not in seen:
                     seen.add(comp)
                     t0g = time.perf_counter()
-                    cache   = precompute_smooth_geometry(pd_c, proximity_radius=proximity_radius, log_fn=log)
+                    # Determine mode for this component from the first matching file.
+                    comp_mode = _snap_map[fp][4]  # index 4 = smooth_mode
+                    cache   = precompute_smooth_geometry(
+                        pd_c,
+                        proximity_radius=proximity_radius,
+                        log_fn=log,
+                        skip_edge_expansion=(comp_mode == "auto"),
+                    )
                     n_ec    = cache.get("n_direct", 0) if cache else 0
-                    log(f"    [{comp}] {n_ec:,} direct edge cells cached  "
-                        f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
-                        "  [zero-filter + proximity applied per file]")
+                    n_ep    = len(cache.get("edge_pt_ids_arr", [])) if cache else 0
+                    if comp_mode == "auto":
+                        log(f"    [{comp}] {n_ep:,} edge points cached (cell flagging skipped)  "
+                            f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
+                            f"  [mode=auto]")
+                    else:
+                        log(f"    [{comp}] {n_ec:,} direct edge cells cached  "
+                            f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
+                            f"  [mode=edge]")
                     _geo_cache[comp] = cache
 
         def _geo_for(fp: Path) -> dict | None:
@@ -185,7 +203,8 @@ def run_processing(
         n_loaded = len(loaded)
         log(f"\n[2/3] Processing {n_loaded} file(s) ({min(n_loaded, n_workers)} workers)...")
         smooth_args = [
-            (fp, on, c, s, pd, mb, _snap_map[fp][0], stop_event, _geo_for(fp))
+            (fp, on, c, s, pd, mb, _snap_map[fp][0], stop_event, _geo_for(fp),
+             _snap_map[fp][4], _snap_map[fp][5], proximity_radius)
             for fp, on, c, s, pd, mb, _tp in loaded
         ]
         _prev = sys.getswitchinterval()
@@ -203,11 +222,13 @@ def run_processing(
                         log(f"  [{done}/{n_loaded}] ERROR: {result}"); continue
                     fp, on, c, s, pd, mb, sm, ma = result
                     processed.append(result)
-                    ni = _snap_map[fp][0]
+                    ni   = _snap_map[fp][0]
+                    mode = _snap_map[fp][4]
                     if ni > 0:
                         log(f"  [{done}/{n_loaded}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  "
-                            f"before={mb:.4g}  after={ma:.4g}  ({ni} iter)")
+                            f"before={mb:.4g}  after={ma:.4g}  "
+                            f"({ni} iter, mode={mode})")
                     else:
                         log(f"  [{done}/{n_loaded}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  no smoothing")
@@ -218,7 +239,7 @@ def run_processing(
         # ── Write CSVs ────────────────────────────────────────────────────────
         for item in processed:
             fp, on, c, s, _, mb, _, ma = item
-            _, snap_pd, snap_tp, mult = _snap_map[fp]
+            _, snap_pd, snap_tp, mult, *_ = _snap_map[fp]
             mbs = mb * mult; mas = ma * mult
             delta = abs(mas - mbs)
             writer.writerow([c, s, fp.name,
@@ -238,7 +259,7 @@ def run_processing(
             temp_vtp_files: list[Path] = []
 
             for fp, on, c, s, pd_orig, _, pd_smooth, _ in snap_items:
-                n_iter_f, snap_pd, snap_tp, mult_f = _snap_map[fp]
+                n_iter_f, snap_pd, snap_tp, mult_f, *_ = _snap_map[fp]
                 is_snap_only  = (n_iter_f == 0)
                 stem          = fp.stem
                 case_snap_dir = snap_dir / on / c / s

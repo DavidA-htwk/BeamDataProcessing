@@ -23,6 +23,7 @@ def precompute_smooth_geometry(
         src: vtk.vtkPolyData,
         proximity_radius: float | None = None,
         log_fn=None,
+        skip_edge_expansion: bool = False,
 ) -> dict | None:
     """Compute and return the geometry-only data needed by apply_edge_smooth.
 
@@ -30,6 +31,11 @@ def precompute_smooth_geometry(
     every VTP file of the same component (same underlying mesh).  Call once per
     component, then pass the result via geo_cache= to skip Steps 1-4 for all
     subsequent files.
+
+    skip_edge_expansion: when True (AUTO mode), Steps 3 and 5 are skipped.
+        Step 3 (flag 6M edge cells) and Step 5 (BFS-expand those cells) are
+        only needed by "edge" mode.  AUTO mode finds its own candidates via
+        local z-score and only needs the CSR connectivity + edge_pt_ids_arr.
 
     Returns a dict with keys:
         edge_cell_list, cell_neighbours, n_cells, n_direct,
@@ -76,33 +82,45 @@ def precompute_smooth_geometry(
             edge_pt_ids.add(loc_pts.FindClosestPoint(edge_pts.GetPoint(i)))
         _log(f"    Step 2/4: done — {len(edge_pt_ids):,} unique source points on edges")
 
+    # Convert edge point IDs to array once — reused by smart_smooth_auto for
+    # fast boundary-edge classification without re-running global vtkFeatureEdges.
+    edge_pt_ids_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
+
     # Step 3 — flag ALL cells owning an edge point. Pure topology, no scalars.
+    # Skipped in AUTO mode: smart_smooth_auto finds its own candidates via
+    # local z-score and never uses edge_cells_arr.
     edge_cells_arr = np.array([], dtype=np.int64)
     n_direct       = 0
     conn           = None
     offs           = None
     if edge_pt_ids:
-        _log(f"    Step 3/4: flagging edge cells (vectorized, {n_cells:,} cells)...")
+        # Always read conn/offs — Step 4 (CSR build) needs them regardless of mode.
         polys = src.GetPolys()
         if polys is not None and polys.GetNumberOfCells() > 0:
             conn = vtk_to_numpy(polys.GetConnectivityArray())
             offs = vtk_to_numpy(polys.GetOffsetsArray())
-            pt_mask = np.zeros(n_pts, dtype=np.uint8)
-            pt_mask[np.fromiter(edge_pt_ids, dtype=np.int64)] = 1
-            cell_hits = np.add.reduceat(pt_mask[conn], offs[:-1].astype(np.intp))
-            edge_cells_arr = np.where(cell_hits > 0)[0].astype(np.int64)
-            n_direct = len(edge_cells_arr)
+
+        if not skip_edge_expansion:
+            _log(f"    Step 3/4: flagging edge cells (vectorized, {n_cells:,} cells)...")
+            if conn is not None and offs is not None:
+                pt_mask = np.zeros(n_pts, dtype=np.uint8)
+                pt_mask[np.fromiter(edge_pt_ids, dtype=np.int64)] = 1
+                cell_hits = np.add.reduceat(pt_mask[conn], offs[:-1].astype(np.intp))
+                edge_cells_arr = np.where(cell_hits > 0)[0].astype(np.int64)
+                n_direct = len(edge_cells_arr)
+            else:
+                cell_pts_tmp = vtk.vtkIdList()
+                ec: list[int] = []
+                for cid in range(n_cells):
+                    src.GetCellPoints(cid, cell_pts_tmp)
+                    for k in range(cell_pts_tmp.GetNumberOfIds()):
+                        if cell_pts_tmp.GetId(k) in edge_pt_ids:
+                            ec.append(cid); break
+                edge_cells_arr = np.array(ec, dtype=np.int64)
+                n_direct = len(edge_cells_arr)
+            _log(f"    Step 3/4: done - {n_direct:,} direct edge cells (no scalar filter)")
         else:
-            cell_pts_tmp = vtk.vtkIdList()
-            ec: list[int] = []
-            for cid in range(n_cells):
-                src.GetCellPoints(cid, cell_pts_tmp)
-                for k in range(cell_pts_tmp.GetNumberOfIds()):
-                    if cell_pts_tmp.GetId(k) in edge_pt_ids:
-                        ec.append(cid); break
-            edge_cells_arr = np.array(ec, dtype=np.int64)
-            n_direct = len(edge_cells_arr)
-        _log(f"    Step 3/4: done - {n_direct:,} direct edge cells (no scalar filter)")
+            _log("    Step 3/4: skipped (AUTO mode — candidates found via z-score)")
     else:
         _log("    Step 3/4: skipped (no edge points found)")
 
@@ -111,9 +129,10 @@ def precompute_smooth_geometry(
               "conn": None, "offs": None, "pt_cell_offsets": None,
               "sorted_cell_ids": None,
               "proximity_radius": proximity_radius,
+              "edge_pt_ids_arr": edge_pt_ids_arr,
               "edge_cell_arr": np.array([], dtype=np.int64),
               "csr_offsets": None, "csr_nbr_ids": None}
-    if len(edge_cells_arr) == 0:
+    if len(edge_cells_arr) == 0 and not skip_edge_expansion:
         return _empty
 
     # Step 4 \u2014 build point\u2192cell CSR for fast per-file neighbour lookup.
@@ -137,61 +156,66 @@ def precompute_smooth_geometry(
         _log("    Step 4/5: done")
 
         # Step 5 — topological ring expansion (fully vectorised, no Python loops).
-        # Grow the direct edge-cell set outward by n_expand topological layers.
-        # n_expand=2 catches cells that are 1-2 hops from a physical edge cell,
-        # which is equivalent to the original spatial proximity=0.03 for most meshes.
-        n_expand = max(2, round(proximity_radius / 0.03)) if proximity_radius > 0.0 else 2
-        n_expand = min(n_expand, 6)
-        _log(f"    Step 5/5: topological expansion ({n_expand} layer(s), "
-             f"{n_direct:,} direct cells)...")
+        # Skipped in AUTO mode: smart_smooth_auto does per-candidate k-ring BFS
+        # instead of a single global expansion over all 6M direct edge cells.
+        if not skip_edge_expansion and len(edge_cells_arr) > 0:
+            # Grow the direct edge-cell set outward by n_expand topological layers.
+            # n_expand=2 catches cells that are 1-2 hops from a physical edge cell,
+            # which is equivalent to the original spatial proximity=0.03 for most meshes.
+            n_expand = max(2, round(proximity_radius / 0.03)) if proximity_radius > 0.0 else 2
+            n_expand = min(n_expand, 6)
+            _log(f"    Step 5/5: topological expansion ({n_expand} layer(s), "
+                 f"{n_direct:,} direct cells)...")
 
-        visited_arr = edge_cells_arr   # sorted unique array, grows each layer
-        ring        = edge_cells_arr   # only the NEW cells added last iteration
+            visited_arr = edge_cells_arr   # sorted unique array, grows each layer
+            ring        = edge_cells_arr   # only the NEW cells added last iteration
 
-        for _layer in range(n_expand):
-            # ── Step A: all point IDs of ring cells (vectorised) ─────────────
-            r_starts = offs[ring]
-            r_ends   = offs[ring + 1]
-            r_sizes  = (r_ends - r_starts).astype(np.int64)
-            total_r  = int(r_sizes.sum())
-            if total_r == 0:
-                break
-            cum_r    = np.empty(len(ring) + 1, dtype=np.int64)
-            cum_r[0] = 0
-            np.cumsum(r_sizes, out=cum_r[1:])
-            local_r  = (np.arange(total_r, dtype=np.int64)
-                        - np.repeat(cum_r[:-1], r_sizes))
-            pts_flat = np.unique(conn[np.repeat(r_starts, r_sizes) + local_r])
+            for _layer in range(n_expand):
+                # ── Step A: all point IDs of ring cells (vectorised) ─────────────
+                r_starts = offs[ring]
+                r_ends   = offs[ring + 1]
+                r_sizes  = (r_ends - r_starts).astype(np.int64)
+                total_r  = int(r_sizes.sum())
+                if total_r == 0:
+                    break
+                cum_r    = np.empty(len(ring) + 1, dtype=np.int64)
+                cum_r[0] = 0
+                np.cumsum(r_sizes, out=cum_r[1:])
+                local_r  = (np.arange(total_r, dtype=np.int64)
+                            - np.repeat(cum_r[:-1], r_sizes))
+                pts_flat = np.unique(conn[np.repeat(r_starts, r_sizes) + local_r])
 
-            # ── Step B: all cell IDs sharing those points (vectorised) ────────
-            p_starts = pt_cell_offsets[pts_flat]
-            p_ends   = pt_cell_offsets[pts_flat + 1]
-            p_sizes  = (p_ends - p_starts).astype(np.int64)
-            total_p  = int(p_sizes.sum())
-            if total_p == 0:
-                break
-            cum_p    = np.empty(len(pts_flat) + 1, dtype=np.int64)
-            cum_p[0] = 0
-            np.cumsum(p_sizes, out=cum_p[1:])
-            local_p  = (np.arange(total_p, dtype=np.int64)
-                        - np.repeat(cum_p[:-1], p_sizes))
-            all_nbrs = sorted_cell_ids[
-                np.repeat(p_starts, p_sizes) + local_p
-            ].astype(np.int64)
+                # ── Step B: all cell IDs sharing those points (vectorised) ────────
+                p_starts = pt_cell_offsets[pts_flat]
+                p_ends   = pt_cell_offsets[pts_flat + 1]
+                p_sizes  = (p_ends - p_starts).astype(np.int64)
+                total_p  = int(p_sizes.sum())
+                if total_p == 0:
+                    break
+                cum_p    = np.empty(len(pts_flat) + 1, dtype=np.int64)
+                cum_p[0] = 0
+                np.cumsum(p_sizes, out=cum_p[1:])
+                local_p  = (np.arange(total_p, dtype=np.int64)
+                            - np.repeat(cum_p[:-1], p_sizes))
+                all_nbrs = sorted_cell_ids[
+                    np.repeat(p_starts, p_sizes) + local_p
+                ].astype(np.int64)
 
-            # ── Step C: cells not yet in the ring ─────────────────────────────
-            new_ids = np.setdiff1d(np.unique(all_nbrs), visited_arr,
-                                   assume_unique=False)
-            if len(new_ids) == 0:
-                break
-            visited_arr = np.union1d(visited_arr, new_ids)
-            ring = new_ids
-            _log(f"    Step 5/5: layer {_layer+1} done — "
-                 f"+{len(new_ids):,} cells ({len(visited_arr):,} total)")
+                # ── Step C: cells not yet in the ring ─────────────────────────────
+                new_ids = np.setdiff1d(np.unique(all_nbrs), visited_arr,
+                                       assume_unique=False)
+                if len(new_ids) == 0:
+                    break
+                visited_arr = np.union1d(visited_arr, new_ids)
+                ring = new_ids
+                _log(f"    Step 5/5: layer {_layer+1} done — "
+                     f"+{len(new_ids):,} cells ({len(visited_arr):,} total)")
 
-        edge_cells_arr = visited_arr
-        _log(f"    Step 5/5: done — {len(edge_cells_arr):,} cells in smoothing ring "
-             f"({len(edge_cells_arr) - n_direct:,} added by expansion)")
+            edge_cells_arr = visited_arr
+            _log(f"    Step 5/5: done — {len(edge_cells_arr):,} cells in smoothing ring "
+                 f"({len(edge_cells_arr) - n_direct:,} added by expansion)")
+        elif skip_edge_expansion:
+            _log("    Step 5/5: skipped (AUTO mode — per-candidate k-ring used instead)")
 
     return {
         "edge_cells_arr":   edge_cells_arr,
@@ -203,6 +227,7 @@ def precompute_smooth_geometry(
         "pt_cell_offsets":  pt_cell_offsets,
         "sorted_cell_ids":  sorted_cell_ids,
         "proximity_radius": proximity_radius,
+        "edge_pt_ids_arr":  edge_pt_ids_arr,
         # backward-compat keys
         "edge_cell_list":   edge_cells_arr.tolist(),
         "edge_cell_arr":    edge_cells_arr,

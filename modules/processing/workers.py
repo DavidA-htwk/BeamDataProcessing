@@ -20,6 +20,7 @@ from modules.vtk.vtk_io import (
     read_vtp, find_max, find_total, _write_vtp, _scale_polydata_array,
 )
 from modules.vtk.smoothing import apply_edge_smooth
+from modules.vtk.smart_smooth import smart_smooth_auto
 from modules.vtk.snapshot_max import save_max_snapshot, precompute_snapshot
 from modules.transform.generate_report import extract_cells_to_csv
 from modules.transform import transform_reference_frame as _trf
@@ -50,13 +51,21 @@ def _smooth_one_file(args: tuple) -> tuple:
     """
     try:
         filepath, output_name, case, scenario, polydata, max_before, \
-            n_iter, stop_event, geo_cache = args
+            n_iter, stop_event, geo_cache, smooth_mode, spike_sigma, \
+            proximity_radius = args
         if stop_event is not None and stop_event.is_set():
             return None
         if n_iter == 0:
             return filepath, output_name, case, scenario, polydata, max_before, polydata, max_before
-        smoothed = apply_edge_smooth(polydata, n_iter=n_iter,
-                                     stop_event=stop_event, geo_cache=geo_cache)
+        if smooth_mode == "auto":
+            smoothed = smart_smooth_auto(
+                polydata, n_iter=n_iter, stop_event=stop_event,
+                geo_cache=geo_cache, spike_sigma=spike_sigma,
+                proximity_radius=proximity_radius,
+            )
+        else:
+            smoothed = apply_edge_smooth(polydata, n_iter=n_iter,
+                                         stop_event=stop_event, geo_cache=geo_cache)
         if smoothed is None:
             return None
         max_after = find_max(smoothed, ARRAY_NAME)

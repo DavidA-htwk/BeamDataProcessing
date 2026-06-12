@@ -16,7 +16,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SETTINGS_FILE, _safe_float, remember_cfg_path
+from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SETTINGS_FILE, _safe_float, remember_cfg_path
 
 
 def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
@@ -105,7 +105,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     _comp_hdr = tk.Frame(comp_lframe)
     _comp_hdr.pack(fill="x")
     for txt, w in [("Component", 24), ("Files", 8), ("Smooth iter", 10),
-                   ("Mult factor", 10), ("Snap pwr dens", 14), ("Snap total pwr", 14)]:
+                   ("Mode", 8), ("Sigma", 6), ("Mult factor", 10),
+                   ("Snap pwr dens", 14), ("Snap total pwr", 14)]:
         tk.Label(_comp_hdr, text=txt, width=w, anchor="w",
                  fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
 
@@ -131,13 +132,15 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         if name in comp_widgets:
             comp_widgets[name]["count_var"].set(str(count))
             return
-        saved       = pending_comp_cfg.get(name, {})
-        smooth_var  = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
+        saved            = pending_comp_cfg.get(name, {})
+        smooth_var       = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
         smooth_var.trace_add("write", _update_prox_state)
-        mult_var    = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
-        snap_pd_var = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
-        snap_tp_var = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
-        count_var   = tk.StringVar(value=str(count))
+        smooth_mode_var  = tk.StringVar(value=str(saved.get("smooth_mode", "edge")))
+        spike_sigma_var  = tk.StringVar(value=str(saved.get("spike_sigma", SPIKE_SIGMA)))
+        mult_var         = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
+        snap_pd_var      = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
+        snap_tp_var      = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
+        count_var        = tk.StringVar(value=str(count))
 
         row = tk.Frame(comp_rows_frame)
         row.pack(fill="x", pady=1)
@@ -145,21 +148,37 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         tk.Label(row, textvariable=count_var,  width=8,  anchor="w", fg="#666666").pack(side="left")
         tk.Spinbox(row, from_=0, to=20, width=5, textvariable=smooth_var).pack(side="left")
         tk.Label(row, text="", width=1).pack(side="left")
+        mode_menu = tk.OptionMenu(row, smooth_mode_var, "edge", "auto")
+        mode_menu.config(width=5)
+        mode_menu.pack(side="left")
+        sigma_entry = tk.Entry(row, textvariable=spike_sigma_var, width=5)
+        sigma_entry.pack(side="left", padx=(2, 0))
+
+        def _update_sigma_state(*_, _entry=sigma_entry, _var=smooth_mode_var):
+            _entry.configure(state="normal" if _var.get() == "auto" else "disabled")
+
+        _update_sigma_state()
+        smooth_mode_var.trace_add("write", _update_sigma_state)
+
+        tk.Label(row, text="", width=1).pack(side="left")
         tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
         tk.Label(row, text="", width=1).pack(side="left")
         tk.Checkbutton(row, text="Pwr density", variable=snap_pd_var).pack(side="left")
         tk.Checkbutton(row, text="Total pwr",   variable=snap_tp_var).pack(side="left")
 
         comp_widgets[name] = {
-            "smooth_var":  smooth_var, "mult_var":    mult_var,
-            "snap_pd_var": snap_pd_var, "snap_tp_var": snap_tp_var,
-            "count_var":   count_var,
+            "smooth_var":       smooth_var,       "smooth_mode_var": smooth_mode_var,
+            "spike_sigma_var":  spike_sigma_var,  "mult_var":        mult_var,
+            "snap_pd_var":      snap_pd_var,       "snap_tp_var":     snap_tp_var,
+            "count_var":        count_var,
         }
 
     def on_load_geometry():
         for name, w in comp_widgets.items():
             pending_comp_cfg[name] = {
                 "smooth_iterations":  w["smooth_var"].get(),
+                "smooth_mode":        w["smooth_mode_var"].get(),
+                "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
@@ -230,6 +249,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         return {
             name: {
                 "smooth_iterations":  w["smooth_var"].get(),
+                "smooth_mode":        w["smooth_mode_var"].get(),
+                "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),

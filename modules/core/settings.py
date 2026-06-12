@@ -20,6 +20,17 @@ FEATURE_ANGLE = 30.0   # degrees
 # below FEATURE_ANGLE.  Set to 0.0 to disable.
 SMOOTH_PROXIMITY_RADIUS = 0.03
 
+# Smart-smooth AUTO mode parameters.
+# SPIKE_SIGMA    — local z-score threshold: a cell is a candidate if its value
+#                  exceeds local_neighbor_mean + SPIKE_SIGMA * local_neighbor_std.
+# MIN_NEIGHBORS  — minimum point-connected neighbors required for reliable local
+#                  statistics; cells with fewer are skipped.
+# SMOOTH_K_RING  — topological k-ring radius for the per-candidate patch used to
+#                  classify edge vs. spike via local vtkFeatureEdges.
+SPIKE_SIGMA    = 2.0
+MIN_NEIGHBORS  = 3
+SMOOTH_K_RING  = 3
+
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"
 
