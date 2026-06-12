@@ -51,7 +51,7 @@ def run_processing(
 
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
-                   smooth_mode, spike_sigma)."""
+                   smooth_mode, spike_sigma, proximity_radius)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -62,8 +62,9 @@ def run_processing(
                     bool(comp_cfg.get("save_power_density", True)),
                     bool(comp_cfg.get("save_total_power",   False)),
                     float(comp_cfg.get("mult_factor", 1.0)),
-                    str(comp_cfg.get("smooth_mode", "edge")),
+                    str(comp_cfg.get("smooth_mode", "auto")),
                     float(comp_cfg.get("spike_sigma", SPIKE_SIGMA)),
+                    float(comp_cfg.get("proximity_radius", proximity_radius)),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -72,10 +73,11 @@ def run_processing(
                 bool(c.get("save_power_density", True)),
                 bool(c.get("save_total_power",   False)),
                 float(c.get("mult_factor", 1.0)),
-                str(c.get("smooth_mode", "edge")),
+                str(c.get("smooth_mode", "auto")),
                 float(c.get("spike_sigma", SPIKE_SIGMA)),
+                float(c.get("proximity_radius", proximity_radius)),
             )
-        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "edge", SPIKE_SIGMA)
+        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "auto", SPIKE_SIGMA, proximity_radius)
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -173,10 +175,11 @@ def run_processing(
                     seen.add(comp)
                     t0g = time.perf_counter()
                     # Determine mode for this component from the first matching file.
-                    comp_mode = _snap_map[fp][4]  # index 4 = smooth_mode
+                    comp_mode  = _snap_map[fp][4]  # index 4 = smooth_mode
+                    comp_prox  = _snap_map[fp][6]  # index 6 = per-component proximity_radius
                     cache   = precompute_smooth_geometry(
                         pd_c,
-                        proximity_radius=proximity_radius,
+                        proximity_radius=comp_prox,
                         log_fn=log,
                         skip_edge_expansion=(comp_mode == "auto"),
                     )
@@ -204,7 +207,7 @@ def run_processing(
         log(f"\n[2/3] Processing {n_loaded} file(s) ({min(n_loaded, n_workers)} workers)...")
         smooth_args = [
             (fp, on, c, s, pd, mb, _snap_map[fp][0], stop_event, _geo_for(fp),
-             _snap_map[fp][4], _snap_map[fp][5], proximity_radius)
+             _snap_map[fp][4], _snap_map[fp][5], _snap_map[fp][6])
             for fp, on, c, s, pd, mb, _tp in loaded
         ]
         _prev = sys.getswitchinterval()

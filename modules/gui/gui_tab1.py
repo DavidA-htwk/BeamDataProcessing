@@ -74,17 +74,16 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     tk.Label(out_frame, textvariable=output_label_var, fg="grey", anchor="w").pack(
         side="left", padx=8)
 
-    # ── Proximity radius ──────────────────────────────────────────────────────
+    # ── Proximity radius (global default, edge mode only) ──────────────────────
     prox_frame = tk.Frame(tab1)
     prox_frame.pack(fill="x", padx=10, pady=(6, 0))
-    tk.Label(prox_frame, text="Proximity radius:", anchor="w").pack(side="left")
+    tk.Label(prox_frame, text="Default proximity radius (edge mode):", anchor="w").pack(side="left")
     proximity_var = tk.StringVar(
         value=str(settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS)))
     prox_entry = tk.Entry(prox_frame, textvariable=proximity_var, width=8)
     prox_entry.pack(side="left", padx=(6, 0))
-    prox_entry.configure(state="disabled")
     tk.Label(prox_frame,
-             text="(mesh units; Smoothes around detected edges for that value; 0 = off)",
+             text="(mesh units; used by 'edge' mode only — AUTO uses k-ring instead; 0 = off)",
              fg="#888888").pack(side="left", padx=(8, 0))
 
     # ── Load Geometry ─────────────────────────────────────────────────────────
@@ -105,7 +104,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     _comp_hdr = tk.Frame(comp_lframe)
     _comp_hdr.pack(fill="x")
     for txt, w in [("Component", 24), ("Files", 8), ("Smooth iter", 10),
-                   ("Mode", 8), ("Sigma", 6), ("Mult factor", 10),
+                   ("Mode", 8), ("Sigma", 6), ("Prox (edge)", 10),
+                   ("Mult factor", 10),
                    ("Snap pwr dens", 14), ("Snap total pwr", 14)]:
         tk.Label(_comp_hdr, text=txt, width=w, anchor="w",
                  fg="#444444", font=("Segoe UI", 8, "bold")).pack(side="left")
@@ -135,8 +135,10 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         saved            = pending_comp_cfg.get(name, {})
         smooth_var       = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
         smooth_var.trace_add("write", _update_prox_state)
-        smooth_mode_var  = tk.StringVar(value=str(saved.get("smooth_mode", "edge")))
+        smooth_mode_var  = tk.StringVar(value=str(saved.get("smooth_mode", "auto")))
         spike_sigma_var  = tk.StringVar(value=str(saved.get("spike_sigma", SPIKE_SIGMA)))
+        prox_var         = tk.StringVar(value=str(saved.get(
+            "proximity_radius", settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))))
         mult_var         = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
         snap_pd_var      = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
         snap_tp_var      = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
@@ -153,12 +155,31 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         mode_menu.pack(side="left")
         sigma_entry = tk.Entry(row, textvariable=spike_sigma_var, width=5)
         sigma_entry.pack(side="left", padx=(2, 0))
+        prox_entry_row = tk.Entry(row, textvariable=prox_var, width=7)
+        prox_entry_row.pack(side="left", padx=(4, 0))
 
-        def _update_sigma_state(*_, _entry=sigma_entry, _var=smooth_mode_var):
-            _entry.configure(state="normal" if _var.get() == "auto" else "disabled")
+        def _update_mode_state(*_,
+                               _menu=mode_menu, _sig=sigma_entry,
+                               _prx=prox_entry_row,
+                               _sv=smooth_var, _mv=smooth_mode_var):
+            n_iter = 0
+            try:
+                n_iter = int(_sv.get())
+            except Exception:
+                pass
+            if n_iter == 0:
+                _menu.configure(state="disabled")
+                _sig.configure(state="disabled")
+                _prx.configure(state="disabled")
+            else:
+                mode = _mv.get()
+                _menu.configure(state="normal")
+                _sig.configure(state="normal" if mode == "auto" else "disabled")
+                _prx.configure(state="normal" if mode == "edge" else "disabled")
 
-        _update_sigma_state()
-        smooth_mode_var.trace_add("write", _update_sigma_state)
+        _update_mode_state()
+        smooth_var.trace_add("write", _update_mode_state)
+        smooth_mode_var.trace_add("write", _update_mode_state)
 
         tk.Label(row, text="", width=1).pack(side="left")
         tk.Entry(row, textvariable=mult_var, width=7).pack(side="left")
@@ -168,7 +189,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
 
         comp_widgets[name] = {
             "smooth_var":       smooth_var,       "smooth_mode_var": smooth_mode_var,
-            "spike_sigma_var":  spike_sigma_var,  "mult_var":        mult_var,
+            "spike_sigma_var":  spike_sigma_var,  "prox_var":        prox_var,
+            "mult_var":         mult_var,
             "snap_pd_var":      snap_pd_var,       "snap_tp_var":     snap_tp_var,
             "count_var":        count_var,
         }
@@ -179,6 +201,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_iterations":  w["smooth_var"].get(),
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
+                "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
@@ -251,6 +274,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_iterations":  w["smooth_var"].get(),
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
+                "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
