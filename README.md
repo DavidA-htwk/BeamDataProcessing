@@ -39,7 +39,6 @@ Value_extract/
 - `vtk >= 9.6.2`
 - `numpy >= 2.4.6`
 - `openpyxl >= 3.1.5`
-- `tqdm >= 4.0`
 - `pyvista >= 0.44` (used by `generate_report.py`)
 
 ```bash
