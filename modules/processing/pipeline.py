@@ -19,7 +19,7 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 from modules.core.settings import (
-    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, _safe_float,
+    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, _safe_float,
 )
 from modules.vtk.vtk_io import _write_vtp, read_vtp
 from modules.core.path_utils import extract_case_scenario
@@ -52,7 +52,8 @@ def run_processing(
 
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
-                   smooth_mode, spike_sigma, proximity_radius)."""
+                   smooth_mode, spike_sigma, proximity_radius, smooth_spikes,
+                   spike_ratio)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -66,6 +67,8 @@ def run_processing(
                     str(comp_cfg.get("smooth_mode", "auto")),
                     float(comp_cfg.get("spike_sigma", SPIKE_SIGMA)),
                     float(comp_cfg.get("proximity_radius", proximity_radius)),
+                    bool(comp_cfg.get("smooth_spikes", False)),
+                    float(comp_cfg.get("spike_ratio", SPIKE_RATIO)),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -77,8 +80,11 @@ def run_processing(
                 str(c.get("smooth_mode", "auto")),
                 float(c.get("spike_sigma", SPIKE_SIGMA)),
                 float(c.get("proximity_radius", proximity_radius)),
+                bool(c.get("smooth_spikes", False)),
+                float(c.get("spike_ratio", SPIKE_RATIO)),
             )
-        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "auto", SPIKE_SIGMA, proximity_radius)
+        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "auto",
+                SPIKE_SIGMA, proximity_radius, False, SPIKE_RATIO)
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -103,13 +109,22 @@ def run_processing(
     csv_path = out_dir / "max_comparison_batch.csv"
     pwr_path = out_dir / "total_power_batch.csv"
 
+    # Purge any _tmp_smooth_* VTP files left by a previous crashed/stopped run.
+    if snap_dir.exists():
+        for _stale in snap_dir.glob("_tmp_smooth_*.vtp"):
+            try:
+                _stale.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     total_files = 0
     with open(csv_path, "w", newline="", encoding="utf-8") as fh, \
          open(pwr_path, "w", newline="", encoding="utf-8") as fh_pwr:
         writer     = csv.writer(fh)
         writer_pwr = csv.writer(fh_pwr)
         writer.writerow(["case", "scenario", "filename",
-                         "max_before", "max_after", "delta", "discrepancy"])
+                         "max_before", "max_after", "delta", "discrepancy",
+                         "snapshot"])
         writer_pwr.writerow(["case", "scenario", "filename", "total_power_W"])
 
         # ── Phase 0: Collect all matching file paths (no loading) ────────────
@@ -137,7 +152,7 @@ def run_processing(
             return
 
         n_all     = len(all_meta)
-        n_workers = min(os.cpu_count() or 4, n_all, 12)
+        n_workers = min(os.cpu_count() or 4, n_all, 6)
         log(f"\nTotal: {n_all} file(s) to process")
         log("=" * 80)
 
@@ -208,6 +223,8 @@ def run_processing(
              _snap_map[fp][4],            # smooth_mode
              _snap_map[fp][5],            # spike_sigma
              _snap_map[fp][6],            # proximity_radius
+             _snap_map[fp][7],            # smooth_spikes
+             _snap_map[fp][8],            # spike_ratio
              needs_snap_map[fp],          # write temp VTP?
              str(snap_dir),
              pid,
@@ -233,16 +250,39 @@ def run_processing(
                     if isinstance(result, Exception):
                         log(f"  [{done}/{n_all}] ERROR: {result}"); continue
 
-                    fp, on, c, s, mb, ma, tp, smooth_path = result
+                    fp, on, c, s, mb, ma, tp, smooth_path, \
+                    pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
 
                     # Write CSV rows immediately (no accumulation needed)
                     mbs   = mb * mult
                     mas   = ma * mult
                     delta = abs(mas - mbs)
+                    # Build relative hyperlink path using backslashes.
+                    # Excel passes relative paths to ShellExecute which uses the
+                    # registered .png handler (Photos), not the browser.
+                    # Backslashes are required — forward slashes cause Excel to
+                    # treat the path as a URL fragment and open Edge instead.
+                    # The path is relative to the CSV file (both in out_dir).
+                    is_snap_only_csv = (ni == 0)
+                    stem_csv = fp.stem
+                    if snap_pd:
+                        if is_snap_only_csv:
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density.png"
+                        else:
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density__after.png"
+                    elif snap_tp:
+                        if is_snap_only_csv:
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr.png"
+                        else:
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr__after.png"
+                    else:
+                        _snap_rel = ""
+                    _snap_link = f'=HYPERLINK("{_snap_rel}","Open")' if _snap_rel else ""
                     writer.writerow([c, s, fp.name,
                                      f"{mbs:.6g}", f"{mas:.6g}",
-                                     f"{delta:.6g}", "YES" if delta > 0.0 else "NO"])
+                                     f"{delta:.6g}", "YES" if delta > 0.0 else "NO",
+                                     _snap_link])
                     if tp is not None:
                         writer_pwr.writerow([c, s, fp.name, f"{tp * mult:.6g}"])
                     total_files += 1
@@ -256,7 +296,7 @@ def run_processing(
                         log(f"  [{done}/{n_all}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  no smoothing")
 
-                    # Queue snapshot args using paths only (no polydata)
+                    # Queue snapshot args — paths + precomputed camera dicts only
                     if snap_pd or snap_tp:
                         is_snap_only  = (ni == 0)
                         stem          = fp.stem
@@ -264,6 +304,9 @@ def run_processing(
                         case_snap_dir.mkdir(parents=True, exist_ok=True)
                         if smooth_path:
                             temp_vtp_files.append(Path(smooth_path))
+
+                        # Common extra args for _render_subprocess
+                        _snap_extra = (pre_orig, pre_smooth, max_pwr_o, max_pwr_s, tp)
 
                         if snap_pd:
                             if is_snap_only:
@@ -275,7 +318,7 @@ def run_processing(
                                 ]
                             snap_proc_args.append(
                                 (str(fp), smooth_path, paths_pd,
-                                 ARRAY_NAME, is_snap_only, stem, mult))
+                                 ARRAY_NAME, is_snap_only, stem, mult) + _snap_extra)
 
                         if snap_tp:
                             if is_snap_only:
@@ -287,7 +330,7 @@ def run_processing(
                                 ]
                             snap_proc_args.append(
                                 (str(fp), smooth_path, paths_tp,
-                                 POWER_ARRAY, is_snap_only, stem, mult))
+                                 POWER_ARRAY, is_snap_only, stem, mult) + _snap_extra)
         finally:
             sys.setswitchinterval(_prev)
         log(f"  Processing done in {time.perf_counter()-t0:.1f}s")
@@ -318,6 +361,13 @@ def run_processing(
             log(f"  Snapshots done in {time.perf_counter()-t0:.1f}s")
         else:
             log("\n[2/2] Snapshots disabled")
+            # Still clean up any temp VTPs written by workers (e.g. if all
+            # snapshot flags were off but needs_snap_map had True entries).
+            for tmp in temp_vtp_files:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     log("\n" + "=" * 80)
     if stopped():

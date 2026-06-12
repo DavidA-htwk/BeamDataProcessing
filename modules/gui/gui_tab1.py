@@ -16,7 +16,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SETTINGS_FILE, _safe_float, remember_cfg_path
+from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, SETTINGS_FILE, _safe_float, remember_cfg_path
 
 
 def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
@@ -98,7 +98,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     comp_grid.pack(fill="x")
 
     _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
-            "Prox (edge)", "Mult", "Pwr density", "Total pwr"]
+            "Prox (edge)", "Mult", "Spk", "Pwr density", "Total pwr"]
     for _c, _txt in enumerate(_HDR):
         tk.Label(comp_grid, text=_txt, anchor="w",
                  fg="#444444", font=("Segoe UI", 8, "bold"),
@@ -125,6 +125,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         prox_var         = tk.StringVar(value=str(saved.get(
             "proximity_radius", settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))))
         mult_var         = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
+        smooth_spikes_var = tk.BooleanVar(value=bool(saved.get("smooth_spikes", False)))
         snap_pd_var      = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
         snap_tp_var      = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
         count_var        = tk.StringVar(value=str(count))
@@ -147,14 +148,16 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         prox_entry_row.grid(row=r, column=5, sticky="w", padx=(0, 4))
         tk.Entry(comp_grid, textvariable=mult_var, width=6).grid(
             row=r, column=6, sticky="w", padx=(0, 4))
+        spk_chk = tk.Checkbutton(comp_grid, text="", variable=smooth_spikes_var)
+        spk_chk.grid(row=r, column=7, sticky="w")
         tk.Checkbutton(comp_grid, text="Pwr density",
-                       variable=snap_pd_var).grid(row=r, column=7, sticky="w")
+                       variable=snap_pd_var).grid(row=r, column=8, sticky="w")
         tk.Checkbutton(comp_grid, text="Total pwr",
-                       variable=snap_tp_var).grid(row=r, column=8, sticky="w")
+                       variable=snap_tp_var).grid(row=r, column=9, sticky="w")
 
         def _update_mode_state(*_,
                                _menu=mode_menu, _sig=sigma_entry,
-                               _prx=prox_entry_row,
+                               _prx=prox_entry_row, _spk=spk_chk,
                                _sv=smooth_var, _mv=smooth_mode_var):
             n_iter = 0
             try:
@@ -165,22 +168,24 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 _menu.configure(state="disabled")
                 _sig.configure(state="disabled")
                 _prx.configure(state="disabled")
+                _spk.configure(state="disabled")
             else:
                 mode = _mv.get()
                 _menu.configure(state="normal")
                 _sig.configure(state="normal" if mode == "auto" else "disabled")
                 _prx.configure(state="normal" if mode == "edge" else "disabled")
+                _spk.configure(state="normal" if mode == "auto" else "disabled")
 
         _update_mode_state()
         smooth_var.trace_add("write", _update_mode_state)
         smooth_mode_var.trace_add("write", _update_mode_state)
 
         comp_widgets[name] = {
-            "smooth_var":       smooth_var,       "smooth_mode_var": smooth_mode_var,
-            "spike_sigma_var":  spike_sigma_var,  "prox_var":        prox_var,
-            "mult_var":         mult_var,
-            "snap_pd_var":      snap_pd_var,       "snap_tp_var":     snap_tp_var,
-            "count_var":        count_var,
+            "smooth_var":        smooth_var,        "smooth_mode_var":  smooth_mode_var,
+            "spike_sigma_var":   spike_sigma_var,   "prox_var":         prox_var,
+            "smooth_spikes_var": smooth_spikes_var, "mult_var":         mult_var,
+            "snap_pd_var":       snap_pd_var,        "snap_tp_var":      snap_tp_var,
+            "count_var":         count_var,
         }
 
     def on_load_geometry():
@@ -190,6 +195,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
+                "smooth_spikes":      w["smooth_spikes_var"].get(),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
@@ -265,6 +271,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
+                "smooth_spikes":      w["smooth_spikes_var"].get(),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),

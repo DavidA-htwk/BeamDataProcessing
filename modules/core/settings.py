@@ -30,6 +30,19 @@ SMOOTH_PROXIMITY_RADIUS = 0.03
 SPIKE_SIGMA    = 2.0
 MIN_NEIGHBORS  = 3
 SMOOTH_K_RING  = 3
+# Ratio filter: candidate must also satisfy val > max(neighbor_vals) * SPIKE_RATIO.
+# Eliminates gradient cells (which are only slightly above their peak neighbor) and
+# keeps only true isolated needles.  Set to 0.0 to disable (sigma only).
+# Typical useful range: 1.5 – 3.0.  With 1.5, a cell must be ≥ 50 % above its
+# single highest neighbor to qualify — gradient slopes never satisfy this.
+# Not exposed in the GUI; set per-component in the config JSON if needed.
+SPIKE_RATIO    = 0.0
+# Secondary edge-direct pass: edge-adjacent cells above this global percentile
+# of all non-zero values are added as candidates regardless of local z-score.
+# Catches tight clusters of 2–3 hot cells at an edge whose mutual elevation
+# inflates each other's local mean, defeating the sigma threshold.
+# 99.9 → top 0.1 % of non-zero values; for 300 k non-zero cells that is ~300 seeds.
+EDGE_TOP_PERCENTILE = 99.9
 
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"

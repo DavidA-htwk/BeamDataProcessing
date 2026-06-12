@@ -121,29 +121,55 @@ def run_gui() -> None:
     notebook.add(tab2, text="Coordinate Transform")
 
     # -- Log area (created early so log_fn can be passed to tab builders) ------
-    tk.Label(root, text="Log:", anchor="w").pack(fill="x", padx=10, pady=(10, 2))
-    log_frame = tk.Frame(root)
-    log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-    log_scroll = tk.Scrollbar(log_frame)
-    log_scroll.pack(side="right", fill="y")
-    log_box = tk.Text(
-        log_frame, width=90, height=14, state="disabled",
-        bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 9),
-        yscrollcommand=log_scroll.set, wrap="none",
-    )
-    log_box.pack(side="left", fill="both", expand=True)
-    log_scroll.config(command=log_box.yview)
+    log_outer = tk.Frame(root)
+    log_outer.pack(fill="both", expand=True, padx=10, pady=(6, 4))
 
-    _log_lines: list[str] = []
+    # Two side-by-side log panes — one per pipeline
+    def _make_log_pane(parent: tk.Frame, label: str) -> tk.Text:
+        col = tk.Frame(parent)
+        col.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        tk.Label(col, text=label, anchor="w",
+                 font=("Segoe UI", 8, "bold"), fg="#888888").pack(fill="x")
+        inner = tk.Frame(col)
+        inner.pack(fill="both", expand=True)
+        sb_y = tk.Scrollbar(inner, orient="vertical")
+        sb_y.pack(side="right", fill="y")
+        sb_x = tk.Scrollbar(inner, orient="horizontal")
+        sb_x.pack(side="bottom", fill="x")
+        box = tk.Text(
+            inner, width=55, height=10, state="disabled",
+            bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 8),
+            yscrollcommand=sb_y.set, xscrollcommand=sb_x.set, wrap="none",
+        )
+        box.pack(side="left", fill="both", expand=True)
+        sb_y.config(command=box.yview)
+        sb_x.config(command=box.xview)
+        return box
+
+    log_box_proc = _make_log_pane(log_outer, "Processing log")
+    log_box_xfm  = _make_log_pane(log_outer, "Transform log")
+
+    _log_lines_proc: list[str] = []
+    _log_lines_xfm:  list[str] = []
     _run_start_time: list = [None]
 
-    def log(msg: str) -> None:
-        log_box.configure(state="normal")
-        log_box.insert("end", msg + "\n")
-        log_box.see("end")
-        log_box.configure(state="disabled")
-        _log_lines.append(msg)
+    def _append_to(box: tk.Text, lines: list, msg: str) -> None:
+        box.configure(state="normal")
+        box.insert("end", msg + "\n")
+        box.see("end")
+        box.configure(state="disabled")
+        lines.append(msg)
         root.update_idletasks()
+
+    def log_proc(msg: str) -> None:
+        _append_to(log_box_proc, _log_lines_proc, msg)
+
+    def log_xfm(msg: str) -> None:
+        _append_to(log_box_xfm, _log_lines_xfm, msg)
+
+    # Unified log for backward-compat (used by tab builders etc.)
+    def log(msg: str) -> None:
+        log_proc(msg)
 
     # -- Build tabs ------------------------------------------------------------
     t1 = build_processing_tab(tab1, settings, log)
@@ -164,6 +190,16 @@ def run_gui() -> None:
     get_transform_params   = t2["get_transform_params"]
     get_xfm_cfg_dict       = t2["get_xfm_cfg_dict"]
     apply_xfm_cfg          = t2["apply_xfm_cfg"]
+
+    # Wire Tab 1 directory reader into Tab 2's Load Cases button
+    def _get_tab1_dirs_for_t2() -> list[str]:
+        raw  = text_box.get("1.0", "end").strip()
+        return [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
+
+    t2["_get_tab1_dirs"][0] = _get_tab1_dirs_for_t2
+    # Auto-populate cases on startup if saved selection exists
+    if settings.get("transform", {}).get("case_selection"):
+        t2["_on_load_cases"]()
 
     # -- Full-config helpers (used by config save/load in tab1) ----------------
     def _current_cfg() -> dict:
@@ -207,8 +243,9 @@ def run_gui() -> None:
     t1["_xfm_cfg_fn"][0] = _cfg_dispatch
 
     # -- Run Both + Stop buttons -----------------------------------------------
-    _stop_event    = threading.Event()
-    _active_workers = [0]
+    _stop_event       = threading.Event()
+    _active_proc      = [0]   # processing workers running
+    _active_xfm       = [0]   # transform workers running
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=(4, 10))
@@ -231,24 +268,42 @@ def run_gui() -> None:
 
     stop_btn.configure(command=on_stop)
 
-    def _set_busy():
+    def _set_busy(mode: str = "both") -> None:
+        """mode: 'proc' | 'xfm' | 'both' — which pane(s) to clear."""
         _stop_event.clear()
-        _log_lines.clear()
         _run_start_time[0] = time.strftime("%Y-%m-%d_%H-%M-%S")
         stop_btn.configure(state="normal", text="Stop")
-        for b in _all_run_btns:
-            b.configure(state="disabled")
-        log_box.configure(state="normal")
-        log_box.delete("1.0", "end")
-        log_box.configure(state="disabled")
+        # Disable only the button(s) being started; Run Both always disabled while anything runs
+        run_both_btn.configure(state="disabled")
+        if mode in ("proc", "both"):
+            tab1_run_btn.configure(state="disabled")
+            _log_lines_proc.clear()
+            log_box_proc.configure(state="normal")
+            log_box_proc.delete("1.0", "end")
+            log_box_proc.configure(state="disabled")
+        if mode in ("xfm", "both"):
+            tab2_run_btn.configure(state="disabled")
+            _log_lines_xfm.clear()
+            log_box_xfm.configure(state="normal")
+            log_box_xfm.delete("1.0", "end")
+            log_box_xfm.configure(state="disabled")
 
-    def _on_worker_done():
-        _active_workers[0] -= 1
-        if _active_workers[0] > 0:
+    def _on_proc_done() -> None:
+        _active_proc[0] = max(0, _active_proc[0] - 1)
+        if _active_proc[0] == 0:
+            tab1_run_btn.configure(state="normal")
+        _finish_if_idle()
+
+    def _on_xfm_done() -> None:
+        _active_xfm[0] = max(0, _active_xfm[0] - 1)
+        if _active_xfm[0] == 0:
+            tab2_run_btn.configure(state="normal")
+        _finish_if_idle()
+
+    def _finish_if_idle() -> None:
+        if _active_proc[0] > 0 or _active_xfm[0] > 0:
             return
-        _active_workers[0] = 0
-        for b in _all_run_btns:
-            b.configure(state="normal")
+        run_both_btn.configure(state="normal")
         stop_btn.configure(state="disabled", text="Stop")
         out_folder = output_folder_var.get().strip() or str(
             Path(__file__).resolve().parent / "output")
@@ -257,30 +312,32 @@ def run_gui() -> None:
             out_path.mkdir(parents=True, exist_ok=True)
             ts    = _run_start_time[0] or time.strftime("%Y-%m-%d_%H-%M-%S")
             fname = f"{out_path.name}_{ts}.log"
+            all_lines = (["=== Processing ==="] + _log_lines_proc +
+                         ["", "=== Transform ==="] + _log_lines_xfm)
             with open(out_path / fname, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(_log_lines))
-            log(f"Log saved to:\n  {out_path / fname}")
+                fh.write("\n".join(all_lines))
+            log_proc(f"Log saved to:\n  {out_path / fname}")
         except Exception as e:
-            log(f"[WARN] Could not save log: {e}")
+            log_proc(f"[WARN] Could not save log: {e}")
 
     # -- Launch helpers --------------------------------------------------------
     def _launch_processing(cfg: dict) -> None:
         def worker():
             try:
-                run_processing(cfg, log, _stop_event)
+                run_processing(cfg, log_proc, _stop_event)
             finally:
-                root.after(0, _on_worker_done)
-        _active_workers[0] += 1
+                root.after(0, _on_proc_done)
+        _active_proc[0] += 1
         threading.Thread(target=worker, daemon=True).start()
 
     def _launch_transform(input_dirs: list, xfm_params: dict, out_folder: str) -> None:
         def worker():
             try:
                 run_transform(input_dirs=input_dirs, xfm_params=xfm_params,
-                              output_folder=out_folder, log=log, stop_event=_stop_event)
+                              output_folder=out_folder, log=log_xfm, stop_event=_stop_event)
             finally:
-                root.after(0, _on_worker_done)
-        _active_workers[0] += 1
+                root.after(0, _on_xfm_done)
+        _active_xfm[0] += 1
         threading.Thread(target=worker, daemon=True).start()
 
     def _get_input_dirs() -> list[str] | None:
@@ -301,26 +358,30 @@ def run_gui() -> None:
             log('[!] No geometry loaded - please click "Load Geometry" before running.')
             return
         save_settings(cfg)
-        _set_busy()
+        _set_busy("proc")
         _launch_processing(cfg)
 
     def on_run_transform():
-        input_dirs = _get_input_dirs()
-        if input_dirs is None:
-            return
         xfm_params = get_transform_params()
         if xfm_params is None:
             return
+        input_dirs = xfm_params.pop("_selected_dirs", [])
+        if not input_dirs:
+            messagebox.showwarning("No cases selected",
+                                   "Select at least one case in the Cases section.")
+            return
         save_settings(_current_cfg())
-        _set_busy()
+        _set_busy("xfm")
         _launch_transform(input_dirs, xfm_params, output_folder_var.get())
 
     def on_run_both():
-        input_dirs = _get_input_dirs()
-        if input_dirs is None:
-            return
         xfm_params = get_transform_params()
         if xfm_params is None:
+            return
+        xfm_input_dirs = xfm_params.pop("_selected_dirs", [])
+        if not xfm_input_dirs:
+            messagebox.showwarning("No cases selected",
+                                   "Select at least one case in the Cases section.")
             return
         cfg = _current_cfg()
         if not cfg["input_dirs"]:
@@ -330,9 +391,9 @@ def run_gui() -> None:
             log('[!] No geometry loaded - please click "Load Geometry" before running.')
             return
         save_settings(cfg)
-        _set_busy()
+        _set_busy("both")
         _launch_processing(cfg)
-        _launch_transform(input_dirs, xfm_params, output_folder_var.get())
+        _launch_transform(xfm_input_dirs, xfm_params, output_folder_var.get())
 
     tab1_run_btn.configure(command=on_run_processing)
     tab2_run_btn.configure(command=on_run_transform)

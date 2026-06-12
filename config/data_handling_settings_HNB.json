@@ -1,0 +1,42 @@
+{
+  "input_dirs": [
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFFC",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFHC",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFTC",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_HFHC"
+  ],
+  "output_folder": "D:/attelnd/Value_extract/RESULTS_HNB",
+  "pattern": "smoothed_results_*.vtp",
+  "name_filter": "CONNECTING_DUCT",
+  "proximity_radius": 0.03,
+  "components": {
+    "CONNECTING_DUCT": {
+      "smooth_iterations": 1,
+      "smooth_mode": "auto",
+      "spike_sigma": 2.0,
+      "proximity_radius": 0.03,
+      "smooth_spikes": true,
+      "mult_factor": 1.0,
+      "save_power_density": true,
+      "save_total_power": true
+    }
+  },
+  "transform": {
+    "preset": "HNB1 \u2192 Tokamak",
+    "unit": "m",
+    "output_unit": "m",
+    "angle_deg": "-79.543",
+    "dx": "-0.57723",
+    "dy": "32.385248",
+    "dz": "1.453462",
+    "pattern": "smoothed_results_*.vtp",
+    "name_filter": "CONNECTING_DUCT",
+    "export_geom": true,
+    "export_area": true,
+    "export_power": true,
+    "export_pload": true,
+    "mult": "1.0",
+    "ignore_zeros": true,
+    "case_selection": []
+  }
+}

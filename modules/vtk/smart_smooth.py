@@ -30,6 +30,7 @@ from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 
 from modules.core.settings import (
     ARRAY_NAME, FEATURE_ANGLE, SPIKE_SIGMA, MIN_NEIGHBORS, SMOOTH_K_RING,
+    SPIKE_RATIO, EDGE_TOP_PERCENTILE,
 )
 from modules.vtk.smoothing import _build_active_csr
 
@@ -93,68 +94,6 @@ def _k_ring_cells(
     return visited
 
 
-# ── Per-candidate edge / spike classification ─────────────────────────────────
-
-def _classify_candidate(
-        src: vtk.vtkPolyData,
-        k_ring_cell_ids: np.ndarray,
-        k_ring_pt_ids: np.ndarray,
-        edge_pt_ids_arr: np.ndarray,
-        feature_angle: float,
-) -> str:
-    """Return 'edge' or 'spike' for a single candidate cell.
-
-    Two-level check:
-    1. Boundary check (no VTK, pure numpy):
-       if any point in the k-ring matches a known mesh boundary/feature-edge
-       point (from the precomputed cache), classify as 'edge'.
-    2. Local feature-edge check (vtkExtractCells + vtkFeatureEdges on tiny patch):
-       if the small patch contains an internal feature edge at `feature_angle`,
-       classify as 'edge'.
-    Otherwise 'spike'.
-    """
-    # Level 1 — fast boundary check via cached edge point IDs
-    if (len(edge_pt_ids_arr) > 0
-            and np.intersect1d(k_ring_pt_ids, edge_pt_ids_arr,
-                               assume_unique=True).size > 0):
-        return "edge"
-
-    # Level 2 — local feature-edge check on extracted patch
-    id_list = vtk.vtkIdList()
-    for cid in k_ring_cell_ids.tolist():
-        id_list.InsertNextId(int(cid))
-
-    extractor = vtk.vtkExtractCells()
-    extractor.SetInputData(src)
-    extractor.SetCellList(id_list)
-    extractor.Update()
-    patch = extractor.GetOutput()
-
-    if patch.GetNumberOfPoints() == 0:
-        return "spike"
-
-    # vtkExtractCells outputs vtkUnstructuredGrid; vtkFeatureEdges needs vtkPolyData.
-    geom_filter = vtk.vtkGeometryFilter()
-    geom_filter.SetInputData(patch)
-    geom_filter.Update()
-    patch_poly = geom_filter.GetOutput()
-
-    fe = vtk.vtkFeatureEdges()
-    fe.SetInputData(patch_poly)
-    fe.BoundaryEdgesOff()      # boundary of the global mesh already handled above
-    fe.FeatureEdgesOn()
-    fe.SetFeatureAngle(feature_angle)
-    fe.NonManifoldEdgesOff()
-    fe.ManifoldEdgesOff()
-    fe.ColoringOff()
-    fe.Update()
-
-    if fe.GetOutput().GetNumberOfPoints() > 0:
-        return "edge"
-
-    return "spike"
-
-
 # ── Main smart-smooth entry point ─────────────────────────────────────────────
 
 def smart_smooth_auto(
@@ -163,11 +102,13 @@ def smart_smooth_auto(
         stop_event=None,
         geo_cache: dict | None = None,
         spike_sigma: float = SPIKE_SIGMA,
+        spike_ratio: float = SPIKE_RATIO,
         min_neighbors: int = MIN_NEIGHBORS,
         k_ring: int = SMOOTH_K_RING,
         feature_angle: float = FEATURE_ANGLE,
         dilation_rings: int = 1,
         proximity_radius: float = 0.0,
+        smooth_spikes: bool = False,
 ) -> vtk.vtkPolyData | None:
     """Smart per-candidate smoothing: local z-score + local edge classification.
 
@@ -181,12 +122,25 @@ def smart_smooth_auto(
     stop_event     : threading.Event; checked between phases
     geo_cache      : dict from precompute_smooth_geometry() — must contain
                      conn, offs, pt_cell_offsets, sorted_cell_ids, edge_pt_ids_arr
-    spike_sigma    : local z-score threshold for candidate detection
+    spike_sigma    : local z-score threshold (cell must exceed
+                     local_mean + spike_sigma * local_std).  Acts as a cheap
+                     first-pass pre-filter before the ratio check.
+    spike_ratio    : ratio filter threshold.  When > 1.0, a candidate must also
+                     satisfy val > max(nbr_vals) * spike_ratio.  Gradient cells
+                     are only slightly above their peak neighbour (ratio ≈ 1) so
+                     they are eliminated; true isolated needles have ratio >> 1.
+                     Set to 0.0 to disable (sigma-only, legacy behaviour).
+                     Typical values: 1.5 – 3.0.
     min_neighbors  : minimum neighbors for local stats to be meaningful
-    k_ring         : topological radius for classification patch
-    feature_angle  : angle (degrees) for vtkFeatureEdges feature detection
+    k_ring         : topological radius for the k-ring BFS patch (used for
+                     edge-point lookup, not vtkFeatureEdges)
+    feature_angle  : reserved; no longer used since Level-2 vtkFeatureEdges
+                     was removed (precompute already covers all feature edges)
     dilation_rings : BFS rings by which edge-classified candidates are expanded
     proximity_radius: unused in AUTO mode (k-ring replaces spatial proximity)
+    smooth_spikes  : if True, spike-classified candidates (not near any edge
+                     point) are also smoothed.  If False (default), only
+                     edge-classified candidates (+ dilation) are smoothed.
     """
     def _cancelled() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -219,45 +173,147 @@ def smart_smooth_auto(
                                     np.array([], dtype=np.int64))
     n_pts_cache     = len(pt_cell_offsets) - 1
 
-    # ── Phase A: candidate detection via local z-score ────────────────────────
+    # ── Phase A: candidate detection via local z-score (fully vectorised) ───────
+    # All neighbor lookups use the cached CSR topology arrays (conn, offs,
+    # pt_cell_offsets, sorted_cell_ids) — zero VTK GetCellPoints/GetPointCells
+    # calls on src.  For a 26 M-cell mesh with 288 K nonzero cells this reduces
+    # Phase A from ~80 s (Python VTK loop) to <1 s (numpy bincount).
     nonzero_ids = np.nonzero(raw_vals)[0].astype(np.int64)
     print(f"  [AUTO] Checking {len(nonzero_ids):,} non-zero cells "
           f"out of {num_cells:,} total.")
 
-    pt_ids_tmp   = vtk.vtkIdList()
-    neighbor_ids = vtk.vtkIdList()
     candidates: list[int] = []
 
-    for cell_id in nonzero_ids.tolist():
-        if _cancelled():
-            return None
-        # Collect point-connected neighbor values using VTK API
-        # (cheaper than CSR slice for the small set of nonzero cells)
-        src.GetCellPoints(cell_id, pt_ids_tmp)
-        nbr_vals: list[float] = []
-        for p_idx in range(pt_ids_tmp.GetNumberOfIds()):
-            p_id = pt_ids_tmp.GetId(p_idx)
-            if p_id >= n_pts_cache:
+    if len(nonzero_ids) > 0 and len(offs) >= num_cells + 1:
+        # 1. Flat array of point IDs for all nonzero cells
+        nz_s      = offs[nonzero_ids]
+        nz_e      = offs[nonzero_ids + 1]
+        nz_sz     = (nz_e - nz_s).astype(np.int64)
+        tot_p     = int(nz_sz.sum())
+        cum_nz    = np.empty(len(nonzero_ids) + 1, dtype=np.int64)
+        cum_nz[0] = 0
+        np.cumsum(nz_sz, out=cum_nz[1:])
+        loc_p     = (np.arange(tot_p, dtype=np.int64)
+                     - np.repeat(cum_nz[:-1], nz_sz))
+        pts_flat  = conn[np.repeat(nz_s, nz_sz) + loc_p]
+        nz_of_p   = np.repeat(np.arange(len(nonzero_ids), dtype=np.int64), nz_sz)
+
+        # 2. Keep only points within the cached mesh range
+        ok       = pts_flat < n_pts_cache
+        pts_ok   = pts_flat[ok]
+        nz_ok    = nz_of_p[ok]
+
+        # 3. Neighbor cell IDs for each valid point
+        p_s      = pt_cell_offsets[pts_ok]
+        p_e      = pt_cell_offsets[pts_ok + 1]
+        p_sz     = (p_e - p_s).astype(np.int64)
+        tot_n    = int(p_sz.sum())
+        cum_p    = np.empty(len(pts_ok) + 1, dtype=np.int64)
+        cum_p[0] = 0
+        np.cumsum(p_sz, out=cum_p[1:])
+        loc_n    = (np.arange(tot_n, dtype=np.int64)
+                    - np.repeat(cum_p[:-1], p_sz))
+        nbr_c    = sorted_cell_ids[np.repeat(p_s, p_sz) + loc_n].astype(np.int64)
+        nz_of_n  = np.repeat(nz_ok, p_sz)
+        self_c   = nonzero_ids[nz_of_n]
+
+        # 4. Remove self-connections
+        keep     = nbr_c != self_c
+        nbr_c    = nbr_c[keep]
+        nz_of_n  = nz_of_n[keep]
+
+        # 5. Per-nonzero-cell neighbor statistics via bincount (O(N))
+        N        = len(nonzero_ids)
+        nbr_v    = raw_vals[nbr_c]
+        cnt      = np.bincount(nz_of_n, minlength=N).astype(np.float64)
+        sm1      = np.bincount(nz_of_n, weights=nbr_v,    minlength=N)
+        sm2      = np.bincount(nz_of_n, weights=nbr_v**2, minlength=N)
+        del nbr_c, nz_of_n, self_c, keep, nbr_v, pts_flat, nz_of_p, pts_ok, nz_ok
+
+        # 6. Flag candidates where val > local_mean + sigma * local_std
+        enough   = cnt >= min_neighbors
+        safe_c   = np.where(cnt > 0, cnt, 1.0)
+        mu       = np.where(enough, sm1 / safe_c, 0.0)
+        var      = np.maximum(np.where(enough, sm2 / safe_c - mu**2, 0.0), 0.0)
+        sig_a    = np.sqrt(var)
+        cv       = raw_vals[nonzero_ids]
+        flagged  = enough & (sig_a >= 1e-12) & (cv > mu + spike_sigma * sig_a)
+        candidates = nonzero_ids[flagged].tolist()
+        del cnt, sm1, sm2, enough, mu, var, sig_a, cv
+
+    elif len(nonzero_ids) > 0:
+        # Fallback: sequential VTK path (mesh size mismatch — should not occur)
+        _pt  = vtk.vtkIdList()
+        _nb  = vtk.vtkIdList()
+        for cell_id in nonzero_ids.tolist():
+            if _cancelled():
+                return None
+            src.GetCellPoints(cell_id, _pt)
+            nbr_v_fb: list[float] = []
+            for p_idx in range(_pt.GetNumberOfIds()):
+                p_id = _pt.GetId(p_idx)
+                if p_id >= n_pts_cache:
+                    continue
+                src.GetPointCells(p_id, _nb)
+                for c_idx in range(_nb.GetNumberOfIds()):
+                    ncid = _nb.GetId(c_idx)
+                    if ncid != cell_id:
+                        nbr_v_fb.append(raw_vals[ncid])
+            if len(nbr_v_fb) < min_neighbors:
                 continue
-            src.GetPointCells(p_id, neighbor_ids)
-            for c_idx in range(neighbor_ids.GetNumberOfIds()):
-                ncid = neighbor_ids.GetId(c_idx)
-                if ncid != cell_id:
-                    nbr_vals.append(raw_vals[ncid])
-
-        if len(nbr_vals) < min_neighbors:
-            continue
-
-        loc_mean = float(np.mean(nbr_vals))
-        loc_std  = float(np.std(nbr_vals))
-        if loc_std < 1e-12:
-            continue
-
-        if raw_vals[cell_id] > loc_mean + spike_sigma * loc_std:
+            lm = float(np.mean(nbr_v_fb))
+            ls = float(np.std(nbr_v_fb))
+            if ls < 1e-12 or raw_vals[cell_id] <= lm + spike_sigma * ls:
+                continue
             candidates.append(cell_id)
 
     print(f"  [AUTO] {len(candidates):,} outlier candidate(s) "
           f"at sigma={spike_sigma}.")
+
+    # ── Phase A-bis: edge-direct pass (secondary, vectorised) ─────────────────
+    # Cells touching a known edge point that sit in the global top
+    # (100 - EDGE_TOP_PERCENTILE) % of non-zero values are added as candidates
+    # regardless of local z-score.  This robustly catches tight clusters of
+    # 2-3 adjacent hot cells at an edge where the elevated neighbours inflate
+    # each other's local mean/std, defeating the sigma threshold alone.
+    # True spikes near low-valued cells are already caught by Phase A (sigma).
+    edge_direct_set: set[int] = set()   # tracked separately to skip Phase B
+    if len(edge_pt_ids_arr) > 0 and len(nonzero_ids) > 0:
+        ep = edge_pt_ids_arr[edge_pt_ids_arr < n_pts_cache]
+        if len(ep) > 0:
+            p_starts = pt_cell_offsets[ep]
+            p_ends   = pt_cell_offsets[ep + 1]
+            p_sizes  = (p_ends - p_starts).astype(np.int64)
+            total_p  = int(p_sizes.sum())
+            if total_p > 0:
+                cum_p    = np.empty(len(ep) + 1, dtype=np.int64)
+                cum_p[0] = 0
+                np.cumsum(p_sizes, out=cum_p[1:])
+                local_p  = (np.arange(total_p, dtype=np.int64)
+                            - np.repeat(cum_p[:-1], p_sizes))
+                edge_adj = np.unique(
+                    sorted_cell_ids[
+                        np.repeat(p_starts, p_sizes) + local_p
+                    ].astype(np.int64)
+                )
+                # Global percentile threshold over all non-zero cells
+                global_thresh = float(np.percentile(raw_vals[nonzero_ids],
+                                                     EDGE_TOP_PERCENTILE))
+                # Edge-adjacent, non-zero, above global threshold
+                edge_adj_nz   = edge_adj[raw_vals[edge_adj] > 0.0]
+                edge_direct   = edge_adj_nz[raw_vals[edge_adj_nz] >= global_thresh]
+                if len(edge_direct) > 0:
+                    cand_set = set(candidates)
+                    n_before = len(candidates)
+                    for cid in edge_direct.tolist():
+                        if cid not in cand_set:
+                            candidates.append(cid)
+                            cand_set.add(cid)
+                        edge_direct_set.add(cid)
+                    n_added = len(candidates) - n_before
+                    if n_added > 0:
+                        print(f"  [AUTO] Edge-direct: +{n_added:,} candidate(s) "
+                              f"above {EDGE_TOP_PERCENTILE:.4g}th percentile.")
 
     if not candidates:
         print("  [AUTO] No candidates found — output unchanged.")
@@ -267,14 +323,26 @@ def smart_smooth_auto(
         return None
 
     # ── Phase B: classify each candidate — edge or spike ─────────────────────
+    # pt_ids_tmp / neighbor_ids only used if spike_ratio > 1.0 (ratio filter)
+    pt_ids_tmp   = vtk.vtkIdList()
+    neighbor_ids = vtk.vtkIdList()
     edge_candidates: list[int] = []
     spike_candidates: list[int] = []
 
+    # Boolean mask for O(1) per-point edge lookup: avoids sorting 2.2 M-element
+    # edge_pt_ids_arr on every candidate.  Falls back to intersect1d if not cached.
+    edge_pt_mask: np.ndarray | None = geo_cache.get("edge_pt_mask")
+
     for cell_id in candidates:
+        # Edge-direct: adjacent to edge point by construction → "edge" instantly
+        if cell_id in edge_direct_set:
+            edge_candidates.append(cell_id)
+            continue
+
+        # Level-1: k-ring point check against edge_pt_mask / edge_pt_ids_arr
         patch_cells = _k_ring_cells(
             cell_id, k_ring, conn, offs, pt_cell_offsets, sorted_cell_ids
         )
-        # Collect unique point IDs for all patch cells
         pt_starts  = offs[patch_cells]
         pt_ends    = offs[patch_cells + 1]
         pt_sizes   = (pt_ends - pt_starts).astype(np.int64)
@@ -289,16 +357,43 @@ def smart_smooth_auto(
                       - np.repeat(cum_pts[:-1], pt_sizes))
         patch_pts  = np.unique(conn[np.repeat(pt_starts, pt_sizes) + local_pts])
 
-        label = _classify_candidate(
-            src, patch_cells, patch_pts, edge_pt_ids_arr, feature_angle
-        )
-        if label == "edge":
-            edge_candidates.append(cell_id)
+        # Boolean mask lookup: O(n_patch) vectorized gather vs O(n_edge × log n_edge)
+        # intersect1d sort+merge.  For 2.2 M edge points and 15 K candidates this
+        # saves ~90 % of the per-candidate classification time.
+        if edge_pt_mask is not None:
+            valid_pp = patch_pts[patch_pts < len(edge_pt_mask)]
+            is_near_edge = bool(edge_pt_mask[valid_pp].any()) if len(valid_pp) else False
         else:
-            spike_candidates.append(cell_id)
+            is_near_edge = (len(edge_pt_ids_arr) > 0
+                            and np.intersect1d(patch_pts, edge_pt_ids_arr,
+                                               assume_unique=True).size > 0)
 
+        if is_near_edge:
+            edge_candidates.append(cell_id)
+            continue
+
+        # Level-1 failed — candidate is not near any edge point → spike.
+        if spike_ratio > 1.0:
+            cell_val = raw_vals[cell_id]
+            src.GetCellPoints(cell_id, pt_ids_tmp)
+            nbr_max_vals: list[float] = []
+            for p_idx in range(pt_ids_tmp.GetNumberOfIds()):
+                p_id = pt_ids_tmp.GetId(p_idx)
+                if p_id < n_pts_cache:
+                    src.GetPointCells(p_id, neighbor_ids)
+                    for c_idx in range(neighbor_ids.GetNumberOfIds()):
+                        ncid = neighbor_ids.GetId(c_idx)
+                        if ncid != cell_id:
+                            nbr_max_vals.append(raw_vals[ncid])
+            if nbr_max_vals:
+                max_nbr = float(max(nbr_max_vals))
+                if max_nbr > 0.0 and cell_val <= max_nbr * spike_ratio:
+                    continue   # gradient cell — skip
+        spike_candidates.append(cell_id)
+
+    ratio_tag = f", ratio>{spike_ratio}" if spike_ratio > 1.0 else ""
     print(f"  [AUTO] Classification: {len(edge_candidates):,} edge, "
-          f"{len(spike_candidates):,} spike.")
+          f"{len(spike_candidates):,} spike{ratio_tag}.")
 
     if _cancelled():
         return None
@@ -362,7 +457,13 @@ def smart_smooth_auto(
 
     # ── Phase D: build active set and smooth ──────────────────────────────────
     spike_arr  = np.array(sorted(set(spike_candidates)), dtype=np.int64)
-    active_cells = np.union1d(edge_candidates_final, spike_arr)
+    if smooth_spikes:
+        active_cells = np.union1d(edge_candidates_final, spike_arr)
+    else:
+        active_cells = edge_candidates_final
+        if len(spike_arr) > 0:
+            print(f"  [AUTO] {len(spike_arr):,} spike candidate(s) detected but "
+                  f"not smoothed (smooth_spikes=off).")
 
     # Zero-filter: skip cells permanently zero in this file
     active_cells = active_cells[raw_vals[active_cells] != 0.0]
@@ -402,10 +503,12 @@ def smart_smooth_auto(
     new_arr.SetName(ARRAY_NAME)
     out.GetCellData().RemoveArray(ARRAY_NAME)
     out.GetCellData().AddArray(new_arr)
+    out.GetCellData().SetActiveScalars(ARRAY_NAME)
 
     n_edge_f  = int(np.sum(np.isin(active_cells, edge_candidates_final)))
-    n_spike_f = int(np.sum(np.isin(active_cells, spike_arr)))
-    print(f"  [AUTO] Done: {n_edge_f:,} edge + {n_spike_f:,} spike = "
+    n_spike_f = int(np.sum(np.isin(active_cells, spike_arr))) if smooth_spikes else 0
+    spike_tag = f" + {n_spike_f:,} spike" if smooth_spikes else ""
+    print(f"  [AUTO] Done: {n_edge_f:,} edge{spike_tag} = "
           f"{len(active_cells):,} cells smoothed "
           f"({n_iter} pass(es)).")
     return out

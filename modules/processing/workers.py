@@ -79,18 +79,23 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
     This combined worker is the memory-efficient path: polydata is loaded,
     processed, and freed entirely within this function.  Only scalar metadata
-    (floats, paths) is returned to the caller, so the main process never
-    accumulates more than n_workers mesh objects in RAM simultaneously.
+    (floats, paths, precomputed camera dicts) is returned to the caller.
+
+    Camera precomputation (vtkCellLocator + multi-ray cast) is done here while
+    polydata is already in memory, so _render_subprocess can skip rebuilding the
+    locator on the large mesh — the most expensive part of snapshot rendering.
 
     Returns (filepath, output_name, case, scenario, max_before, max_after,
-             total_pwr, smooth_vtp_path) or an Exception or None if stopped.
-    smooth_vtp_path is None when n_iter==0 or snapshots are not needed.
+             total_pwr, smooth_vtp_path,
+             pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
+    or an Exception or None if stopped.
     """
     try:
         import hashlib
         (fp, on, c, s,
          n_iter, stop_event, geo_cache,
          smooth_mode, spike_sigma, proximity_radius,
+         smooth_spikes, spike_ratio,
          needs_snap, snap_dir_str, pid) = args
 
         if stop_event is not None and stop_event.is_set():
@@ -98,6 +103,14 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
         # ── Load ──────────────────────────────────────────────────────────────
         polydata   = read_vtp(str(fp))
+        # Build VTK's internal cell-links structure explicitly before entering
+        # the thread pool's shared execution.  vtkPolyData.GetPointCells() builds
+        # this structure lazily on first call via a non-reentrant C++ lock; if 12
+        # threads all call GetPointCells() on their respective polydata objects
+        # simultaneously, they can deadlock on that lock.  Building it here
+        # (sequentially within each thread, before any concurrent VTK calls)
+        # ensures every subsequent GetPointCells() call is a fast O(1) lookup.
+        polydata.BuildLinks()
         max_before = find_max(polydata, ARRAY_NAME)
         total_pwr  = find_total(polydata, POWER_ARRAY)
 
@@ -109,38 +122,66 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             del polydata
             return None
 
-        # ── Smooth ────────────────────────────────────────────────────────────
-        smooth_vtp_path: str | None = None
+        # ── Smooth + precompute camera ─────────────────────────────────────────
+        smooth_vtp_path: str | None  = None
+        pre_orig_cam:    dict | None = None
+        pre_smooth_cam:  dict | None = None
+        max_pwr_orig:    float | None = None
+        max_pwr_smooth:  float | None = None
+
         if n_iter > 0:
             if smooth_mode == "auto":
                 smoothed = smart_smooth_auto(
                     polydata, n_iter=n_iter, stop_event=stop_event,
                     geo_cache=geo_cache, spike_sigma=spike_sigma,
+                    spike_ratio=spike_ratio,
                     proximity_radius=proximity_radius,
+                    smooth_spikes=smooth_spikes,
                 )
             else:
                 smoothed = apply_edge_smooth(
                     polydata, n_iter=n_iter,
                     stop_event=stop_event, geo_cache=geo_cache,
                 )
-            del polydata   # free original immediately after smoothing
+
+            # Precompute camera from original while still in memory.
+            # Camera placement uses vtkCellLocator (expensive on large meshes);
+            # doing it here avoids rebuilding the locator in the render process.
+            if needs_snap:
+                pre_orig_cam = precompute_snapshot(polydata, ARRAY_NAME)
+                max_pwr_orig = find_max(polydata, POWER_ARRAY)
+
+            del polydata   # free original immediately after smoothing + precompute
             if smoothed is None:
                 return None
+
             max_after = find_max(smoothed, ARRAY_NAME)
 
-            # ── Write temp VTP ─────────────────────────────────────────────
             if needs_snap:
+                # BuildLinks() needed so _robust_normal → GetPointCells works
+                # correctly inside precompute_snapshot (smoothed is a fresh
+                # DeepCopy that hasn't built its internal link structure yet).
+                smoothed.BuildLinks()
+                pre_smooth_cam = precompute_snapshot(smoothed, ARRAY_NAME)
+                max_pwr_smooth = find_max(smoothed, POWER_ARRAY)
                 h   = hashlib.md5(str(fp).encode()).hexdigest()[:12]
                 tmp = Path(snap_dir_str) / f"_tmp_smooth_{pid}_{h}.vtp"
                 tmp.parent.mkdir(parents=True, exist_ok=True)
                 _write_vtp(smoothed, tmp)
                 smooth_vtp_path = str(tmp)
-            del smoothed   # free smoothed immediately after writing
+
+            del smoothed   # free after precompute + write
         else:
+            if needs_snap:
+                pre_orig_cam   = precompute_snapshot(polydata, ARRAY_NAME)
+                max_pwr_orig   = find_max(polydata, POWER_ARRAY)
+                pre_smooth_cam = pre_orig_cam   # snapshot_only: same file for both
+                max_pwr_smooth = max_pwr_orig
             del polydata
             max_after = max_before
 
-        return fp, on, c, s, max_before, max_after, total_pwr, smooth_vtp_path
+        return (fp, on, c, s, max_before, max_after, total_pwr, smooth_vtp_path,
+                pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
 
     except Exception as exc:
         return exc
@@ -197,30 +238,44 @@ def _render_subprocess(args: tuple) -> tuple:
     On Windows, vtkRenderWindow uses WGL which acquires a per-process GPU driver
     lock via wglMakeCurrent().  Running in separate processes gives each its own
     GPU context so DWM compositing of the Tkinter window is never blocked.
+
+    pre_orig_cam / pre_smooth_cam contain centroid, normal, cam_pos, diag and
+    max_val precomputed in the smoothing worker (polydata already in memory there).
+    This avoids rebuilding vtkCellLocator on the 26 M-cell mesh here.
     """
     try:
         (orig_vtp_path, smooth_vtp_path, out_paths,
-         array_name, snapshot_only, label, mult_factor) = args
+         array_name, snapshot_only, label, mult_factor,
+         pre_orig_cam, pre_smooth_cam,
+         max_pwr_orig, max_pwr_smooth, total_pwr_raw) = args
         t0 = time.perf_counter()
+
+        _total_pwr = (total_pwr_raw * mult_factor) if total_pwr_raw is not None else None
+
+        def _build_pre(cam: dict | None, max_pwr_raw: float | None) -> dict | None:
+            """Build precomputed dict from cached camera data + scaled max_val.
+
+            cam contains geometry-only fields (centroid, normal, cam_pos, diag,
+            max_cid) from ARRAY_NAME.  max_val is overridden with the appropriate
+            scaled value for the current array_name.
+            """
+            if cam is None:
+                return None
+            if array_name == ARRAY_NAME:
+                # Power density: max_val from the same array used for camera
+                return {**cam, "max_val": cam["max_val"] * mult_factor}
+            else:
+                # Total power: camera from pwr_density, max_val from POWER_ARRAY
+                mv = (max_pwr_raw * mult_factor
+                      if max_pwr_raw is not None
+                      else cam["max_val"] * mult_factor)
+                return {**cam, "max_val": mv}
+
+        pre_orig   = _build_pre(pre_orig_cam,   max_pwr_orig)
+        pre_smooth = _build_pre(pre_smooth_cam, max_pwr_smooth)
 
         pd_orig = read_vtp(str(orig_vtp_path))
         pd_orig = _scale_polydata_array(pd_orig, array_name, mult_factor)
-
-        # Camera: always use Power_Density_W_m2 for focal-point placement so both
-        # render types look from the same angle (beam hot-spot, not edge cell).
-        def _make_precomputed(pd_scaled, pd_raw_for_cam):
-            pre_arr = precompute_snapshot(pd_scaled, array_name)
-            if array_name == ARRAY_NAME or pre_arr is None:
-                return pre_arr
-            pre_cam = precompute_snapshot(pd_raw_for_cam, ARRAY_NAME)
-            if pre_cam is None:
-                return pre_arr
-            return {**pre_cam, "max_val": pre_arr["max_val"]}
-
-        pd_orig_raw = read_vtp(str(orig_vtp_path))
-        _raw_total  = find_total(pd_orig_raw, POWER_ARRAY)
-        _total_pwr  = (_raw_total * mult_factor) if _raw_total is not None else None
-        pre_orig    = _make_precomputed(pd_orig, pd_orig_raw)
 
         if snapshot_only:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
@@ -228,12 +283,8 @@ def _render_subprocess(args: tuple) -> tuple:
         else:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
                               vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
-            pd_smooth     = read_vtp(str(smooth_vtp_path))
-            pd_smooth_raw = pd_smooth
-            pd_smooth     = _scale_polydata_array(pd_smooth, array_name, mult_factor)
-            if pd_smooth is pd_smooth_raw:
-                pd_smooth_raw = read_vtp(str(smooth_vtp_path))
-            pre_smooth = _make_precomputed(pd_smooth, pd_smooth_raw)
+            pd_smooth = read_vtp(str(smooth_vtp_path))
+            pd_smooth = _scale_polydata_array(pd_smooth, array_name, mult_factor)
             save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
                               vmax=None, precomputed=pre_smooth, total_power_W=_total_pwr)
 

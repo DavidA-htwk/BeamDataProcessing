@@ -86,6 +86,14 @@ def precompute_smooth_geometry(
     # fast boundary-edge classification without re-running global vtkFeatureEdges.
     edge_pt_ids_arr = np.fromiter(edge_pt_ids, dtype=np.int64)
 
+    # Boolean mask equivalent of edge_pt_ids_arr: O(1) per-point lookup vs O(log N)
+    # intersect1d sort+merge.  Stored in cache so Phase B never re-sorts the 2.2 M
+    # entry array per candidate.
+    edge_pt_mask = np.zeros(n_pts, dtype=bool)
+    if len(edge_pt_ids_arr) > 0:
+        valid_ep = edge_pt_ids_arr[edge_pt_ids_arr < n_pts]
+        edge_pt_mask[valid_ep] = True
+
     # Step 3 — flag ALL cells owning an edge point. Pure topology, no scalars.
     # Skipped in AUTO mode: smart_smooth_auto finds its own candidates via
     # local z-score and never uses edge_cells_arr.
@@ -130,6 +138,7 @@ def precompute_smooth_geometry(
               "sorted_cell_ids": None,
               "proximity_radius": proximity_radius,
               "edge_pt_ids_arr": edge_pt_ids_arr,
+              "edge_pt_mask":    edge_pt_mask,
               "edge_cell_arr": np.array([], dtype=np.int64),
               "csr_offsets": None, "csr_nbr_ids": None}
     if len(edge_cells_arr) == 0 and not skip_edge_expansion:
@@ -228,6 +237,7 @@ def precompute_smooth_geometry(
         "sorted_cell_ids":  sorted_cell_ids,
         "proximity_radius": proximity_radius,
         "edge_pt_ids_arr":  edge_pt_ids_arr,
+        "edge_pt_mask":     edge_pt_mask,
         # backward-compat keys
         "edge_cell_list":   edge_cells_arr.tolist(),
         "edge_cell_arr":    edge_cells_arr,
