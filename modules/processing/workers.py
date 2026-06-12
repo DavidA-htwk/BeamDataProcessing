@@ -277,6 +277,20 @@ def _render_subprocess(args: tuple) -> tuple:
         pd_orig = read_vtp(str(orig_vtp_path))
         pd_orig = _scale_polydata_array(pd_orig, array_name, mult_factor)
 
+        # For total power: the precomputed max_val comes from the worker's
+        # find_max() on the unscaled mesh.  Re-derive it from the actual
+        # polydata here to ensure it matches whatever was scaled/read back,
+        # and also correctly sets the active scalar so the mapper uses
+        # POWER_ARRAY for coloring (not the last-set active ARRAY_NAME).
+        if array_name != ARRAY_NAME:
+            _arr = pd_orig.GetCellData().GetArray(array_name)
+            if _arr is not None:
+                from vtk.util.numpy_support import vtk_to_numpy as _v2n
+                _actual_max = float(_v2n(_arr).max())
+                if pre_orig is not None:
+                    pre_orig = {**pre_orig, "max_val": _actual_max}
+                pd_orig.GetCellData().SetActiveScalars(array_name)
+
         if snapshot_only:
             save_max_snapshot(pd_orig, array_name, Path(out_paths[0]),
                               vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
@@ -285,6 +299,14 @@ def _render_subprocess(args: tuple) -> tuple:
                               vmax=None, precomputed=pre_orig, total_power_W=_total_pwr)
             pd_smooth = read_vtp(str(smooth_vtp_path))
             pd_smooth = _scale_polydata_array(pd_smooth, array_name, mult_factor)
+            if array_name != ARRAY_NAME:
+                _arr_s = pd_smooth.GetCellData().GetArray(array_name)
+                if _arr_s is not None:
+                    from vtk.util.numpy_support import vtk_to_numpy as _v2n_s
+                    _actual_max_s = float(_v2n_s(_arr_s).max())
+                    if pre_smooth is not None:
+                        pre_smooth = {**pre_smooth, "max_val": _actual_max_s}
+                    pd_smooth.GetCellData().SetActiveScalars(array_name)
             save_max_snapshot(pd_smooth, array_name, Path(out_paths[1]),
                               vmax=None, precomputed=pre_smooth, total_power_W=_total_pwr)
 
