@@ -403,7 +403,9 @@ def smart_smooth_auto(
     out.GetCellData().RemoveArray(ARRAY_NAME)
     out.GetCellData().AddArray(new_arr)
 
-    n_edge_f = int(len(edge_candidates_final))
-    n_spike  = int(len(spike_arr))
-    print(f"  [AUTO] Done: {n_edge_f:,} edge cell(s), {n_spike:,} spike cell(s) smoothed.")
+    n_edge_f  = int(np.sum(np.isin(active_cells, edge_candidates_final)))
+    n_spike_f = int(np.sum(np.isin(active_cells, spike_arr)))
+    print(f"  [AUTO] Done: {n_edge_f:,} edge + {n_spike_f:,} spike = "
+          f"{len(active_cells):,} cells smoothed "
+          f"({n_iter} pass(es)).")
     return out

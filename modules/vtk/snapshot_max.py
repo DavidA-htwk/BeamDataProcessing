@@ -7,13 +7,18 @@ vtkPolyData.
 Camera strategy
 ~~~~~~~~~~~~~~~
 1. Find the cell with the maximum value of *array_name*.
-2. Compute that cell's centroid and surface normal (via vtkPolyDataNormals).
-3. Cast a ray from the centroid along the normal up to 2 x bounding-box
-   diagonal.  If it hits geometry (an opposing wall - e.g. the far side of
-   a duct) the camera is placed 1 % before the hit point, sitting inside
-   the cavity with the max cell in direct view.  If the ray hits nothing the
-   camera falls back to the default 1.5 x diagonal distance.
-4. Set the view-up vector to whichever world axis is least parallel to the
+2. Compute a robust surface normal via area-weighted averaging over the
+   1-ring neighbourhood of the max cell (not just the single-cell cross
+   product), giving a stable direction even for small or near-degenerate
+   triangles.
+3. Cast rays from a disk of sample points centred on the cell centroid
+   (centre + 8 equally-spaced ring points, radius ≈ 2 % of bounding-box
+   diagonal), all parallel to the normal.  The camera is placed at the
+   *minimum* hit distance across all rays.  This prevents a single central
+   ray from slipping through a narrow gap between wall panels — any nearby
+   wall blocked by a ring ray constrains the camera.
+4. If no ray hits anything, fall back to 1.5 × bounding-box diagonal.
+5. Set the view-up vector to whichever world axis is least parallel to the
    normal (to avoid gimbal lock).
 
 The polydata is coloured by *array_name* using a blue->red (cool-to-warm)
@@ -74,7 +79,7 @@ def precompute_snapshot(
     max_val = float(vals[max_cid])
 
     centroid = _cell_centroid(polydata, max_cid)
-    normal   = _cell_normal(polydata, max_cid)
+    normal   = _robust_normal(polydata, max_cid)
     diag     = _bbox_diagonal(polydata)
     cam_pos  = _camera_pos_with_raycast(polydata, centroid, normal, diag, diag * 1.5)
 
@@ -136,7 +141,7 @@ def save_max_snapshot(
         max_cid = int(np.argmax(vals))
         max_val = float(vals[max_cid])
         cell_centroid = _cell_centroid(polydata, max_cid)
-        cell_normal   = _cell_normal(polydata, max_cid)
+        cell_normal   = _robust_normal(polydata, max_cid)
         _cam_pos_pre  = None
         diag          = None
 
@@ -450,6 +455,52 @@ def _cell_centroid(polydata: vtk.vtkPolyData, cid: int) -> tuple[float, float, f
     return cx, cy, cz
 
 
+def _robust_normal(
+    polydata: vtk.vtkPolyData,
+    cid: int,
+) -> tuple[float, float, float]:
+    """
+    Return an area-weighted average normal over the 1-ring neighbourhood of
+    *cid* (the cell itself plus all cells sharing a point with it).
+
+    Area-weighting is implicit: the cross product magnitude equals twice the
+    triangle area, so larger triangles contribute proportionally more to the
+    averaged direction.  This gives a smooth, outlier-resistant normal even
+    when the max cell is a small or nearly-degenerate triangle.
+    """
+    pt_ids  = vtk.vtkIdList()
+    nbr_ids = vtk.vtkIdList()
+    pts     = polydata.GetPoints()
+
+    polydata.GetCellPoints(cid, pt_ids)
+    seen: set = {cid}
+    ring_cids: list[int] = [cid]
+    for k in range(pt_ids.GetNumberOfIds()):
+        polydata.GetPointCells(pt_ids.GetId(k), nbr_ids)
+        for m in range(nbr_ids.GetNumberOfIds()):
+            ncid = nbr_ids.GetId(m)
+            if ncid not in seen:
+                seen.add(ncid)
+                ring_cids.append(ncid)
+
+    nx_sum = ny_sum = nz_sum = 0.0
+    cell_pt_ids = vtk.vtkIdList()
+    for c in ring_cids:
+        polydata.GetCellPoints(c, cell_pt_ids)
+        if cell_pt_ids.GetNumberOfIds() < 3:
+            continue
+        p0 = np.asarray(pts.GetPoint(cell_pt_ids.GetId(0)))
+        p1 = np.asarray(pts.GetPoint(cell_pt_ids.GetId(1)))
+        p2 = np.asarray(pts.GetPoint(cell_pt_ids.GetId(2)))
+        n  = np.cross(p1 - p0, p2 - p0)   # magnitude = 2 × area → natural weighting
+        nx_sum += n[0]; ny_sum += n[1]; nz_sum += n[2]
+
+    length = (nx_sum**2 + ny_sum**2 + nz_sum**2) ** 0.5
+    if length < 1e-10:
+        return _cell_normal(polydata, cid)   # degenerate neighbourhood — fall back
+    return (nx_sum / length, ny_sum / length, nz_sum / length)
+
+
 def _cell_normal(polydata: vtk.vtkPolyData, cid: int) -> tuple[float, float, float]:
     """
     Return the surface normal of *cid* via cross product of two cell edges.
@@ -526,52 +577,72 @@ def _camera_pos_with_raycast(
     normal: tuple[float, float, float],
     diag: float,
     default_dist: float,
+    n_sample: int = 8,
+    sample_radius_frac: float = 0.02,
 ) -> tuple[float, float, float]:
     """
-    Cast a ray from *focal* along *normal* up to 2 × diag.
-    If it hits geometry (a wall on the other side) place the camera 1 %
-    before that hit so it ends up inside the cavity looking at the cell.
-    If no blocker is found, use *default_dist*.
+    Multi-ray disk sampling camera placement.
+
+    Casts rays from the centroid plus *n_sample* equally-spaced points on a
+    circle of radius ``diag * sample_radius_frac`` centred on *focal*, all
+    parallel to *normal*.  Takes the **minimum** hit distance across all rays
+    so that a wall close to any sample point blocks the camera — preventing
+    a single on-axis ray from slipping through a narrow gap between panels.
+
+    Falls back to *default_dist* if no ray hits anything.
     """
     nx, ny, nz = normal
-    ray_end = (focal[0] + nx * diag * 2,
-               focal[1] + ny * diag * 2,
-               focal[2] + nz * diag * 2)
+    n_arr      = np.array([nx, ny, nz], dtype=float)
+    foc_arr    = np.array(focal,        dtype=float)
+    offset     = diag * 0.01       # small push above the surface
+    ray_reach  = diag * 2.0        # maximum ray length
 
+    # ── Build tangent frame in the plane perpendicular to normal ──────────────
+    # Pick the world axis least parallel to normal as the first tangent seed.
+    t_seed = np.array([1.0, 0.0, 0.0]) if abs(nx) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = t_seed - np.dot(t_seed, n_arr) * n_arr
+    t1_len = float(np.linalg.norm(t1))
+    t1 = t1 / t1_len if t1_len > 1e-10 else np.array([0.0, 1.0, 0.0])
+    t2 = np.cross(n_arr, t1)
+
+    # ── Sample origins: centre + ring ─────────────────────────────────────────
+    radius = diag * sample_radius_frac
+    origins = [foc_arr]   # centre ray always included
+    for i in range(n_sample):
+        angle = 2.0 * math.pi * i / n_sample
+        origins.append(foc_arr + radius * (math.cos(angle) * t1
+                                           + math.sin(angle) * t2))
+
+    # ── Ray-cast ──────────────────────────────────────────────────────────────
     locator = vtk.vtkCellLocator()
     locator.SetDataSet(polydata)
     locator.BuildLocator()
 
+    hit_dists: list[float] = []
     t       = vtk.reference(0.0)
     x       = [0.0, 0.0, 0.0]
     pcoords = [0.0, 0.0, 0.0]
     sub_id  = vtk.reference(0)
     cell_id = vtk.reference(-1)
 
-    # Small offset so the ray starts just above the source cell surface
-    offset = diag * 0.01
-    ray_start = (focal[0] + nx * offset,
-                 focal[1] + ny * offset,
-                 focal[2] + nz * offset)
+    for sp in origins:
+        ray_start = (sp + n_arr * offset).tolist()
+        ray_end   = (sp + n_arr * ray_reach).tolist()
+        hit = locator.IntersectWithLine(
+            ray_start, ray_end, 1e-6, t, x, pcoords, sub_id, cell_id,
+        )
+        if hit:
+            dist = float(np.linalg.norm(np.array(x) - foc_arr))
+            hit_dists.append(dist)
 
-    hit = locator.IntersectWithLine(
-        list(ray_start), list(ray_end),
-        1e-6,
-        t, x, pcoords, sub_id, cell_id,
-    )
+    if not hit_dists:
+        return (focal[0] + nx * default_dist,
+                focal[1] + ny * default_dist,
+                focal[2] + nz * default_dist)
 
-    if hit:
-        # Distance from focal to the blocking wall.
-        # Place camera right at the wall (clamped to at least offset from focal)
-        # so it is as far from the hot cell as possible.
-        hit_dist = ((x[0] - focal[0])**2 +
-                    (x[1] - focal[1])**2 +
-                    (x[2] - focal[2])**2) ** 0.5
-        cam_dist = max(hit_dist, offset * 2)
-        return (focal[0] + nx * cam_dist,
-                focal[1] + ny * cam_dist,
-                focal[2] + nz * cam_dist)
-
-    return (focal[0] + nx * default_dist,
-            focal[1] + ny * default_dist,
-            focal[2] + nz * default_dist)
+    # Minimum hit distance — catches the closest wall even if some rays slip
+    # through gaps between panels.
+    cam_dist = max(float(min(hit_dists)), offset * 2)
+    return (focal[0] + nx * cam_dist,
+            focal[1] + ny * cam_dist,
+            focal[2] + nz * cam_dist)
