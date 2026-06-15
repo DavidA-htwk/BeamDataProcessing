@@ -155,7 +155,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             if smoothed is None:
                 return None
 
-            max_after = find_max(smoothed, ARRAY_NAME)
+            max_after      = find_max(smoothed, ARRAY_NAME)
+            total_pwr_after = find_total(smoothed, POWER_ARRAY)
 
             if needs_snap:
                 # BuildLinks() needed so _robust_normal → GetPointCells works
@@ -178,9 +179,10 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                 pre_smooth_cam = pre_orig_cam   # snapshot_only: same file for both
                 max_pwr_smooth = max_pwr_orig
             del polydata
-            max_after = max_before
+            max_after       = max_before
+            total_pwr_after = total_pwr  # no smoothing applied
 
-        return (fp, on, c, s, max_before, max_after, total_pwr, smooth_vtp_path,
+        return (fp, on, c, s, max_before, max_after, total_pwr, total_pwr_after, smooth_vtp_path,
                 pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
 
     except Exception as exc:

@@ -27,7 +27,4 @@ desktop.ini
 # Excel / temp
 ~$*.xlsx
 *.xlsb
-config/data_handling_settings_CDL.json
-config/data_handling_settings_DNB.json
-config/data_handling_settings_DNB_specific.json
-config/data_handling_settings_DNB_view.json
+config/

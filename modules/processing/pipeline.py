@@ -107,7 +107,6 @@ def run_processing(
 
     snap_dir = out_dir / "snapshots"
     csv_path = out_dir / "max_comparison_batch.csv"
-    pwr_path = out_dir / "total_power_batch.csv"
 
     # Purge any _tmp_smooth_* VTP files left by a previous crashed/stopped run.
     if snap_dir.exists():
@@ -118,14 +117,13 @@ def run_processing(
                 pass
 
     total_files = 0
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh, \
-         open(pwr_path, "w", newline="", encoding="utf-8") as fh_pwr:
-        writer     = csv.writer(fh)
-        writer_pwr = csv.writer(fh_pwr)
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
         writer.writerow(["case", "scenario", "filename",
                          "max_before", "max_after", "delta", "discrepancy",
+                         "total_power_before", "total_power_after",
+                         "total_power_delta", "total_power_discrepancy",
                          "snapshot"])
-        writer_pwr.writerow(["case", "scenario", "filename", "total_power_W"])
 
         # ── Phase 0: Collect all matching file paths (no loading) ────────────
         all_meta: list[tuple] = []   # (filepath, output_name, case, scenario)
@@ -250,7 +248,7 @@ def run_processing(
                     if isinstance(result, Exception):
                         log(f"  [{done}/{n_all}] ERROR: {result}"); continue
 
-                    fp, on, c, s, mb, ma, tp, smooth_path, \
+                    fp, on, c, s, mb, ma, tp, tp_after, smooth_path, \
                     pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
 
@@ -279,12 +277,20 @@ def run_processing(
                     else:
                         _snap_rel = ""
                     _snap_link = f'=HYPERLINK("{_snap_rel}","Open")' if _snap_rel else ""
+                    tpbs_str = f"{tp       * mult:.6g}" if tp       is not None else ""
+                    tpas_str = f"{tp_after * mult:.6g}" if tp_after is not None else ""
+                    if tp is not None and tp_after is not None:
+                        tp_delta     = abs(tp_after * mult - tp * mult)
+                        tp_delta_str = f"{tp_delta:.6g}"
+                        tp_disc_str  = "YES" if tp_delta > 0.0 else "NO"
+                    else:
+                        tp_delta_str = ""
+                        tp_disc_str  = ""
                     writer.writerow([c, s, fp.name,
                                      f"{mbs:.6g}", f"{mas:.6g}",
                                      f"{delta:.6g}", "YES" if delta > 0.0 else "NO",
+                                     tpbs_str, tpas_str, tp_delta_str, tp_disc_str,
                                      _snap_link])
-                    if tp is not None:
-                        writer_pwr.writerow([c, s, fp.name, f"{tp * mult:.6g}"])
                     total_files += 1
 
                     if ni > 0:
@@ -375,7 +381,6 @@ def run_processing(
     else:
         log(f"Processed {total_files} file(s) across {len(input_dirs)} folder(s).")
     log(f"CSV log saved to:\n  {csv_path}")
-    log(f"Power CSV saved to:\n  {pwr_path}")
 
 
 # ── Transform pipeline ────────────────────────────────────────────────────────

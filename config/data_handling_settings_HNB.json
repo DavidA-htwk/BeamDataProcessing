@@ -7,10 +7,20 @@
   ],
   "output_folder": "D:/attelnd/Value_extract/RESULTS_HNB",
   "pattern": "smoothed_results_*.vtp",
-  "name_filter": "CONNECTING_DUCT",
+  "name_filter": "CONNECTING_DUCT,DUCT_LINER",
   "proximity_radius": 0.03,
   "components": {
     "CONNECTING_DUCT": {
+      "smooth_iterations": 1,
+      "smooth_mode": "auto",
+      "spike_sigma": 2.0,
+      "proximity_radius": 0.03,
+      "smooth_spikes": true,
+      "mult_factor": 1.0,
+      "save_power_density": true,
+      "save_total_power": true
+    },
+    "DUCT_LINER": {
       "smooth_iterations": 1,
       "smooth_mode": "auto",
       "spike_sigma": 2.0,
