@@ -44,13 +44,6 @@ SPIKE_RATIO    = 0.0
 # 99.9 → top 0.1 % of non-zero values; for 300 k non-zero cells that is ~300 seeds.
 EDGE_TOP_PERCENTILE = 99.9
 
-# Absolute path to the ParaView executable used to generate "Open in ParaView"
-# launcher scripts alongside the CSV.  Set to "" to disable launcher generation.
-PARAVIEW_EXE: str = (
-    r"C:\users\attelnd\Work Folders\Desktop"
-    r"\ParaView-6.1.0-Windows-Python3.12-msvc2017-AMD64\bin\paraview.exe"
-)
-
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"
 

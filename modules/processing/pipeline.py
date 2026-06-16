@@ -20,7 +20,6 @@ from pathlib import Path
 
 from modules.core.settings import (
     ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, _safe_float,
-    PARAVIEW_EXE,
 )
 from modules.vtk.vtk_io import _write_vtp, read_vtp
 from modules.core.path_utils import extract_case_scenario
@@ -54,7 +53,7 @@ def run_processing(
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
                    smooth_mode, spike_sigma, proximity_radius, smooth_spikes,
-                   spike_ratio)."""
+                   spike_ratio, save_smooth_vtp)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -70,6 +69,7 @@ def run_processing(
                     float(comp_cfg.get("proximity_radius", proximity_radius)),
                     bool(comp_cfg.get("smooth_spikes", False)),
                     float(comp_cfg.get("spike_ratio", SPIKE_RATIO)),
+                    bool(comp_cfg.get("save_smooth_vtp", False)),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -83,9 +83,10 @@ def run_processing(
                 float(c.get("proximity_radius", proximity_radius)),
                 bool(c.get("smooth_spikes", False)),
                 float(c.get("spike_ratio", SPIKE_RATIO)),
+                bool(c.get("save_smooth_vtp", False)),
             )
         return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "auto",
-                SPIKE_SIGMA, proximity_radius, False, SPIKE_RATIO)
+                SPIKE_SIGMA, proximity_radius, False, SPIKE_RATIO, False)
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -106,11 +107,9 @@ def run_processing(
     out_dir    = Path(cfg["output_folder"]) if cfg["output_folder"] else script_dir / "output"
     os.makedirs(out_dir, exist_ok=True)
 
-    snap_dir     = out_dir / "snapshots"
-    csv_path     = out_dir / "max_comparison_batch.csv"
-    launchers_dir = out_dir / "vtp_launchers"
-    if PARAVIEW_EXE:
-        launchers_dir.mkdir(parents=True, exist_ok=True)
+    snap_dir   = out_dir / "snapshots"
+    smooth_dir = out_dir / "post_smoothed"
+    csv_path   = out_dir / "max_comparison_batch.csv"
 
     # Purge any _tmp_smooth_* VTP files left by a previous crashed/stopped run.
     if snap_dir.exists():
@@ -127,7 +126,7 @@ def run_processing(
                          "max_before", "max_after", "delta", "discrepancy",
                          "total_power_before", "total_power_after",
                          "total_power_delta", "total_power_discrepancy",
-                         "snapshot", "paraview"])
+                         "snapshot", "paraview", "post_smoothed_vtp"])
 
         # ── Phase 0: Collect all matching file paths (no loading) ────────────
         all_meta: list[tuple] = []   # (filepath, output_name, case, scenario)
@@ -230,6 +229,8 @@ def run_processing(
              needs_snap_map[fp],          # write temp VTP?
              str(snap_dir),
              pid,
+             _snap_map[fp][9],            # save_smooth_vtp
+             str(smooth_dir),             # permanent smooth VTP root
             )
             for fp, on, c, s in all_meta
         ]
@@ -253,6 +254,7 @@ def run_processing(
                         log(f"  [{done}/{n_all}] ERROR: {result}"); continue
 
                     fp, on, c, s, mb, ma, tp, tp_after, smooth_path, \
+                    saved_smooth_path, \
                     pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
 
@@ -281,19 +283,9 @@ def run_processing(
                     else:
                         _snap_rel = ""
                     _snap_link = f'=HYPERLINK("{_snap_rel}","Open")' if _snap_rel else ""
-                    # ParaView launcher: write a per-file .bat and link to it
-                    _pv_link = ""
-                    if PARAVIEW_EXE:
-                        _bat_name = f"{c}__{s}__{fp.stem}.bat"
-                        _bat_path = launchers_dir / _bat_name
-                        try:
-                            _bat_path.write_text(
-                                f'@echo off\n"{PARAVIEW_EXE}" "{fp}"\n',
-                                encoding="ascii",
-                            )
-                            _pv_link = f'=HYPERLINK("vtp_launchers\\{_bat_name}","Open")'
-                        except OSError:
-                            pass
+                    # Plain absolute paths — copy-paste into Explorer address bar to open
+                    _pv_path       = str(fp) if fp else ""
+                    _smooth_vtp_path = saved_smooth_path if saved_smooth_path else ""
                     tpbs_str = f"{tp       * mult:.6g}" if tp       is not None else ""
                     tpas_str = f"{tp_after * mult:.6g}" if tp_after is not None else ""
                     if tp is not None and tp_after is not None:
@@ -307,7 +299,7 @@ def run_processing(
                                      f"{mbs:.6g}", f"{mas:.6g}",
                                      f"{delta:.6g}", "YES" if delta > 0.0 else "NO",
                                      tpbs_str, tpas_str, tp_delta_str, tp_disc_str,
-                                     _snap_link, _pv_link])
+                                     _snap_link, _pv_path, _smooth_vtp_path])
                     total_files += 1
 
                     if ni > 0:

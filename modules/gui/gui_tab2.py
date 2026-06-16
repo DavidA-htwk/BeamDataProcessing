@@ -143,7 +143,18 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     case_lframe.pack(fill="both", expand=True, padx=10, pady=(8, 4))
 
     # Injected after build — set by Data_handling.py so Load Cases reads Tab 1.
-    _get_tab1_dirs: list = [None]   # [0] = callable() → list[str]
+    _get_tab1_dirs:    list = [None]   # [0] = callable() → list[str]
+    _get_output_folder: list = [None]  # [0] = callable() → str  (smoothed-source mode)
+
+    # Source toggle — choose between original input folders or saved post-smoothed VTPs
+    src_frame = tk.Frame(case_lframe)
+    src_frame.pack(fill="x", pady=(0, 4))
+    tk.Label(src_frame, text="Source:", anchor="w", width=8).pack(side="left")
+    xfm_source_var = tk.StringVar(value=xfm_s.get("xfm_source", "original"))
+    tk.Radiobutton(src_frame, text="Original input folders",
+                   variable=xfm_source_var, value="original").pack(side="left", padx=(0, 16))
+    tk.Radiobutton(src_frame, text="Smoothed VTPs from Data Handling Processing (output/smoothed/)",
+                   variable=xfm_source_var, value="smoothed").pack(side="left")
 
     # Load Cases button + status
     load_case_btn_frame = tk.Frame(case_lframe)
@@ -217,16 +228,47 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
 
     def on_load_cases():
-        get_dirs = _get_tab1_dirs[0]
-        if get_dirs is None:
-            messagebox.showwarning("Not ready",
-                                   "Tab 1 not yet initialised. Please wait.")
-            return
-        dirs = get_dirs()
-        if not dirs:
-            messagebox.showwarning("No directories",
-                                   "Please add at least one folder in the Tab 1 directory list.")
-            return
+        source = xfm_source_var.get()
+        dirs: list[str] = []
+
+        if source == "smoothed":
+            get_out = _get_output_folder[0]
+            if get_out is None:
+                messagebox.showwarning("Not ready", "Output folder not yet available.")
+                return
+            out_raw = get_out().strip()
+            smooth_root = (Path(out_raw) / "post_smoothed") if out_raw else None
+            if not smooth_root or not smooth_root.exists():
+                load_case_status.set("  Post-smoothed folder not found.")
+                messagebox.showwarning(
+                    "Post-smoothed folder not found",
+                    f"The post-smoothed VTP folder does not exist yet:\n\n"
+                    f"  {smooth_root}\n\n"
+                    "Run Processing with 'Save VTP' enabled first.",
+                )
+                return
+            # Enumerate 2nd-level subdirs: post_smoothed/{output_name}/{case_dir}
+            for output_dir in sorted(smooth_root.iterdir()):
+                if output_dir.is_dir():
+                    for case_dir in sorted(output_dir.iterdir()):
+                        if case_dir.is_dir():
+                            dirs.append(str(case_dir))
+            if not dirs:
+                load_case_status.set("  Post-smoothed folder exists but is empty.")
+                return
+        else:
+            get_dirs = _get_tab1_dirs[0]
+            if get_dirs is None:
+                messagebox.showwarning("Not ready",
+                                       "Tab 1 not yet initialised. Please wait.")
+                return
+            dirs = get_dirs()
+            if not dirs:
+                messagebox.showwarning(
+                    "No directories",
+                    "Please add at least one folder in the Tab 1 directory list.")
+                return
+
         cases_by_output: dict[str, list[Path]] = {}
         n_total = 0
         for d in dirs:
@@ -240,8 +282,9 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                 n_total += len(subs)
         _build_case_grid(cases_by_output)
         if n_total:
+            src_label = "post-smoothed" if source == "smoothed" else "input"
             load_case_status.set(
-                f"  {len(cases_by_output)} output(s), {n_total} case(s) found")
+                f"  {len(cases_by_output)} output(s), {n_total} case(s) found  [{src_label}]")
         else:
             load_case_status.set("  No subfolders found in the given paths.")
 
@@ -352,6 +395,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
 
     def get_xfm_cfg_dict() -> dict:
         return {
+            "xfm_source":     xfm_source_var.get(),
             "preset":         xfm_preset_var.get(),
             "unit":           xfm_unit_var.get(),
             "output_unit":    xfm_out_unit_var.get(),
@@ -373,6 +417,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     def apply_xfm_cfg(xfm: dict) -> None:
         if not xfm:
             return
+        xfm_source_var.set(xfm.get("xfm_source", "original"))
         _p = xfm.get("preset", "")
         if _p not in _trf.TRANSFORM_PRESETS:
             _p = list(_trf.TRANSFORM_PRESETS.keys())[0]
@@ -418,10 +463,12 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         "get_transform_params": get_transform_params,
         "get_xfm_cfg_dict":    get_xfm_cfg_dict,
         "apply_xfm_cfg":       apply_xfm_cfg,
-        "_get_tab1_dirs":      _get_tab1_dirs,   # caller injects Tab 1 dir getter
-        "_on_load_cases":      on_load_cases,    # caller can trigger after wiring
+        "_get_tab1_dirs":      _get_tab1_dirs,      # caller injects Tab 1 dir getter
+        "_get_output_folder":  _get_output_folder,  # caller injects output folder getter
+        "_on_load_cases":      on_load_cases,       # caller can trigger after wiring
         "_saved_sel":          _saved_sel,
         "case_checks":         case_checks,
+        "xfm_source_var":      xfm_source_var,
     }
 
     # ── Preset selector ───────────────────────────────────────────────────────

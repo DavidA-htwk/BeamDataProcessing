@@ -98,7 +98,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     comp_grid.pack(fill="x")
 
     _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
-            "Prox (edge)", "Mult", "Spk", "Pwr density", "Total pwr"]
+            "Prox (edge)", "Mult", "Spk", "Pwr density", "Total pwr", "Save post-smooth VTP"]
     for _c, _txt in enumerate(_HDR):
         tk.Label(comp_grid, text=_txt, anchor="w",
                  fg="#444444", font=("Segoe UI", 8, "bold"),
@@ -154,6 +154,9 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                        variable=snap_pd_var).grid(row=r, column=8, sticky="w")
         tk.Checkbutton(comp_grid, text="Total pwr",
                        variable=snap_tp_var).grid(row=r, column=9, sticky="w")
+        save_vtp_var = tk.BooleanVar(value=bool(saved.get("save_smooth_vtp", False)))
+        tk.Checkbutton(comp_grid, text="Save post-smooth VTP",
+                       variable=save_vtp_var).grid(row=r, column=10, sticky="w")
 
         def _update_mode_state(*_,
                                _menu=mode_menu, _sig=sigma_entry,
@@ -185,7 +188,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
             "spike_sigma_var":   spike_sigma_var,   "prox_var":         prox_var,
             "smooth_spikes_var": smooth_spikes_var, "mult_var":         mult_var,
             "snap_pd_var":       snap_pd_var,        "snap_tp_var":      snap_tp_var,
-            "count_var":         count_var,
+            "save_vtp_var":      save_vtp_var,       "count_var":        count_var,
         }
 
     def on_load_geometry():
@@ -199,6 +202,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
+                "save_smooth_vtp":    w["save_vtp_var"].get(),
             }
         raw  = text_box.get("1.0", "end").strip()
         dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
@@ -275,6 +279,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
+                "save_smooth_vtp":    w["save_vtp_var"].get(),
             }
             for name, w in comp_widgets.items()
         }

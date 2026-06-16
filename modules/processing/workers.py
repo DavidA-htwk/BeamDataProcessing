@@ -86,7 +86,7 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
     locator on the large mesh — the most expensive part of snapshot rendering.
 
     Returns (filepath, output_name, case, scenario, max_before, max_after,
-             total_pwr, smooth_vtp_path,
+             total_pwr, total_pwr_after, smooth_vtp_path, saved_smooth_path,
              pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
     or an Exception or None if stopped.
     """
@@ -96,7 +96,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
          n_iter, stop_event, geo_cache,
          smooth_mode, spike_sigma, proximity_radius,
          smooth_spikes, spike_ratio,
-         needs_snap, snap_dir_str, pid) = args
+         needs_snap, snap_dir_str, pid,
+         save_smooth_vtp, smooth_out_str) = args
 
         if stop_event is not None and stop_event.is_set():
             return None
@@ -123,11 +124,12 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             return None
 
         # ── Smooth + precompute camera ─────────────────────────────────────────
-        smooth_vtp_path: str | None  = None
-        pre_orig_cam:    dict | None = None
-        pre_smooth_cam:  dict | None = None
-        max_pwr_orig:    float | None = None
-        max_pwr_smooth:  float | None = None
+        smooth_vtp_path:   str | None  = None
+        saved_smooth_path: str | None  = None
+        pre_orig_cam:      dict | None = None
+        pre_smooth_cam:    dict | None = None
+        max_pwr_orig:      float | None = None
+        max_pwr_smooth:    float | None = None
 
         if n_iter > 0:
             if smooth_mode == "auto":
@@ -171,6 +173,14 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                 _write_vtp(smoothed, tmp)
                 smooth_vtp_path = str(tmp)
 
+            # Save a permanent post-smoothed VTP if requested
+            if save_smooth_vtp:
+                _perm_dir = Path(smooth_out_str) / on / c / s
+                _perm_dir.mkdir(parents=True, exist_ok=True)
+                _perm_path = _perm_dir / f"post_smooth__{fp.name}"
+                _write_vtp(smoothed, _perm_path)
+                saved_smooth_path = str(_perm_path)
+
             del smoothed   # free after precompute + write
         else:
             if needs_snap:
@@ -183,7 +193,7 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             total_pwr_after = total_pwr  # no smoothing applied
 
         return (fp, on, c, s, max_before, max_after, total_pwr, total_pwr_after, smooth_vtp_path,
-                pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
+                saved_smooth_path, pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
 
     except Exception as exc:
         return exc

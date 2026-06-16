@@ -197,6 +197,7 @@ def run_gui() -> None:
         return [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
 
     t2["_get_tab1_dirs"][0] = _get_tab1_dirs_for_t2
+    t2["_get_output_folder"][0] = lambda: output_folder_var.get().strip()
     # Auto-populate cases on startup if saved selection exists
     if settings.get("transform", {}).get("case_selection"):
         t2["_on_load_cases"]()
