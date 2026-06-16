@@ -81,7 +81,7 @@ def precompute_snapshot(
     centroid = _cell_centroid(polydata, max_cid)
     normal   = _robust_normal(polydata, max_cid)
     diag     = _bbox_diagonal(polydata)
-    cam_pos  = _camera_pos_with_raycast(polydata, centroid, normal, diag, diag * 1.5)
+    cam_pos  = _sphere_sample_camera_pos(polydata, centroid, normal, diag)
 
     return {
         "max_cid":  max_cid,
@@ -553,14 +553,21 @@ def _place_camera(
     if cam_pos_override is not None:
         cam_pos = cam_pos_override
     elif polydata is not None:
-        cam_pos = _camera_pos_with_raycast(polydata, focal, normal, diag, default_dist)
+        cam_pos = _sphere_sample_camera_pos(polydata, focal, normal, diag)
     else:
         cam_pos = (focal[0] + nx * default_dist,
                    focal[1] + ny * default_dist,
                    focal[2] + nz * default_dist)
 
-    axes = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
-    dot_abs = [abs(nx * ax[0] + ny * ax[1] + nz * ax[2]) for ax in axes]
+    # View-up: world axis least parallel to the actual camera direction.
+    # Use cam_pos rather than the surface normal — after sphere sampling they differ.
+    _cdir = np.array([cam_pos[0] - focal[0],
+                      cam_pos[1] - focal[1],
+                      cam_pos[2] - focal[2]], dtype=float)
+    _cl   = float(np.linalg.norm(_cdir))
+    _cdir = _cdir / _cl if _cl > 1e-10 else np.array([nx, ny, nz], dtype=float)
+    axes    = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    dot_abs = [abs(float(_cdir[0]*a[0] + _cdir[1]*a[1] + _cdir[2]*a[2])) for a in axes]
     view_up = axes[dot_abs.index(min(dot_abs))]
 
     camera = renderer.GetActiveCamera()
@@ -646,3 +653,105 @@ def _camera_pos_with_raycast(
     return (focal[0] + nx * cam_dist,
             focal[1] + ny * cam_dist,
             focal[2] + nz * cam_dist)
+
+
+def _fibonacci_sphere_dirs(n: int) -> list[tuple[float, float, float]]:
+    """Return *n* approximately uniformly-spaced directions on the unit sphere
+    using the Fibonacci / golden-angle spiral."""
+    golden = (1.0 + math.sqrt(5.0)) * 0.5
+    out: list[tuple[float, float, float]] = []
+    for i in range(n):
+        theta = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (i + 0.5) / n)))
+        phi   = 2.0 * math.pi * i / golden
+        out.append((
+            math.sin(theta) * math.cos(phi),
+            math.sin(theta) * math.sin(phi),
+            math.cos(theta),
+        ))
+    return out
+
+
+def _sphere_sample_camera_pos(
+    polydata: vtk.vtkPolyData,
+    focal:    tuple[float, float, float],
+    normal:   tuple[float, float, float],
+    diag:     float,
+    n_dirs:   int = 32,
+) -> tuple[float, float, float]:
+    """
+    Sphere-sampled camera placement.
+
+    Generates *n_dirs* candidate directions uniformly on the unit sphere via
+    the Fibonacci spiral.  Any candidate in the negative-normal hemisphere is
+    flipped, giving dense coverage of the outward-facing side.
+
+    Each candidate is scored by::
+
+        score = face_dot * space_score
+
+    where  face_dot    = dot(direction, surface_normal)  [prefer face-on view]
+           space_score = clamp(cam_dist / (0.5 * diag), 0, 1)
+                         [penalise directions with very little free space]
+
+    cam_dist is 85 % of the first wall hit along the candidate direction, or
+    1.5 * diag if no wall is found.
+
+    Falls back to the surface-normal direction if every candidate is degenerate.
+    """
+    foc_arr = np.array(focal,  dtype=float)
+    n_arr   = np.array(normal, dtype=float)
+
+    default_dist = diag * 1.5
+    offset       = diag * 0.005   # push off surface before casting
+    ray_reach    = diag * 3.0     # maximum outward ray length
+
+    locator = vtk.vtkCellLocator()
+    locator.SetDataSet(polydata)
+    locator.BuildLocator()
+
+    t_ref   = vtk.reference(0.0)
+    x_hit   = [0.0, 0.0, 0.0]
+    pcoords = [0.0, 0.0, 0.0]
+    sub_id  = vtk.reference(0)
+    cell_id = vtk.reference(-1)
+
+    best_score:   float = -1.0
+    best_cam_pos: tuple | None = None
+
+    for d_raw in _fibonacci_sphere_dirs(n_dirs):
+        d = np.asarray(d_raw, dtype=float)
+
+        # Flip to outward hemisphere so every candidate is face-on or better
+        face_dot = float(np.dot(d, n_arr))
+        if face_dot <= 0.0:
+            d        = -d
+            face_dot = -face_dot
+
+        ray_s = (foc_arr + d * offset).tolist()
+        ray_e = (foc_arr + d * ray_reach).tolist()
+
+        hit = locator.IntersectWithLine(
+            ray_s, ray_e, 1e-6, t_ref, x_hit, pcoords, sub_id, cell_id,
+        )
+
+        if hit:
+            wall_dist = float(np.linalg.norm(np.array(x_hit) - foc_arr))
+            cam_dist  = wall_dist * 0.85
+        else:
+            cam_dist = default_dist
+
+        # Reward directions with more free space; full credit at >= 0.5 * diag
+        space_score = min(1.0, cam_dist / (diag * 0.5))
+        score = face_dot * space_score
+
+        if score > best_score:
+            best_score   = score
+            best_cam_pos = tuple((foc_arr + d * cam_dist).tolist())
+
+    if best_cam_pos is None:
+        nx, ny, nz = normal
+        best_cam_pos = (focal[0] + nx * default_dist,
+                        focal[1] + ny * default_dist,
+                        focal[2] + nz * default_dist)
+
+    return best_cam_pos

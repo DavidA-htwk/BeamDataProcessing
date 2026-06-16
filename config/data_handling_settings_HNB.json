@@ -1,11 +1,11 @@
 {
   "input_dirs": [
-    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFFC",
-    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFHC",
-    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFTC",
-    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_HFHC"
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFFC_D",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFHC_D",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_FFTC_D",
+    "D:\\attelnd\\Beam_on_target\\BeamOnTarget_Branch\\BeamOnTarget\\OUTPUT_CDL_HFHC_D"
   ],
-  "output_folder": "D:/attelnd/Value_extract/RESULTS_HNB",
+  "output_folder": "D:/attelnd/Value_extract/RESULTS_HNB_1606",
   "pattern": "smoothed_results_*.vtp",
   "name_filter": "CONNECTING_DUCT,DUCT_LINER",
   "proximity_radius": 0.03,

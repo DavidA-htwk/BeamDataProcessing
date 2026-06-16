@@ -349,6 +349,33 @@ def run_gui() -> None:
         return dirs
 
     # -- Run callbacks ---------------------------------------------------------
+    def _resolve_out_path() -> Path:
+        """Resolve the output folder the same way the pipeline does."""
+        raw = output_folder_var.get().strip()
+        return Path(raw) if raw else Path(__file__).resolve().parent / "output"
+
+    def _confirm_overwrite() -> bool:
+        """Return True (proceed) or False (cancel).
+
+        Shows a yes/no dialog if the output folder already contains files so
+        the user can cancel before anything is overwritten.
+        """
+        out = _resolve_out_path()
+        if not out.exists():
+            return True
+        try:
+            has_files = any(p.is_file() for p in out.iterdir())
+        except OSError:
+            return True
+        if not has_files:
+            return True
+        return messagebox.askyesno(
+            "Output folder not empty",
+            f"The output folder already contains files:\n\n  {out}\n\n"
+            "Existing files may be overwritten.  Continue anyway?",
+            icon="warning",
+        )
+
     def on_run_processing():
         cfg = _current_cfg()
         if not cfg["input_dirs"]:
@@ -356,6 +383,8 @@ def run_gui() -> None:
             return
         if not comp_widgets:
             log('[!] No geometry loaded - please click "Load Geometry" before running.')
+            return
+        if not _confirm_overwrite():
             return
         save_settings(cfg)
         _set_busy("proc")
@@ -369,6 +398,8 @@ def run_gui() -> None:
         if not input_dirs:
             messagebox.showwarning("No cases selected",
                                    "Select at least one case in the Cases section.")
+            return
+        if not _confirm_overwrite():
             return
         save_settings(_current_cfg())
         _set_busy("xfm")
@@ -389,6 +420,8 @@ def run_gui() -> None:
             return
         if not comp_widgets:
             log('[!] No geometry loaded - please click "Load Geometry" before running.')
+            return
+        if not _confirm_overwrite():
             return
         save_settings(cfg)
         _set_busy("both")
