@@ -155,12 +155,14 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         tk.Checkbutton(comp_grid, text="Total pwr",
                        variable=snap_tp_var).grid(row=r, column=9, sticky="w")
         save_vtp_var = tk.BooleanVar(value=bool(saved.get("save_smooth_vtp", False)))
-        tk.Checkbutton(comp_grid, text="Save post-smooth VTP",
-                       variable=save_vtp_var).grid(row=r, column=10, sticky="w")
+        save_vtp_chk = tk.Checkbutton(comp_grid, text="Save post-smooth VTP",
+                                      variable=save_vtp_var)
+        save_vtp_chk.grid(row=r, column=10, sticky="w")
 
         def _update_mode_state(*_,
                                _menu=mode_menu, _sig=sigma_entry,
                                _prx=prox_entry_row, _spk=spk_chk,
+                               _svp=save_vtp_chk,
                                _sv=smooth_var, _mv=smooth_mode_var):
             n_iter = 0
             try:
@@ -172,12 +174,14 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 _sig.configure(state="disabled")
                 _prx.configure(state="disabled")
                 _spk.configure(state="disabled")
+                _svp.configure(state="disabled")
             else:
                 mode = _mv.get()
                 _menu.configure(state="normal")
                 _sig.configure(state="normal" if mode == "auto" else "disabled")
                 _prx.configure(state="normal" if mode == "edge" else "disabled")
                 _spk.configure(state="normal" if mode == "auto" else "disabled")
+                _svp.configure(state="normal")
 
         _update_mode_state()
         smooth_var.trace_add("write", _update_mode_state)

@@ -97,16 +97,43 @@ def precompute_smooth_geometry(
     # Step 3 — flag ALL cells owning an edge point. Pure topology, no scalars.
     # Skipped in AUTO mode: smart_smooth_auto finds its own candidates via
     # local z-score and never uses edge_cells_arr.
-    edge_cells_arr = np.array([], dtype=np.int64)
-    n_direct       = 0
-    conn           = None
-    offs           = None
+    edge_cells_arr   = np.array([], dtype=np.int64)
+    n_direct         = 0
+    conn             = None
+    offs             = None
+    cell_areas       = np.zeros(n_cells, dtype=np.float32)
+    sliver_threshold = 0.0
     if edge_pt_ids:
         # Always read conn/offs — Step 4 (CSR build) needs them regardless of mode.
         polys = src.GetPolys()
         if polys is not None and polys.GetNumberOfCells() > 0:
             conn = vtk_to_numpy(polys.GetConnectivityArray())
             offs = vtk_to_numpy(polys.GetOffsetsArray())
+            # Per-cell triangle area — vectorised, once per component.
+            # Used downstream to detect and correct degenerate sliver cells
+            # before any scalar processing (area < 1e-4 × median_area).
+            _pts_vtk = src.GetPoints()
+            if _pts_vtk is not None:
+                _pts_np = vtk_to_numpy(_pts_vtk.GetData()).reshape(-1, 3).astype(np.float64)
+                _csizes = np.diff(offs)
+                _tri    = np.where(_csizes == 3)[0]
+                if len(_tri) > 0:
+                    _ts    = offs[_tri]
+                    _v0    = _pts_np[conn[_ts]]
+                    _v1    = _pts_np[conn[_ts + 1]]
+                    _v2    = _pts_np[conn[_ts + 2]]
+                    _cr    = np.cross(_v1 - _v0, _v2 - _v0)
+                    _atri  = 0.5 * np.linalg.norm(_cr, axis=1)
+                    cell_areas[_tri] = _atri.astype(np.float32)
+                    _pos   = _atri[_atri > 0.0]
+                    if len(_pos) > 0:
+                        _med             = float(np.median(_pos))
+                        sliver_threshold = _med * 1e-4
+                        _log(f"    Cell areas: median={_med:.3e}, "
+                             f"sliver threshold={sliver_threshold:.3e} "
+                             f"({len(_tri):,} triangles)")
+                    del _pts_np, _csizes, _tri, _ts, _v0, _v1, _v2, _cr, _atri, _pos
+                del _pts_vtk
 
         if not skip_edge_expansion:
             _log(f"    Step 3/4: flagging edge cells (vectorized, {n_cells:,} cells)...")
@@ -132,15 +159,16 @@ def precompute_smooth_geometry(
     else:
         _log("    Step 3/4: skipped (no edge points found)")
 
-    _empty = {"edge_cells_arr": np.array([], dtype=np.int64), "edge_cell_list": [],
-              "cell_neighbours": {}, "n_cells": n_cells, "n_direct": 0,
-              "conn": None, "offs": None, "pt_cell_offsets": None,
-              "sorted_cell_ids": None,
+    _empty = {"edge_cells_arr":   np.array([], dtype=np.int64), "edge_cell_list": [],
+              "cell_neighbours":  {}, "n_cells": n_cells, "n_direct": 0,
+              "conn":             None, "offs": None, "pt_cell_offsets": None,
+              "sorted_cell_ids":  None,
               "proximity_radius": proximity_radius,
-              "edge_pt_ids_arr": edge_pt_ids_arr,
-              "edge_pt_mask":    edge_pt_mask,
-              "edge_cell_arr": np.array([], dtype=np.int64),
-              "csr_offsets": None, "csr_nbr_ids": None}
+              "edge_pt_ids_arr":  edge_pt_ids_arr,
+              "edge_pt_mask":     edge_pt_mask,
+              "edge_cell_arr":    np.array([], dtype=np.int64),
+              "csr_offsets":      None, "csr_nbr_ids": None,
+              "cell_areas":       cell_areas, "sliver_threshold": sliver_threshold}
     if len(edge_cells_arr) == 0 and not skip_edge_expansion:
         return _empty
 
@@ -238,6 +266,8 @@ def precompute_smooth_geometry(
         "proximity_radius": proximity_radius,
         "edge_pt_ids_arr":  edge_pt_ids_arr,
         "edge_pt_mask":     edge_pt_mask,
+        "cell_areas":       cell_areas,
+        "sliver_threshold": sliver_threshold,
         # backward-compat keys
         "edge_cell_list":   edge_cells_arr.tolist(),
         "edge_cell_arr":    edge_cells_arr,
@@ -479,6 +509,47 @@ def apply_edge_smooth(
             current_vals = next_vals
             if n_iter > 1:
                 print(f"  Smooth pass {iteration + 1}/{n_iter} done.")
+
+    # ── Sliver correction ────────────────────────────────────────────────────
+    # Area-weighted neighbor-mean replacement for degenerate near-zero-area
+    # triangles that produce physically incorrect power densities.
+    if (geo_cache is not None
+            and geo_cache.get("cell_areas") is not None
+            and float(geo_cache.get("sliver_threshold", 0.0)) > 0.0
+            and geo_cache.get("conn") is not None
+            and geo_cache.get("pt_cell_offsets") is not None):
+        _ar   = np.asarray(geo_cache["cell_areas"], dtype=np.float64)
+        _sthr = float(geo_cache["sliver_threshold"])
+        _cn   = geo_cache["conn"]
+        _of   = geo_cache["offs"]
+        _pc   = geo_cache["pt_cell_offsets"]
+        _sc   = geo_cache["sorted_cell_ids"].astype(np.int64)
+        _npc  = len(_pc) - 1
+        _sm   = (raw_vals > 0.0) & (_ar[:len(raw_vals)] < _sthr)
+        _si   = np.where(_sm)[0]
+        if len(_si) > 0:
+            print(f"  Sliver correction: {len(_si):,} degenerate cell(s) "
+                  f"(area < {_sthr:.3e}).")
+            _ncorr = 0
+            for _cid in _si.tolist():
+                _ss, _se = int(_of[_cid]), int(_of[_cid + 1])
+                _ns: set[int] = set()
+                for _pid in _cn[_ss:_se].tolist():
+                    if _pid < _npc:
+                        _ps, _pe = int(_pc[_pid]), int(_pc[_pid + 1])
+                        for _ncc in _sc[_ps:_pe].tolist():
+                            if _ncc != _cid and current_vals[_ncc] != 0.0:
+                                _ns.add(int(_ncc))
+                if not _ns:
+                    continue
+                _na = np.array(sorted(_ns), dtype=np.int64)
+                _w  = _ar[_na]
+                _ws = float(_w.sum())
+                current_vals[_cid] = (float(np.dot(_w, current_vals[_na]) / _ws)
+                                      if _ws > 0.0 else float(current_vals[_na].mean()))
+                _ncorr += 1
+            if _ncorr:
+                print(f"  Sliver correction: {_ncorr:,} cell(s) corrected.")
 
     new_arr = numpy_to_vtk(current_vals, deep=True, array_type=out_arr.GetDataType())
     new_arr.SetName(ARRAY_NAME)

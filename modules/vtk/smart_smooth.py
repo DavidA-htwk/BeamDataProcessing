@@ -173,6 +173,46 @@ def smart_smooth_auto(
                                     np.array([], dtype=np.int64))
     n_pts_cache     = len(pt_cell_offsets) - 1
 
+    # ── Sliver pre-correction ─────────────────────────────────────────────────
+    # Degenerate near-zero-area triangles (mesh generation artifacts) produce
+    # astronomically high Power_Density values (P / A where A → 0).  Their
+    # extreme value is shared across every cell in the tiny cluster, so local
+    # std ≈ 0 and Phase A's sigma test silently excludes them.  Replace with an
+    # area-weighted neighbor mean BEFORE Phase A so that:
+    #   (a) physically meaningful values appear in the output, and
+    #   (b) the original extreme values no longer inflate neighbor local-means,
+    #       which could otherwise suppress Phase A from flagging adjacent cells.
+    _ca_pre = geo_cache.get("cell_areas")
+    _st_pre = float(geo_cache.get("sliver_threshold", 0.0))
+    if _ca_pre is not None and _st_pre > 0.0 and len(_ca_pre) == num_cells:
+        _ar_pre  = np.asarray(_ca_pre, dtype=np.float64)
+        _sv_mask = (raw_vals > 0.0) & (_ar_pre < _st_pre)
+        _sv_ids  = np.where(_sv_mask)[0].astype(np.int64)
+        if len(_sv_ids) > 0:
+            print(f"  [AUTO] Sliver pre-correction: {len(_sv_ids):,} degenerate "
+                  f"cell(s) detected (area < {_st_pre:.3e}).")
+            _orig   = raw_vals.copy()
+            _ncorr  = 0
+            for _cid in _sv_ids.tolist():
+                _ss, _se = int(offs[_cid]), int(offs[_cid + 1])
+                _ns: set[int] = set()
+                for _pid in conn[_ss:_se].tolist():
+                    if _pid < n_pts_cache:
+                        _ps, _pe = int(pt_cell_offsets[_pid]), int(pt_cell_offsets[_pid + 1])
+                        for _nc in sorted_cell_ids[_ps:_pe].tolist():
+                            if _nc != _cid and _orig[_nc] != 0.0:
+                                _ns.add(int(_nc))
+                if not _ns:
+                    continue
+                _na     = np.array(sorted(_ns), dtype=np.int64)
+                _w      = _ar_pre[_na]
+                _ws     = float(_w.sum())
+                raw_vals[_cid] = (float(np.dot(_w, _orig[_na]) / _ws)
+                                  if _ws > 0.0 else float(_orig[_na].mean()))
+                _ncorr += 1
+            del _orig
+            print(f"  [AUTO] Sliver pre-correction: {_ncorr:,} cell(s) corrected.")
+
     # ── Phase A: candidate detection via local z-score (fully vectorised) ───────
     # All neighbor lookups use the cached CSR topology arrays (conn, offs,
     # pt_cell_offsets, sorted_cell_ids) — zero VTK GetCellPoints/GetPointCells
@@ -314,6 +354,51 @@ def smart_smooth_auto(
                     if n_added > 0:
                         print(f"  [AUTO] Edge-direct: +{n_added:,} candidate(s) "
                               f"above {EDGE_TOP_PERCENTILE:.4g}th percentile.")
+
+    # ── Phase A-ter: global absolute fallback with isolation check ───────────
+    # Phase A fails for tight clusters of uniformly elevated cells: all
+    # neighbours share the same high value, so local_std ≈ 0 and the sigma
+    # condition is never satisfied for any cell in the cluster.
+    # Phase A-bis catches cluster cells that touch a physical edge point, but
+    # misses clusters that are close to (but not directly on) an edge.
+    # This pass adds top-(100-EDGE_TOP_PERCENTILE)% cells BUT only if they are
+    # isolated: their highest-valued point-connected neighbour must be below
+    # ATER_ISOLATION_RATIO × the cell's own value.  This gates out legitimate
+    # physics hot-spots (which always have elevated neighbours forming a
+    # gradient), and only flags cells that are anomalously high relative to a
+    # near-zero surroundings — i.e. true geometric/mesh artifacts.
+    # The ~300 cells in the top 0.1% make the Python inner loop negligible.
+    _ATER_ISOLATION_RATIO = 0.1   # neighbour must be < 10 % of cell value
+    if len(nonzero_ids) > 0:
+        _g_thresh = float(np.percentile(raw_vals[nonzero_ids], EDGE_TOP_PERCENTILE))
+        _above    = nonzero_ids[raw_vals[nonzero_ids] >= _g_thresh]
+        if len(_above) > 0:
+            cand_set = set(candidates)
+            n_before = len(candidates)
+            for _cid in _above.tolist():
+                if _cid not in cand_set:
+                    _cval = float(raw_vals[_cid])
+                    # Walk point-connected neighbours and find the maximum value.
+                    _ss, _se = int(offs[_cid]), int(offs[_cid + 1])
+                    _max_nbr = 0.0
+                    for _pid in conn[_ss:_se].tolist():
+                        if _pid < n_pts_cache:
+                            _ps, _pe = (int(pt_cell_offsets[_pid]),
+                                        int(pt_cell_offsets[_pid + 1]))
+                            for _nc in sorted_cell_ids[_ps:_pe].tolist():
+                                if _nc != _cid:
+                                    _v = float(raw_vals[_nc])
+                                    if _v > _max_nbr:
+                                        _max_nbr = _v
+                    # Only eligible if surroundings are zero or much lower.
+                    if _max_nbr == 0.0 or _max_nbr < _cval * _ATER_ISOLATION_RATIO:
+                        candidates.append(_cid)
+                        cand_set.add(_cid)
+            n_added = len(candidates) - n_before
+            if n_added > 0:
+                print(f"  [AUTO] Global-top fallback: +{n_added:,} isolated "
+                      f"candidate(s) above {EDGE_TOP_PERCENTILE:.4g}th percentile "
+                      f"(val >= {_g_thresh:.3e}, isolation ratio {_ATER_ISOLATION_RATIO}).")
 
     if not candidates:
         print("  [AUTO] No candidates found — output unchanged.")
