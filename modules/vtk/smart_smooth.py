@@ -173,6 +173,11 @@ def smart_smooth_auto(
                                     np.array([], dtype=np.int64))
     n_pts_cache     = len(pt_cell_offsets) - 1
 
+    _spk_label   = "spike=ON" if smooth_spikes else "spike=off"
+    _ratio_label = f"  ratio={spike_ratio}" if spike_ratio > 0.0 else ""
+    print(f"  [AUTO] Settings: iter={n_iter}  sigma={spike_sigma}{_ratio_label}  "
+          f"{_spk_label}  k_ring={k_ring}  dilation={dilation_rings}")
+
     # ── Sliver pre-correction ─────────────────────────────────────────────────
     # Degenerate near-zero-area triangles (mesh generation artifacts) produce
     # astronomically high Power_Density values (P / A where A → 0).  Their

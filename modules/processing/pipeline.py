@@ -159,6 +159,40 @@ def run_processing(
 
         _snap_map = {fp: _file_settings(fp) for fp, *_ in all_meta}
 
+        # ── Settings summary (once per run) ──────────────────────────────────
+        log("\n  Smoothing settings per component:")
+        _seen_comps: dict[str, tuple] = {}
+        for _fp, *_ in all_meta:
+            _comp = next(
+                (n for n in components if n != "(all)" and n.lower() in _fp.stem.lower()),
+                "(all)",
+            )
+            if _comp not in _seen_comps:
+                _seen_comps[_comp] = _snap_map[_fp]
+        for _comp, _s in _seen_comps.items():
+            (_ni, _spd, _stp, _mf, _sm, _ss, _pr, _spk, _sr, _sv) = _s
+            _spk_str  = "ON" if _spk else "off"
+            _sv_str   = "ON" if _sv  else "off"
+            _snap_str = ("pwr-density" if _spd and not _stp
+                         else "total-pwr" if not _spd and _stp
+                         else "both" if _spd and _stp else "none")
+            if _ni == 0:
+                log(f"    [{_comp}] iterations=0 (no smoothing)  "
+                    f"mult={_mf}  snapshots={_snap_str}")
+            elif _sm == "auto":
+                _ratio_str = f"  spike_ratio={_sr}" if _sr > 0.0 else ""
+                log(f"    [{_comp}] mode=auto  iter={_ni}  "
+                    f"sigma={_ss}{_ratio_str}  "
+                    f"spike_smooth={_spk_str}  "
+                    f"save_post_smooth={_sv_str}  "
+                    f"mult={_mf}  snapshots={_snap_str}")
+            else:
+                log(f"    [{_comp}] mode=edge  iter={_ni}  "
+                    f"proximity={_pr}  "
+                    f"save_post_smooth={_sv_str}  "
+                    f"mult={_mf}  snapshots={_snap_str}")
+        log("")
+
         # ── Phase 1: Geo-cache precompute (load one file per component, free) ─
         # Polydata is created, used to build the cache, then immediately deleted.
         # The cache itself holds only numpy arrays (~1 GB per component) and stays
