@@ -109,7 +109,10 @@ def run_processing(
 
     snap_dir   = out_dir / "snapshots"
     smooth_dir = out_dir / "post_smoothed"
-    csv_path   = out_dir / "max_comparison_batch.csv"
+    csv_dir    = out_dir / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    _ts       = time.strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path  = csv_dir / f"max_comparison_batch_{_ts}.csv"
 
     # Purge any _tmp_smooth_* VTP files left by a previous crashed/stopped run.
     if snap_dir.exists():
@@ -126,6 +129,7 @@ def run_processing(
                          "max_before", "max_after", "delta", "discrepancy",
                          "total_power_before", "total_power_after",
                          "total_power_delta", "total_power_discrepancy",
+                         "mult_factor",
                          "snapshot", "paraview", "post_smoothed_vtp"])
 
         # ── Phase 0: Collect all matching file paths (no loading) ────────────
@@ -333,6 +337,7 @@ def run_processing(
                                      f"{mbs:.6g}", f"{mas:.6g}",
                                      f"{delta:.6g}", "YES" if delta > 0.0 else "NO",
                                      tpbs_str, tpas_str, tp_delta_str, tp_disc_str,
+                                     f"{mult:.6g}",
                                      _snap_link, _pv_path, _smooth_vtp_path])
                     total_files += 1
 

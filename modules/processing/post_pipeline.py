@@ -61,11 +61,14 @@ def run_post_processing(
     snap_tp     = bool(cfg.get("snap_total_pwr", False))
     save_snaps  = bool(cfg.get("save_snapshots", False)) and (snap_pd or snap_tp)
 
-    script_dir = Path(__file__).resolve().parent.parent.parent
-    out_dir    = Path(out_root) if out_root else script_dir / "output"
-    pp_dir     = out_dir / "post_processed"
-    snap_dir   = out_dir / "post_processed_snapshots"
-    csv_path   = out_dir / "post_processed_batch.csv"
+    script_dir  = Path(__file__).resolve().parent.parent.parent
+    out_dir     = Path(out_root) if out_root else script_dir / "output"
+    pp_dir      = out_dir / "post_processed"
+    snap_dir    = out_dir / "post_processed_snapshots"
+    csv_dir     = out_dir / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    _ts         = time.strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path    = csv_dir / f"post_processed_batch_{_ts}.csv"
 
     os.makedirs(pp_dir, exist_ok=True)
 
@@ -131,6 +134,7 @@ def run_post_processing(
         writer = csv.writer(fh)
         writer.writerow(["group", "output_name", "merged_cases", "filename",
                          "n_cases_merged", "max_val", "total_power",
+                         "mult_factor_applied", "source",
                          "snapshot", "vtp_path"])
 
         for (group_name, output_name, stem), file_case_pairs in sorted(slot_groups.items()):
@@ -225,9 +229,11 @@ def run_post_processing(
                 pre_cam = precompute_snapshot(merged, ARRAY_NAME)
 
             # ── Write merged VTP ──────────────────────────────────────────────
-            out_subdir = pp_dir / output_name
+            # Files go into a per-group subdir so each group can be
+            # selected individually in the Coordinate Transform tab.
+            out_subdir = pp_dir / output_name / group_name
             out_subdir.mkdir(parents=True, exist_ok=True)
-            out_vtp = out_subdir / f"{group_name}__merged__{stem}.vtp"
+            out_vtp = out_subdir / f"merged__{stem}.vtp"
             _write_vtp(merged, out_vtp)
 
             elapsed = time.perf_counter() - t0
@@ -238,18 +244,18 @@ def run_post_processing(
             # ── Queue snapshot args ───────────────────────────────────────────
             snap_str = ""
             if save_snaps and pre_cam is not None:
-                snap_dir_case = snap_dir / output_name
+                snap_dir_case = snap_dir / output_name / group_name
                 snap_dir_case.mkdir(parents=True, exist_ok=True)
                 _snap_label = f"{group_name}__{output_name.replace('OUTPUT_', '', 1)}"
                 _extra = (pre_cam, pre_cam, max_pwr_v, max_pwr_v, total_pwr)
                 if snap_pd:
-                    p_pd = [str(snap_dir_case / f"{_snap_label}__{stem}__pwr_density.png")]
+                    p_pd = [str(snap_dir_case / f"merged__{stem}__pwr_density.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_pd,
                          ARRAY_NAME, True, stem, 1.0) + _extra)
                     snap_str = p_pd[0]
                 if snap_tp:
-                    p_tp = [str(snap_dir_case / f"{_snap_label}__{stem}__total_pwr.png")]
+                    p_tp = [str(snap_dir_case / f"merged__{stem}__total_pwr.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_tp,
                          POWER_ARRAY, True, stem, 1.0) + _extra)
@@ -264,6 +270,8 @@ def run_post_processing(
                 f"{group_name}__merged__{stem}.vtp", n_loaded,
                 f"{max_val:.6g}" if max_val is not None else "",
                 f"{total_pwr:.6g}" if total_pwr is not None else "",
+                f"{mult_factor:.6g}" if apply_mult else "1.0 (not applied)",
+                cfg.get("pp_source", "original"),
                 snap_link, str(out_vtp),
             ])
 

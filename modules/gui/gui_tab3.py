@@ -35,6 +35,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     # ── Injection hooks (filled by Data_handling.py after build) ─────────────
     _get_tab1_dirs:    list = [None]   # [0] = callable() → list[str]
     _get_output_folder: list = [None]  # [0] = callable() → str
+    _get_mult_factor_p: list = [None]  # [0] = callable() → str  (processing mult)
 
     # ── Source + pattern/filter ───────────────────────────────────────────────
     src_lframe = tk.LabelFrame(tab3, text="Input source", padx=8, pady=6)
@@ -130,7 +131,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
              font=("Segoe UI", 8, "italic"), fg="#999999").pack(pady=(4, 0))
     preview_img_lbl  = tk.Label(preview_outer, bg="#f5f5f5",
                                 text="(select a case)", fg="#bbbbbb",
-                                font=("Segoe UI", 8))
+                                font=("Segoe UI", 8), cursor="hand2")
     preview_img_lbl.pack(expand=True)
     preview_name_lbl = tk.Label(preview_outer, bg="#f5f5f5",
                                 text="", fg="#666666",
@@ -151,7 +152,11 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
              bg="#f5f5f5", highlightthickness=0, showvalue=False,
              length=1).pack(side="left", fill="x", expand=True, padx=(4, 2))
 
-    _preview_ref = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
+    _preview_ref  = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
+    _pan_offset   = [0.0, 0.0]     # [dx, dy] pan in original image pixels
+    _drag_start   = [None, None]   # screen pos at ButtonPress-1
+    _drag_pan_st  = [0.0, 0.0]    # _pan_offset snapshot at drag start
+    _img_orig_sz  = [None]         # (iw, ih) of last loaded image
 
     def _find_snapshot_pp(sf_path: str) -> str | None:
         """Return best matching processing snapshot PNG for sf_path."""
@@ -185,25 +190,40 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         return str(pngs[0])
 
     def _render_preview_pp(snap: str) -> None:
-        """Load and display *snap* cropped and scaled to the current pane size."""
+        """Load and display *snap* with pan/zoom applied."""
         w    = max(80, preview_outer.winfo_width() - 8)
-        h    = max(60, preview_outer.winfo_height() - 80)  # room for header + zoom + name
+        h    = max(60, preview_outer.winfo_height() - 80)
         zoom = zoom_var.get()
         try:
             try:
                 from PIL import Image as _PI, ImageTk as _PIT
                 img = _PI.open(snap)
+                iw, ih = img.size
+                _img_orig_sz[0] = (iw, ih)
                 if zoom > 1.0:
-                    iw, ih = img.size
+                    cx_def = iw * 0.375   # mesh viewport center (left 75%)
+                    cy_def = ih * 0.5
                     cw, ch = iw / zoom, ih / zoom
-                    cx, cy = iw / 2, ih / 2
+                    cx = cx_def + _pan_offset[0]
+                    cy = cy_def + _pan_offset[1]
+                    # Clamp crop box inside image
+                    if cx - cw / 2 < 0:  cx = cw / 2
+                    if cx + cw / 2 > iw: cx = iw - cw / 2
+                    if cy - ch / 2 < 0:  cy = ch / 2
+                    if cy + ch / 2 > ih: cy = ih - ch / 2
+                    _pan_offset[0] = cx - cx_def
+                    _pan_offset[1] = cy - cy_def
                     img = img.crop((
                         max(0, int(cx - cw / 2)),
                         max(0, int(cy - ch / 2)),
                         min(iw, int(cx + cw / 2)),
                         min(ih, int(cy + ch / 2)),
                     ))
-                img.thumbnail((w, h))
+                cw2, ch2 = img.size
+                ratio = min(w / max(cw2, 1), h / max(ch2, 1))
+                img   = img.resize((max(1, int(cw2 * ratio)),
+                                    max(1, int(ch2 * ratio))),
+                                   _PI.LANCZOS)
                 photo = _PIT.PhotoImage(img)
             except ImportError:
                 photo = tk.PhotoImage(file=snap)
@@ -219,11 +239,36 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             _preview_ref[0] = None
 
     def _on_zoom_pp(*_):
+        _pan_offset[0] = 0.0
+        _pan_offset[1] = 0.0
         _zoom_val_lbl.configure(text=f"{zoom_var.get():.1f}×")
         if _preview_ref[1]:
             _render_preview_pp(_preview_ref[1])
 
     zoom_var.trace_add("write", _on_zoom_pp)
+
+    def _start_drag_pp(event):
+        _drag_start[0]  = event.x
+        _drag_start[1]  = event.y
+        _drag_pan_st[0] = _pan_offset[0]
+        _drag_pan_st[1] = _pan_offset[1]
+
+    def _do_drag_pp(event):
+        if _drag_start[0] is None or _img_orig_sz[0] is None:
+            return
+        if zoom_var.get() <= 1.0:
+            return
+        iw, ih  = _img_orig_sz[0]
+        dw = max(1, preview_outer.winfo_width() - 8)
+        dh = max(1, preview_outer.winfo_height() - 80)
+        z  = zoom_var.get()
+        _pan_offset[0] = _drag_pan_st[0] - (event.x - _drag_start[0]) * (iw / z) / dw
+        _pan_offset[1] = _drag_pan_st[1] - (event.y - _drag_start[1]) * (ih / z) / dh
+        if _preview_ref[1]:
+            _render_preview_pp(_preview_ref[1])
+
+    preview_img_lbl.bind("<ButtonPress-1>", _start_drag_pp)
+    preview_img_lbl.bind("<B1-Motion>",     _do_drag_pp)
 
     def _update_preview_pp(sf_path: str) -> None:
         snap = _find_snapshot_pp(sf_path)
@@ -487,20 +532,27 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     # Activate first tool by default
     _select_tool(MERGE_GROUPS[0][0])
 
-    # ── Multiplication factor (only for source = original) ────────────────────
+    # ── Multiplication factor ─────────────────────────────────────────────────
     mult_lframe = tk.LabelFrame(tab3, text="Multiplication factor", padx=8, pady=4)
     _mult_frame_row = tk.Frame(mult_lframe)
     _mult_frame_row.pack(fill="x")
-    pp_mult_var = tk.StringVar(value=str(pp_s.get("mult_factor", "1.0")))
+    pp_mult_var = tk.StringVar(value=str(pp_s.get("mult_factor_pp", "1.0")))
     pp_mult_label = tk.Label(_mult_frame_row, text="Factor:",
                              font=("Segoe UI", 9, "bold"))
     pp_mult_label.pack(side="left")
     pp_mult_entry = tk.Entry(_mult_frame_row, textvariable=pp_mult_var, width=10)
     pp_mult_entry.pack(side="left", padx=(8, 0))
-    tk.Label(_mult_frame_row, text="(applied to power density and total power)",
-             fg="#64748b").pack(side="left", padx=(8, 0))
+    pp_mult_desc = tk.Label(_mult_frame_row,
+                            text="(applied to power density and total power)",
+                            fg="#64748b")
+    pp_mult_desc.pack(side="left", padx=(8, 4))
+    pp_mult_note = tk.Label(_mult_frame_row, text="", fg="#b45309",
+                            font=("Segoe UI", 8, "italic"))
+    pp_mult_note.pack(side="left")
+    # Always visible — enable/disable controlled by source toggle below
+    mult_lframe.pack(fill="x", padx=10, pady=(4, 2))
 
-    # ── Merge arrays ───────────────────────────────────────────────────
+    # ── Merge arrays ───────────────────────────────────────────────────────────
     merge_lframe = tk.LabelFrame(tab3, text="Merge arrays", padx=8, pady=4)
     merge_lframe.pack(fill="x", padx=10, pady=(4, 2))
     merge_row = tk.Frame(merge_lframe)
@@ -553,46 +605,42 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     )
     tab3_run_btn.pack(side="left", padx=6)
 
-    # ── Pack order: src → cases → [mult] → snaps → run ───────────────────────
-    # mult_lframe visibility is managed reactively below.
+    # ── Pack order: cases → mult → merge → snaps → run ───────────────────────
     snap_lframe.pack(fill="x", padx=10, pady=(4, 2))
     btn_frame.pack(pady=(4, 10))
 
-    _mult_packed = [False]   # tracks current pack state
+    def _update_pp_mult_state(*_):
+        src = pp_source_var.get()
+        if src == "original":
+            pp_mult_var.set("1.0")
+            pp_mult_entry.configure(state="normal")
+            pp_mult_label.configure(fg="black")
+            pp_mult_desc.configure(fg="#64748b")
+            pp_mult_note.configure(text="")
+        else:
+            # Show the mult_factor_p (processing factor) from live comp_widgets
+            get_p = _get_mult_factor_p[0]
+            if get_p is not None:
+                pp_mult_var.set(get_p())
+            pp_mult_entry.configure(state="disabled")
+            pp_mult_label.configure(fg="#999999")
+            pp_mult_desc.configure(fg="#bbbbbb")
+            pp_mult_note.configure(
+                text="(← mult_factor_p applied in Processing)")
 
-    def _update_mult_visibility(*_):
-        is_orig = pp_source_var.get() == "original"
-        if is_orig and not _mult_packed[0]:
-            # Insert mult_lframe before snap_lframe: pack_forget later widgets,
-            # pack mult, then re-pack later widgets in order.
-            snap_lframe.pack_forget()
-            btn_frame.pack_forget()
-            mult_lframe.pack(fill="x", padx=10, pady=(0, 4))
-            snap_lframe.pack(fill="x", padx=10, pady=(4, 2))
-            btn_frame.pack(pady=(4, 10))
-            _mult_packed[0] = True
-        elif not is_orig and _mult_packed[0]:
-            mult_lframe.pack_forget()
-            _mult_packed[0] = False
+    pp_source_var.trace_add("write", _update_pp_mult_state)
+    _update_pp_mult_state()   # apply on first render
 
-    pp_source_var.trace_add("write", _update_mult_visibility)
-    _update_mult_visibility()   # apply on first render
-
-    # ── Also auto-update pattern default when source changes ──────────────────
+    # ── Auto-update pattern when source changes ───────────────────────────────
     _PATTERNS = {
-        "original":   "smoothed_results_*.vtp",
+        "original":    "smoothed_results_*.vtp",
         "post_smooth": "post_smooth__*.vtp",
     }
-    _last_auto_pattern: list[str] = [pp_pattern_var.get()]
 
     def _update_pattern_default(*_):
-        src = pp_source_var.get()
+        src     = pp_source_var.get()
         default = _PATTERNS.get(src, "smoothed_results_*.vtp")
-        # Only auto-update if the entry still holds the other mode's default
-        current = pp_pattern_var.get()
-        if current in _PATTERNS.values():
-            pp_pattern_var.set(default)
-            _last_auto_pattern[0] = default
+        pp_pattern_var.set(default)
 
     pp_source_var.trace_add("write", _update_pattern_default)
 
@@ -636,17 +684,25 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     def get_pp_cfg_dict() -> dict:
         """Serialisable config for settings persistence."""
+        # Always save the effective (upstream) factor when source is non-original
+        # so we never persist a stale "1" that would lose the real value.
+        src = pp_source_var.get()
+        saved_mult = (
+            pp_mult_var.get()
+            if src == "original"
+            else _infer_upstream_mult()
+        )
         return {
-            "pp_source":        pp_source_var.get(),
+            "pp_source":        src,
             "pattern":          pp_pattern_var.get(),
             "name_filter":      pp_filter_var.get(),
-            "mult_factor":      pp_mult_var.get(),
+            "mult_factor":      saved_mult,
             "merge_pd":         pp_merge_pd_var.get(),
             "merge_pwr":        pp_merge_pwr_var.get(),
             "save_snapshots":   pp_save_snaps_var.get(),
             "snap_pwr_density": pp_snap_pd_var.get(),
             "snap_total_pwr":   pp_snap_tp_var.get(),
-            "case_groups":      dict(case_group),   # {path: group_name}
+            "case_groups":      dict(case_group),
         }
 
     def apply_pp_cfg(pp: dict) -> None:
@@ -655,7 +711,9 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         pp_source_var.set(pp.get("pp_source", "original"))
         pp_pattern_var.set(pp.get("pattern", "smoothed_results_*.vtp"))
         pp_filter_var.set(pp.get("name_filter", ""))
-        pp_mult_var.set(str(pp.get("mult_factor", "1.0")))
+        pp_mult_var.set(str(pp.get("mult_factor_pp", "1.0")))
+        # Re-trigger state to populate from live comp_widgets if non-original
+        _update_pp_mult_state()
         pp_save_snaps_var.set(bool(pp.get("save_snapshots", False)))
         pp_merge_pd_var.set(bool(pp.get("merge_pd",  True)))
         pp_merge_pwr_var.set(bool(pp.get("merge_pwr", True)))
@@ -681,6 +739,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         "apply_pp_cfg":       apply_pp_cfg,
         "_get_tab1_dirs":     _get_tab1_dirs,
         "_get_output_folder": _get_output_folder,
+        "_get_mult_factor_p": _get_mult_factor_p,
         "_on_load_cases":     on_load_cases,
         "case_group":         case_group,
         "pp_source_var":      pp_source_var,

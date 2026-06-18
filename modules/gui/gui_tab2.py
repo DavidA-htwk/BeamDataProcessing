@@ -147,6 +147,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     # Injected after build — set by Data_handling.py so Load Cases reads Tab 1.
     _get_tab1_dirs:    list = [None]   # [0] = callable() → list[str]
     _get_output_folder: list = [None]  # [0] = callable() → str  (smoothed-source mode)
+    _get_mult_factor_p: list = [None]  # [0] = callable() → str  (processing mult)
 
     # Source toggle — original / post-smoothed / post-processed
     src_frame = tk.Frame(case_lframe)
@@ -239,7 +240,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
              font=("Segoe UI", 8, "italic"), fg="#999999").pack(pady=(4, 0))
     preview_img_lbl  = tk.Label(preview_outer, bg="#f5f5f5",
                                 text="(select a case)", fg="#bbbbbb",
-                                font=("Segoe UI", 8))
+                                font=("Segoe UI", 8), cursor="hand2")
     preview_img_lbl.pack(expand=True)
     preview_name_lbl = tk.Label(preview_outer, bg="#f5f5f5",
                                 text="", fg="#666666",
@@ -260,7 +261,11 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
              bg="#f5f5f5", highlightthickness=0, showvalue=False,
              length=1).pack(side="left", fill="x", expand=True, padx=(4, 2))
 
-    _preview_ref = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
+    _preview_ref  = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
+    _pan_offset   = [0.0, 0.0]     # [dx, dy] pan in original image pixels
+    _drag_start   = [None, None]   # screen pos at ButtonPress-1
+    _drag_pan_st  = [0.0, 0.0]    # _pan_offset snapshot at drag start
+    _img_orig_sz  = [None]         # (iw, ih) of last loaded image
 
     def _find_snapshot_xfm(sf_path: str) -> str | None:
         """Return best matching snapshot PNG for sf_path given current source."""
@@ -297,25 +302,40 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         return str(pngs[0])
 
     def _render_preview_xfm(snap: str) -> None:
-        """Load and display *snap* cropped and scaled to the current pane size."""
+        """Load and display *snap* with pan/zoom applied."""
         w    = max(80, preview_outer.winfo_width() - 8)
-        h    = max(60, preview_outer.winfo_height() - 80)  # room for header + zoom + name
+        h    = max(60, preview_outer.winfo_height() - 80)
         zoom = zoom_var.get()
         try:
             try:
                 from PIL import Image as _PI, ImageTk as _PIT
                 img = _PI.open(snap)
+                iw, ih = img.size
+                _img_orig_sz[0] = (iw, ih)
                 if zoom > 1.0:
-                    iw, ih = img.size
+                    cx_def = iw * 0.375   # mesh viewport center (left 75%)
+                    cy_def = ih * 0.5
                     cw, ch = iw / zoom, ih / zoom
-                    cx, cy = iw / 2, ih / 2
+                    cx = cx_def + _pan_offset[0]
+                    cy = cy_def + _pan_offset[1]
+                    # Clamp crop box inside image
+                    if cx - cw / 2 < 0:  cx = cw / 2
+                    if cx + cw / 2 > iw: cx = iw - cw / 2
+                    if cy - ch / 2 < 0:  cy = ch / 2
+                    if cy + ch / 2 > ih: cy = ih - ch / 2
+                    _pan_offset[0] = cx - cx_def
+                    _pan_offset[1] = cy - cy_def
                     img = img.crop((
                         max(0, int(cx - cw / 2)),
                         max(0, int(cy - ch / 2)),
                         min(iw, int(cx + cw / 2)),
                         min(ih, int(cy + ch / 2)),
                     ))
-                img.thumbnail((w, h))
+                cw2, ch2 = img.size
+                ratio = min(w / max(cw2, 1), h / max(ch2, 1))
+                img   = img.resize((max(1, int(cw2 * ratio)),
+                                    max(1, int(ch2 * ratio))),
+                                   _PI.LANCZOS)
                 photo = _PIT.PhotoImage(img)
             except ImportError:
                 photo = tk.PhotoImage(file=snap)
@@ -331,11 +351,36 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             _preview_ref[0] = None
 
     def _on_zoom_xfm(*_):
+        _pan_offset[0] = 0.0
+        _pan_offset[1] = 0.0
         _zoom_val_lbl.configure(text=f"{zoom_var.get():.1f}×")
         if _preview_ref[1]:
             _render_preview_xfm(_preview_ref[1])
 
     zoom_var.trace_add("write", _on_zoom_xfm)
+
+    def _start_drag_xfm(event):
+        _drag_start[0]  = event.x
+        _drag_start[1]  = event.y
+        _drag_pan_st[0] = _pan_offset[0]
+        _drag_pan_st[1] = _pan_offset[1]
+
+    def _do_drag_xfm(event):
+        if _drag_start[0] is None or _img_orig_sz[0] is None:
+            return
+        if zoom_var.get() <= 1.0:
+            return
+        iw, ih  = _img_orig_sz[0]
+        dw = max(1, preview_outer.winfo_width() - 8)
+        dh = max(1, preview_outer.winfo_height() - 80)
+        z  = zoom_var.get()
+        _pan_offset[0] = _drag_pan_st[0] - (event.x - _drag_start[0]) * (iw / z) / dw
+        _pan_offset[1] = _drag_pan_st[1] - (event.y - _drag_start[1]) * (ih / z) / dh
+        if _preview_ref[1]:
+            _render_preview_xfm(_preview_ref[1])
+
+    preview_img_lbl.bind("<ButtonPress-1>", _start_drag_xfm)
+    preview_img_lbl.bind("<B1-Motion>",     _do_drag_xfm)
 
     def _update_preview_xfm(sf_path: str) -> None:
         snap = _find_snapshot_xfm(sf_path)
@@ -464,7 +509,10 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                 return
             for output_dir in sorted(pp_root.iterdir()):
                 if output_dir.is_dir():
-                    dirs.append(str(output_dir))   # output_name dirs contain VTPs directly
+                    # Enumerate group subdirs: post_processed/{output_name}/{group_name}/
+                    for group_dir in sorted(output_dir.iterdir()):
+                        if group_dir.is_dir():
+                            dirs.append(str(group_dir))
             if not dirs:
                 load_case_status.set("  Post-processed folder exists but is empty.")
                 return
@@ -489,9 +537,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                 continue
             name = p.name
             if source == "post_processed":
-                # Merged VTPs live directly in the case dir — no scenario subdir.
-                # Use the output_name (parent) as the row label and the case dir
-                # itself as the checkbox entry.
+                # Structure: post_processed/{output_name}/{group_name}/merged__*.vtp
+                # Use output_name as row label, group_name as checkbox.
                 row_label = p.parent.name
                 cases_by_output.setdefault(row_label, []).append(p)
                 n_total += 1
@@ -551,7 +598,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     xfm_mult_label = tk.Label(xfm_misc_frame, text="Multiplication factor:",
                               font=("Segoe UI", 9, "bold"))
     xfm_mult_label.pack(side="left")
-    xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult", "1.0")))
+    xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult_factor_t", xfm_s.get("mult", "1.0"))))
     xfm_mult_entry = tk.Entry(xfm_misc_frame, textvariable=xfm_mult_var, width=10)
     xfm_mult_entry.pack(side="left", padx=(8, 0))
     xfm_mult_desc = tk.Label(xfm_misc_frame, text="(applied to power & power load)",
@@ -567,15 +614,21 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     def _update_xfm_mult_state(*_):
         src = xfm_source_var.get()
         if src == "original":
+            xfm_mult_var.set("1.0")
             xfm_mult_entry.configure(state="normal")
             xfm_mult_label.configure(fg="black")
             xfm_mult_desc.configure(fg="#64748b")
             xfm_mult_note.configure(text="")
         else:
+            # Show the mult_factor_p (processing factor) from live comp_widgets
+            get_p = _get_mult_factor_p[0]
+            if get_p is not None:
+                xfm_mult_var.set(get_p())
             xfm_mult_entry.configure(state="disabled")
             xfm_mult_label.configure(fg="#999999")
             xfm_mult_desc.configure(fg="#bbbbbb")
-            xfm_mult_note.configure(text="(already applied — N/A)")
+            xfm_mult_note.configure(
+                text="(← mult_factor_p applied in Processing)")
 
     xfm_source_var.trace_add("write", _update_xfm_mult_state)
     _update_xfm_mult_state()
@@ -638,8 +691,11 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         }
 
     def get_xfm_cfg_dict() -> dict:
+        src = xfm_source_var.get()
+        # Save mult_factor_t only when source=original (user-editable).
+        # When non-original, save whatever is currently displayed (mult_factor_p).
         return {
-            "xfm_source":     xfm_source_var.get(),
+            "xfm_source":     src,
             "preset":         xfm_preset_var.get(),
             "unit":           xfm_unit_var.get(),
             "output_unit":    xfm_out_unit_var.get(),
@@ -653,7 +709,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             "export_area":    xfm_export_area.get(),
             "export_power":   xfm_export_power.get(),
             "export_pload":   xfm_export_pload.get(),
-            "mult":           xfm_mult_var.get(),
+            "mult_factor_t":  xfm_mult_var.get(),
+            "mult":           xfm_mult_var.get(),  # backward compat
             "ignore_zeros":   xfm_ignore_zeros.get(),
             "case_selection": get_selected_dirs(),
         }
@@ -679,7 +736,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         xfm_export_area.set(bool(xfm.get("export_area",  True)))
         xfm_export_power.set(bool(xfm.get("export_power", True)))
         xfm_export_pload.set(bool(xfm.get("export_pload", True)))
-        xfm_mult_var.set(str(xfm.get("mult", "1.0")))
+        xfm_mult_var.set(str(xfm.get("mult_factor_t", xfm.get("mult", "1.0"))))
         xfm_ignore_zeros.set(bool(xfm.get("ignore_zeros", False)))
         _saved_sel.clear()
         _saved_sel.update(xfm.get("case_selection", []))
@@ -707,8 +764,9 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         "get_transform_params": get_transform_params,
         "get_xfm_cfg_dict":    get_xfm_cfg_dict,
         "apply_xfm_cfg":       apply_xfm_cfg,
-        "_get_tab1_dirs":      _get_tab1_dirs,      # caller injects Tab 1 dir getter
-        "_get_output_folder":  _get_output_folder,  # caller injects output folder getter
+        "_get_tab1_dirs":      _get_tab1_dirs,
+        "_get_output_folder":  _get_output_folder,
+        "_get_mult_factor_p":  _get_mult_factor_p,
         "_on_load_cases":      on_load_cases,       # caller can trigger after wiring
         "_saved_sel":          _saved_sel,
         "case_checks":         case_checks,

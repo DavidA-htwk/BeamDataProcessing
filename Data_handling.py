@@ -215,6 +215,27 @@ def run_gui() -> None:
     t2["_get_output_folder"][0] = lambda: output_folder_var.get().strip()
     t3["_get_tab1_dirs"][0] = _get_tab1_dirs_for_t2
     t3["_get_output_folder"][0] = lambda: output_folder_var.get().strip()
+
+    def _get_processing_mult_factor() -> str:
+        """Return the mult_factor_p: the factor set in named Processing components.
+        If all named components share the same value, return it.
+        Falls back to transform.mult_factor_t then '1.0'."""
+        comp_dict = t1["_get_comp_dict"]()
+        named = {
+            str(cfg.get("mult_factor", 1.0))
+            for name, cfg in comp_dict.items()
+            if name != "(all)"
+        }
+        if len(named) == 1:
+            return named.pop()
+        # Fall back to transform factor
+        try:
+            return str(float(t2["xfm_mult_var"].get()))
+        except Exception:
+            return "1.0"
+
+    t2["_get_mult_factor_p"][0] = _get_processing_mult_factor
+    t3["_get_mult_factor_p"][0] = _get_processing_mult_factor
     # Auto-populate cases on startup if saved selection exists
     if settings.get("transform", {}).get("case_selection"):
         t2["_on_load_cases"]()
@@ -342,14 +363,16 @@ def run_gui() -> None:
             Path(__file__).resolve().parent / "output")
         try:
             out_path = Path(out_folder)
-            out_path.mkdir(parents=True, exist_ok=True)
+            log_dir  = out_path / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
             ts    = _run_start_time[0] or time.strftime("%Y-%m-%d_%H-%M-%S")
             fname = f"{out_path.name}_{ts}.log"
             all_lines = (["=== Processing ==="] + _log_lines_proc +
+                         ["", "=== Post Processing ==="] + _log_lines_pp +
                          ["", "=== Transform ==="] + _log_lines_xfm)
-            with open(out_path / fname, "w", encoding="utf-8") as fh:
+            with open(log_dir / fname, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(all_lines))
-            log_proc(f"Log saved to:\n  {out_path / fname}")
+            log_proc(f"Log saved to:\n  {log_dir / fname}")
         except Exception as e:
             log_proc(f"[WARN] Could not save log: {e}")
 
@@ -437,6 +460,10 @@ def run_gui() -> None:
         if pp_run_cfg is None:
             return
         pp_run_cfg["output_folder"] = output_folder_var.get()
+        # Pass mult_factor_p so the CSV can record what factor was used upstream
+        get_p = t3["_get_mult_factor_p"][0]
+        if get_p is not None:
+            pp_run_cfg["mult_factor_p"] = get_p()
         if not _confirm_overwrite():
             return
         save_settings(_current_cfg())
