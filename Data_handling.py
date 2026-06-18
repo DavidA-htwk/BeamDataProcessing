@@ -42,8 +42,10 @@ from modules.core.settings import (
     load_settings, save_settings, _safe_float, SMOOTH_PROXIMITY_RADIUS,
 )
 from modules.processing.pipeline import run_processing, run_transform
+from modules.processing.post_pipeline import run_post_processing
 from modules.gui.gui_tab1 import build_processing_tab
 from modules.gui.gui_tab2 import build_transform_tab
+from modules.gui.gui_tab3 import build_post_processing_tab
 
 
 # -- GUI -----------------------------------------------------------------------
@@ -118,6 +120,8 @@ def run_gui() -> None:
     tab1 = tk.Frame(notebook)
     tab2 = tk.Frame(notebook)
     notebook.add(tab1, text="Processing")
+    tab3 = tk.Frame(notebook)
+    notebook.add(tab3, text="Post Processing")
     notebook.add(tab2, text="Coordinate Transform")
 
     # -- Log area (created early so log_fn can be passed to tab builders) ------
@@ -147,9 +151,11 @@ def run_gui() -> None:
         return box
 
     log_box_proc = _make_log_pane(log_outer, "Processing log")
+    log_box_pp   = _make_log_pane(log_outer, "Post Processing log")
     log_box_xfm  = _make_log_pane(log_outer, "Transform log")
 
     _log_lines_proc: list[str] = []
+    _log_lines_pp:   list[str] = []
     _log_lines_xfm:  list[str] = []
     _run_start_time: list = [None]
 
@@ -164,6 +170,9 @@ def run_gui() -> None:
     def log_proc(msg: str) -> None:
         _append_to(log_box_proc, _log_lines_proc, msg)
 
+    def log_pp(msg: str) -> None:
+        _append_to(log_box_pp, _log_lines_pp, msg)
+
     def log_xfm(msg: str) -> None:
         _append_to(log_box_xfm, _log_lines_xfm, msg)
 
@@ -173,6 +182,7 @@ def run_gui() -> None:
 
     # -- Build tabs ------------------------------------------------------------
     t1 = build_processing_tab(tab1, settings, log)
+    t3 = build_post_processing_tab(tab3, settings)
     t2 = build_transform_tab(tab2, settings)
 
     # Unpack frequently-used widgets from tab-state dicts
@@ -191,13 +201,20 @@ def run_gui() -> None:
     get_xfm_cfg_dict       = t2["get_xfm_cfg_dict"]
     apply_xfm_cfg          = t2["apply_xfm_cfg"]
 
-    # Wire Tab 1 directory reader into Tab 2's Load Cases button
+    tab3_run_btn           = t3["tab3_run_btn"]
+    get_pp_cfg             = t3["get_pp_cfg"]
+    get_pp_cfg_dict        = t3["get_pp_cfg_dict"]
+    apply_pp_cfg           = t3["apply_pp_cfg"]
+
+    # Wire Tab 1 directory reader into Tab 2 and Tab 3 Load Cases buttons
     def _get_tab1_dirs_for_t2() -> list[str]:
         raw  = text_box.get("1.0", "end").strip()
         return [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
 
     t2["_get_tab1_dirs"][0] = _get_tab1_dirs_for_t2
     t2["_get_output_folder"][0] = lambda: output_folder_var.get().strip()
+    t3["_get_tab1_dirs"][0] = _get_tab1_dirs_for_t2
+    t3["_get_output_folder"][0] = lambda: output_folder_var.get().strip()
     # Auto-populate cases on startup if saved selection exists
     if settings.get("transform", {}).get("case_selection"):
         t2["_on_load_cases"]()
@@ -214,6 +231,7 @@ def run_gui() -> None:
             "proximity_radius": _safe_float(proximity_var.get(), SMOOTH_PROXIMITY_RADIUS),
             "components":      t1["_get_comp_dict"](),
             "transform":       get_xfm_cfg_dict(),
+            "post_processing": get_pp_cfg_dict(),
         }
 
     def _apply_cfg(loaded: dict) -> None:
@@ -229,6 +247,7 @@ def run_gui() -> None:
         pending_comp_cfg.clear()
         pending_comp_cfg.update(loaded.get("components", {}))
         apply_xfm_cfg(loaded.get("transform", {}))
+        apply_pp_cfg(loaded.get("post_processing", {}))
 
     # Wire config callbacks into tab1 so Save/Load buttons work
     t1["_xfm_cfg_fn"][0] = _current_cfg   # used by save button
@@ -246,6 +265,7 @@ def run_gui() -> None:
     # -- Run Both + Stop buttons -----------------------------------------------
     _stop_event       = threading.Event()
     _active_proc      = [0]   # processing workers running
+    _active_pp        = [0]   # post-processing workers running
     _active_xfm       = [0]   # transform workers running
 
     btn_frame = tk.Frame(root)
@@ -261,7 +281,7 @@ def run_gui() -> None:
     )
     stop_btn.pack(side="left", padx=6)
 
-    _all_run_btns = [tab1_run_btn, tab2_run_btn, run_both_btn]
+    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn, run_both_btn]
 
     def on_stop():
         _stop_event.set()
@@ -270,7 +290,7 @@ def run_gui() -> None:
     stop_btn.configure(command=on_stop)
 
     def _set_busy(mode: str = "both") -> None:
-        """mode: 'proc' | 'xfm' | 'both' — which pane(s) to clear."""
+        """mode: 'proc' | 'pp' | 'xfm' | 'both' — which pane(s) to clear."""
         _stop_event.clear()
         _run_start_time[0] = time.strftime("%Y-%m-%d_%H-%M-%S")
         stop_btn.configure(state="normal", text="Stop")
@@ -282,6 +302,12 @@ def run_gui() -> None:
             log_box_proc.configure(state="normal")
             log_box_proc.delete("1.0", "end")
             log_box_proc.configure(state="disabled")
+        if mode in ("pp",):
+            tab3_run_btn.configure(state="disabled")
+            _log_lines_pp.clear()
+            log_box_pp.configure(state="normal")
+            log_box_pp.delete("1.0", "end")
+            log_box_pp.configure(state="disabled")
         if mode in ("xfm", "both"):
             tab2_run_btn.configure(state="disabled")
             _log_lines_xfm.clear()
@@ -295,6 +321,12 @@ def run_gui() -> None:
             tab1_run_btn.configure(state="normal")
         _finish_if_idle()
 
+    def _on_pp_done() -> None:
+        _active_pp[0] = max(0, _active_pp[0] - 1)
+        if _active_pp[0] == 0:
+            tab3_run_btn.configure(state="normal")
+        _finish_if_idle()
+
     def _on_xfm_done() -> None:
         _active_xfm[0] = max(0, _active_xfm[0] - 1)
         if _active_xfm[0] == 0:
@@ -302,7 +334,7 @@ def run_gui() -> None:
         _finish_if_idle()
 
     def _finish_if_idle() -> None:
-        if _active_proc[0] > 0 or _active_xfm[0] > 0:
+        if _active_proc[0] > 0 or _active_pp[0] > 0 or _active_xfm[0] > 0:
             return
         run_both_btn.configure(state="normal")
         stop_btn.configure(state="disabled", text="Stop")
@@ -329,6 +361,15 @@ def run_gui() -> None:
             finally:
                 root.after(0, _on_proc_done)
         _active_proc[0] += 1
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_post_processing(cfg: dict) -> None:
+        def worker():
+            try:
+                run_post_processing(cfg, log_pp, _stop_event)
+            finally:
+                root.after(0, _on_pp_done)
+        _active_pp[0] += 1
         threading.Thread(target=worker, daemon=True).start()
 
     def _launch_transform(input_dirs: list, xfm_params: dict, out_folder: str) -> None:
@@ -391,6 +432,17 @@ def run_gui() -> None:
         _set_busy("proc")
         _launch_processing(cfg)
 
+    def on_run_post_processing():
+        pp_run_cfg = get_pp_cfg()
+        if pp_run_cfg is None:
+            return
+        pp_run_cfg["output_folder"] = output_folder_var.get()
+        if not _confirm_overwrite():
+            return
+        save_settings(_current_cfg())
+        _set_busy("pp")
+        _launch_post_processing(pp_run_cfg)
+
     def on_run_transform():
         xfm_params = get_transform_params()
         if xfm_params is None:
@@ -430,6 +482,7 @@ def run_gui() -> None:
         _launch_transform(xfm_input_dirs, xfm_params, output_folder_var.get())
 
     tab1_run_btn.configure(command=on_run_processing)
+    tab3_run_btn.configure(command=on_run_post_processing)
     tab2_run_btn.configure(command=on_run_transform)
     run_both_btn.configure(command=on_run_both)
     root.mainloop()
