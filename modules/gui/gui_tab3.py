@@ -110,6 +110,17 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     chk_inner.bind("<Configure>", _on_chk_resize)
 
+    def _on_mousewheel(event):
+        chk_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    chk_canvas.bind("<MouseWheel>", _on_mousewheel)
+    chk_inner.bind("<MouseWheel>",  _on_mousewheel)
+
+    def _bind_mousewheel_to_children(widget):
+        widget.bind("<MouseWheel>", _on_mousewheel)
+        for child in widget.winfo_children():
+            _bind_mousewheel_to_children(child)
+
     # ── Snapshot preview pane (resizable via sash) ────────────────────────────
     _PREVIEW_INIT_W = 280
     preview_outer = tk.Frame(case_content, bg="#f5f5f5", relief="sunken", bd=1)
@@ -125,6 +136,21 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                                 text="", fg="#666666",
                                 font=("Segoe UI", 7), wraplength=0)
     preview_name_lbl.pack(pady=(2, 4))
+
+    # ── Zoom slider ───────────────────────────────────────────────────
+    zoom_var = tk.DoubleVar(value=1.0)
+    _zoom_frame = tk.Frame(preview_outer, bg="#f5f5f5")
+    _zoom_frame.pack(fill="x", padx=6, pady=(0, 2))
+    tk.Label(_zoom_frame, text="Zoom:", bg="#f5f5f5",
+             font=("Segoe UI", 7), fg="#777777").pack(side="left")
+    _zoom_val_lbl = tk.Label(_zoom_frame, text="1.0×", bg="#f5f5f5",
+                             font=("Segoe UI", 7, "bold"), fg="#444444", width=4)
+    _zoom_val_lbl.pack(side="right")
+    tk.Scale(_zoom_frame, from_=1.0, to=8.0, resolution=0.1,
+             orient="horizontal", variable=zoom_var,
+             bg="#f5f5f5", highlightthickness=0, showvalue=False,
+             length=1).pack(side="left", fill="x", expand=True, padx=(4, 2))
+
     _preview_ref = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
 
     def _find_snapshot_pp(sf_path: str) -> str | None:
@@ -159,13 +185,24 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         return str(pngs[0])
 
     def _render_preview_pp(snap: str) -> None:
-        """Load and display *snap* at the current pane width."""
-        w = max(80, preview_outer.winfo_width() - 8)
-        h = max(60, preview_outer.winfo_height() - 40)
+        """Load and display *snap* cropped and scaled to the current pane size."""
+        w    = max(80, preview_outer.winfo_width() - 8)
+        h    = max(60, preview_outer.winfo_height() - 80)  # room for header + zoom + name
+        zoom = zoom_var.get()
         try:
             try:
                 from PIL import Image as _PI, ImageTk as _PIT
                 img = _PI.open(snap)
+                if zoom > 1.0:
+                    iw, ih = img.size
+                    cw, ch = iw / zoom, ih / zoom
+                    cx, cy = iw / 2, ih / 2
+                    img = img.crop((
+                        max(0, int(cx - cw / 2)),
+                        max(0, int(cy - ch / 2)),
+                        min(iw, int(cx + cw / 2)),
+                        min(ih, int(cy + ch / 2)),
+                    ))
                 img.thumbnail((w, h))
                 photo = _PIT.PhotoImage(img)
             except ImportError:
@@ -180,6 +217,13 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         except Exception as exc:
             preview_img_lbl.configure(image="", text=f"[error: {exc}]", fg="#cc0000")
             _preview_ref[0] = None
+
+    def _on_zoom_pp(*_):
+        _zoom_val_lbl.configure(text=f"{zoom_var.get():.1f}×")
+        if _preview_ref[1]:
+            _render_preview_pp(_preview_ref[1])
+
+    zoom_var.trace_add("write", _on_zoom_pp)
 
     def _update_preview_pp(sf_path: str) -> None:
         snap = _find_snapshot_pp(sf_path)
@@ -214,6 +258,9 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     # restore from saved config
     _saved_case_groups: dict[str, str] = dict(pp_s.get("case_groups", {}))
 
+    _last_click_path: list[str | None] = [None]   # for Shift+click range assign
+    _ordered_paths:   list[str]        = []        # display order, rebuilt each load
+
     def _assign_group(sf_path: str) -> None:
         """Assign sf_path to the active group, or clear it if already that group."""
         active = active_group_var.get()
@@ -230,6 +277,31 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
                           text=grp[0].upper() if grp else "",
                           fg="white" if grp else "#e5e7eb")
+        _last_click_path[0] = sf_path
+        _update_preview_pp(sf_path)
+
+    def _assign_range(sf_path: str) -> None:
+        """Shift+click: assign active group to range from last click to sf_path."""
+        last = _last_click_path[0]
+        active = active_group_var.get()
+        if last and last in _ordered_paths and sf_path in _ordered_paths:
+            lo = min(_ordered_paths.index(last), _ordered_paths.index(sf_path))
+            hi = max(_ordered_paths.index(last), _ordered_paths.index(sf_path))
+            for pp in _ordered_paths[lo:hi + 1]:
+                if active == "_clear":
+                    case_group.pop(pp, None)
+                else:
+                    case_group[pp] = active
+                ind = _indicator_widgets.get(pp)
+                if ind is not None:
+                    grp = case_group.get(pp)
+                    ind.configure(
+                        bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
+                        text=grp[0].upper() if grp else "",
+                        fg="white" if grp else "#e5e7eb")
+        else:
+            _assign_group(sf_path)
+        _last_click_path[0] = sf_path
         _update_preview_pp(sf_path)
 
     def _build_case_grid(cases_by_output: dict[str, list[Path]]) -> None:
@@ -238,6 +310,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             w.destroy()
         case_group.clear()
         _indicator_widgets.clear()
+        _ordered_paths.clear()
         if not cases_by_output:
             tk.Label(chk_inner, text="(no subfolders found)",
                      fg="#aaaaaa", bg="white").grid(
@@ -251,6 +324,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 row=0, column=col_idx, sticky="w", padx=(4, 12), pady=(2, 4))
             for row_idx, sf in enumerate(sorted(subfolders), start=1):
                 sp = str(sf)
+                _ordered_paths.append(sp)
                 # Restore saved assignment
                 if sp in _saved_case_groups:
                     case_group[sp] = _saved_case_groups[sp]
@@ -275,8 +349,11 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 for widget in (ind, name_lbl):
                     widget.bind("<Button-1>",
                                 lambda _e, p=sp: _assign_group(p))
+                    widget.bind("<Shift-Button-1>",
+                                lambda _e, p=sp: _assign_range(p))
         chk_inner.update_idletasks()
         chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
+        _bind_mousewheel_to_children(chk_inner)
 
     def on_load_cases():
         source = pp_source_var.get()

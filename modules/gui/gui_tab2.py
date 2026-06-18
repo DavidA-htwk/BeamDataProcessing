@@ -219,6 +219,17 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
 
     chk_inner.bind("<Configure>", _on_chk_resize)
 
+    def _on_mousewheel(event):
+        chk_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    chk_canvas.bind("<MouseWheel>", _on_mousewheel)
+    chk_inner.bind("<MouseWheel>",  _on_mousewheel)
+
+    def _bind_mousewheel_to_children(widget):
+        widget.bind("<MouseWheel>", _on_mousewheel)
+        for child in widget.winfo_children():
+            _bind_mousewheel_to_children(child)
+
     # ── Snapshot preview pane (resizable via sash) ────────────────────────────
     _PREVIEW_INIT_W = 280
     preview_outer = tk.Frame(case_content, bg="#f5f5f5", relief="sunken", bd=1)
@@ -234,6 +245,21 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                                 text="", fg="#666666",
                                 font=("Segoe UI", 7), wraplength=0)
     preview_name_lbl.pack(pady=(2, 4))
+
+    # ── Zoom slider ───────────────────────────────────────────────────
+    zoom_var = tk.DoubleVar(value=1.0)
+    _zoom_frame = tk.Frame(preview_outer, bg="#f5f5f5")
+    _zoom_frame.pack(fill="x", padx=6, pady=(0, 2))
+    tk.Label(_zoom_frame, text="Zoom:", bg="#f5f5f5",
+             font=("Segoe UI", 7), fg="#777777").pack(side="left")
+    _zoom_val_lbl = tk.Label(_zoom_frame, text="1.0×", bg="#f5f5f5",
+                             font=("Segoe UI", 7, "bold"), fg="#444444", width=4)
+    _zoom_val_lbl.pack(side="right")
+    tk.Scale(_zoom_frame, from_=1.0, to=8.0, resolution=0.1,
+             orient="horizontal", variable=zoom_var,
+             bg="#f5f5f5", highlightthickness=0, showvalue=False,
+             length=1).pack(side="left", fill="x", expand=True, padx=(4, 2))
+
     _preview_ref = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
 
     def _find_snapshot_xfm(sf_path: str) -> str | None:
@@ -271,13 +297,24 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         return str(pngs[0])
 
     def _render_preview_xfm(snap: str) -> None:
-        """Load and display *snap* at the current pane width."""
-        w = max(80, preview_outer.winfo_width() - 8)
-        h = max(60, preview_outer.winfo_height() - 40)
+        """Load and display *snap* cropped and scaled to the current pane size."""
+        w    = max(80, preview_outer.winfo_width() - 8)
+        h    = max(60, preview_outer.winfo_height() - 80)  # room for header + zoom + name
+        zoom = zoom_var.get()
         try:
             try:
                 from PIL import Image as _PI, ImageTk as _PIT
                 img = _PI.open(snap)
+                if zoom > 1.0:
+                    iw, ih = img.size
+                    cw, ch = iw / zoom, ih / zoom
+                    cx, cy = iw / 2, ih / 2
+                    img = img.crop((
+                        max(0, int(cx - cw / 2)),
+                        max(0, int(cy - ch / 2)),
+                        min(iw, int(cx + cw / 2)),
+                        min(ih, int(cy + ch / 2)),
+                    ))
                 img.thumbnail((w, h))
                 photo = _PIT.PhotoImage(img)
             except ImportError:
@@ -292,6 +329,13 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         except Exception as exc:
             preview_img_lbl.configure(image="", text=f"[error: {exc}]", fg="#cc0000")
             _preview_ref[0] = None
+
+    def _on_zoom_xfm(*_):
+        _zoom_val_lbl.configure(text=f"{zoom_var.get():.1f}×")
+        if _preview_ref[1]:
+            _render_preview_xfm(_preview_ref[1])
+
+    zoom_var.trace_add("write", _on_zoom_xfm)
 
     def _update_preview_xfm(sf_path: str) -> None:
         snap = _find_snapshot_xfm(sf_path)
@@ -313,6 +357,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     case_checks: dict[str, tk.BooleanVar] = {}
     # Restore saved selection
     _saved_sel: set[str] = set(xfm_s.get("case_selection", []))
+    _last_click_path: list[str | None] = [None]   # for Shift+click range select
+    _ordered_paths:   list[str]        = []        # display order, rebuilt each load
 
     def _build_case_grid(cases_by_output: dict[str, list[Path]]) -> None:
         """Rebuild checkbox grid from cases_by_output = {output_name: [subfolder, ...]}.
@@ -324,6 +370,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         for w in chk_inner.winfo_children():
             w.destroy()
         case_checks.clear()
+        _ordered_paths.clear()
 
         if not cases_by_output:
             tk.Label(chk_inner, text="(no subfolders found)",
@@ -339,17 +386,36 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                 row=0, column=col_idx, sticky="w", padx=(4, 12), pady=(2, 4))
             # One checkbox per subfolder stacked vertically
             for row_idx, sf in enumerate(sorted(subfolders), start=1):
-                var = tk.BooleanVar(value=(str(sf) in _saved_sel))
-                def _cmd(p=str(sf), v=var):
+                sp  = str(sf)
+                var = tk.BooleanVar(value=(sp in _saved_sel))
+                _ordered_paths.append(sp)
+                def _cmd(p=sp, v=var):
+                    _last_click_path[0] = p
                     if v.get():
                         _update_preview_xfm(p)
+                def _shift_cmd(event, p=sp, v=var):
+                    """Shift+click: check all cases between last click and this one."""
+                    last = _last_click_path[0]
+                    if last and last in case_checks and p in _ordered_paths and last in _ordered_paths:
+                        lo = min(_ordered_paths.index(last), _ordered_paths.index(p))
+                        hi = max(_ordered_paths.index(last), _ordered_paths.index(p))
+                        for pp in _ordered_paths[lo:hi + 1]:
+                            if pp in case_checks:
+                                case_checks[pp].set(True)
+                    else:
+                        v.set(not v.get())
+                    _last_click_path[0] = p
+                    _update_preview_xfm(p)
+                    return "break"  # suppress default Checkbutton toggle
                 cb  = tk.Checkbutton(chk_inner, text=sf.name, variable=var,
                                      anchor="w", bg="white", command=_cmd)
+                cb.bind("<Shift-Button-1>", _shift_cmd)
                 cb.grid(row=row_idx, column=col_idx, sticky="w", padx=(4, 12), pady=1)
-                case_checks[str(sf)] = var
+                case_checks[sp] = var
 
         chk_inner.update_idletasks()
         chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
+        _bind_mousewheel_to_children(chk_inner)
 
     def on_load_cases():
         source = xfm_source_var.get()
