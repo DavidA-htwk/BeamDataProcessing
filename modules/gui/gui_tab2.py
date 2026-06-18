@@ -620,7 +620,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             xfm_mult_desc.configure(fg="#64748b")
             xfm_mult_note.configure(text="")
         else:
-            # Show the mult_factor_p (processing factor) from live comp_widgets
+            # Show mult_factor_p — VTPs store raw values, factor is applied here
             get_p = _get_mult_factor_p[0]
             if get_p is not None:
                 xfm_mult_var.set(get_p())
@@ -628,7 +628,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             xfm_mult_label.configure(fg="#999999")
             xfm_mult_desc.configure(fg="#bbbbbb")
             xfm_mult_note.configure(
-                text="(← mult_factor_p applied in Processing)")
+                text="(← mult_factor_p — applied here to raw VTP values)")
 
     xfm_source_var.trace_add("write", _update_xfm_mult_state)
     _update_xfm_mult_state()

@@ -618,7 +618,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             pp_mult_desc.configure(fg="#64748b")
             pp_mult_note.configure(text="")
         else:
-            # Show the mult_factor_p (processing factor) from live comp_widgets
+            # Show mult_factor_p — VTPs store raw values, factor is applied here
             get_p = _get_mult_factor_p[0]
             if get_p is not None:
                 pp_mult_var.set(get_p())
@@ -626,7 +626,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             pp_mult_label.configure(fg="#999999")
             pp_mult_desc.configure(fg="#bbbbbb")
             pp_mult_note.configure(
-                text="(← mult_factor_p applied in Processing)")
+                text="(← mult_factor_p — applied here to raw VTP values)")
 
     pp_source_var.trace_add("write", _update_pp_mult_state)
     _update_pp_mult_state()   # apply on first render
@@ -673,7 +673,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             "pattern":         pp_pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":     pp_filter_var.get().strip(),
             "mult_factor":     mult,
-            "apply_mult":      (source == "original"),
+            "apply_mult":      True,   # VTPs always store raw values; factor applied here
             "merge_pd":        pp_merge_pd_var.get(),
             "merge_pwr":       pp_merge_pwr_var.get(),
             "save_snapshots":  pp_save_snaps_var.get(),
@@ -684,19 +684,12 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     def get_pp_cfg_dict() -> dict:
         """Serialisable config for settings persistence."""
-        # Always save the effective (upstream) factor when source is non-original
-        # so we never persist a stale "1" that would lose the real value.
         src = pp_source_var.get()
-        saved_mult = (
-            pp_mult_var.get()
-            if src == "original"
-            else _infer_upstream_mult()
-        )
         return {
             "pp_source":        src,
             "pattern":          pp_pattern_var.get(),
             "name_filter":      pp_filter_var.get(),
-            "mult_factor":      saved_mult,
+            "mult_factor_pp":   pp_mult_var.get() if src == "original" else "1.0",
             "merge_pd":         pp_merge_pd_var.get(),
             "merge_pwr":        pp_merge_pwr_var.get(),
             "save_snapshots":   pp_save_snaps_var.get(),

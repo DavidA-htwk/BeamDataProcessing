@@ -54,7 +54,10 @@ def run_post_processing(
     name_filter = cfg.get("name_filter", "")
     out_root    = cfg.get("output_folder", "")
     mult_factor = float(cfg.get("mult_factor", 1.0))
-    apply_mult  = bool(cfg.get("apply_mult", True))   # False when source != original
+    apply_mult  = bool(cfg.get("apply_mult", True))
+    # Note: VTP files (original and post-smoothed) always store RAW unscaled values.
+    # The mult_factor is only applied to snapshots and CSV in the Processing pipeline,
+    # never baked into the .vtp files themselves.  apply_mult is therefore always True.
     merge_pd    = bool(cfg.get("merge_pd",   True))   # merge Power_Density_W_m2
     merge_pwr   = bool(cfg.get("merge_pwr",  True))   # merge Deposited_Power_W
     snap_pd     = bool(cfg.get("snap_pwr_density", True))
@@ -79,7 +82,7 @@ def run_post_processing(
     # ── Phase 0: Collect and group files ─────────────────────────────────────
     log("Collecting files from selected cases...")
     log(f"  Pattern: {pattern}  |  filter: {name_filter or '(none)'}")
-    log(f"  Mult factor: {mult_factor if apply_mult else '(not applied — already scaled)'}")
+    log(f"  Mult factor: {mult_factor:.6g} (always applied — VTPs store raw values)")
     log(f"  Merge arrays: "
         f"{'Power Density' if merge_pd else ''}"
         f"{' + ' if merge_pd and merge_pwr else ''}"
