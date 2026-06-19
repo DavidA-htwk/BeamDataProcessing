@@ -355,7 +355,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     tab1_btn_frame = tk.Frame(tab1)
     tab1_btn_frame.pack(pady=(6, 10))
     tab1_run_btn = tk.Button(
-        tab1_btn_frame, text="Run Processing", width=16, bg="#d4000e", fg="white",
+        tab1_btn_frame, text="Run Processing", width=16, bg="#0060c0", fg="white",
         font=("Segoe UI", 10, "bold"),
     )
     tab1_run_btn.pack(side="left", padx=6)

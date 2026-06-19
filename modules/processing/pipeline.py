@@ -269,6 +269,7 @@ def run_processing(
              pid,
              _snap_map[fp][9],            # save_smooth_vtp
              str(smooth_dir),             # permanent smooth VTP root
+             _snap_map[fp][3],            # mult_factor — baked into saved post-smooth VTP
             )
             for fp, on, c, s in all_meta
         ]

@@ -302,6 +302,11 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     _indicator_widgets: dict[str, tk.Label] = {}
     # restore from saved config
     _saved_case_groups: dict[str, str] = dict(pp_s.get("case_groups", {}))
+    # Baked factor: set by on_load_cases when loading post_smooth dirs.
+    # 1.0 = unscaled VTPs (allow user factor)
+    # 0.0 = mixed/unknown (disable field)
+    # other = that factor was baked in (disable field, use 1.0 internally)
+    _baked_factor: list[float] = [1.0]
 
     _last_click_path: list[str | None] = [None]   # for Shift+click range assign
     _ordered_paths:   list[str]        = []        # display order, rebuilt each load
@@ -451,6 +456,22 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             if subs:
                 cases_by_output[p.name] = subs
                 n_total += len(subs)
+        # Detect baked factor from _mult_factor.txt metadata in scenario dirs
+        if source == "post_smooth":
+            _ff: set[float] = set()
+            for _d in dirs:
+                for _sd in Path(_d).iterdir():
+                    if _sd.is_dir():
+                        _mf = _sd / "_mult_factor.txt"
+                        if _mf.exists():
+                            try: _ff.add(float(_mf.read_text().strip()))
+                            except Exception: pass
+            _baked_factor[0] = (
+                _ff.pop() if len(_ff) == 1 else
+                0.0 if len(_ff) > 1 else 1.0)
+        else:
+            _baked_factor[0] = 1.0
+        _update_pp_mult_state()
         _build_case_grid(cases_by_output)
         if n_total:
             src_label = "post-smoothed" if source == "post_smooth" else "input"
@@ -610,23 +631,37 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     btn_frame.pack(pady=(4, 10))
 
     def _update_pp_mult_state(*_):
-        src = pp_source_var.get()
+        src   = pp_source_var.get()
+        baked = _baked_factor[0]
         if src == "original":
+            _baked_factor[0] = 1.0
             pp_mult_var.set("1.0")
             pp_mult_entry.configure(state="normal")
             pp_mult_label.configure(fg="black")
             pp_mult_desc.configure(fg="#64748b")
             pp_mult_note.configure(text="")
-        else:
-            # Show mult_factor_p — VTPs store raw values, factor is applied here
-            get_p = _get_mult_factor_p[0]
-            if get_p is not None:
-                pp_mult_var.set(get_p())
+        elif baked == 0.0:
+            # Mixed factors detected across selected dirs
             pp_mult_entry.configure(state="disabled")
             pp_mult_label.configure(fg="#999999")
             pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(
-                text="(← mult_factor_p — applied here to raw VTP values)")
+            pp_mult_note.configure(text="(mixed factors baked in VTPs — cannot re-apply)")
+        elif baked != 1.0:
+            # Specific factor baked into VTPs — show it, use 1.0 internally
+            pp_mult_var.set(str(baked))
+            pp_mult_entry.configure(state="disabled")
+            pp_mult_label.configure(fg="#999999")
+            pp_mult_desc.configure(fg="#bbbbbb")
+            pp_mult_note.configure(text=f"(← factor {baked:.4g} already baked into VTPs)")
+        else:
+            # baked == 1.0: VTPs are unscaled — allow user to set a factor
+            get_p = _get_mult_factor_p[0]
+            if get_p is not None:
+                pp_mult_var.set(get_p())
+            pp_mult_entry.configure(state="normal")
+            pp_mult_label.configure(fg="black")
+            pp_mult_desc.configure(fg="#64748b")
+            pp_mult_note.configure(text="(VTPs unscaled — factor applied here)")
 
     pp_source_var.trace_add("write", _update_pp_mult_state)
     _update_pp_mult_state()   # apply on first render
@@ -668,12 +703,18 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                                  "Multiplication factor must be a number.")
             return None
         source = pp_source_var.get()
+        baked  = _baked_factor[0]
+        # If factor is already baked into VTPs, use 1.0 to avoid double-scaling.
+        effective_mult = (
+            1.0 if (baked != 1.0 and source != "original")
+            else mult
+        )
         return {
             "groups":          groups,
             "pattern":         pp_pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":     pp_filter_var.get().strip(),
-            "mult_factor":     mult,
-            "apply_mult":      True,   # VTPs always store raw values; factor applied here
+            "mult_factor":     effective_mult,
+            "apply_mult":      True,
             "merge_pd":        pp_merge_pd_var.get(),
             "merge_pwr":       pp_merge_pwr_var.get(),
             "save_snapshots":  pp_save_snaps_var.get(),

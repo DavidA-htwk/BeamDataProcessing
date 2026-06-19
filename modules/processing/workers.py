@@ -97,7 +97,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
          smooth_mode, spike_sigma, proximity_radius,
          smooth_spikes, spike_ratio,
          needs_snap, snap_dir_str, pid,
-         save_smooth_vtp, smooth_out_str) = args
+         save_smooth_vtp, smooth_out_str,
+         mult_factor_save) = args
 
         if stop_event is not None and stop_event.is_set():
             return None
@@ -178,7 +179,17 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                 _perm_dir = Path(smooth_out_str) / on / c / s
                 _perm_dir.mkdir(parents=True, exist_ok=True)
                 _perm_path = _perm_dir / f"post_smooth__{fp.name}"
-                _write_vtp(smoothed, _perm_path)
+                if mult_factor_save != 1.0:
+                    # Bake the factor into the VTP so downstream tools see
+                    # scaled values directly and need not re-apply the factor.
+                    _to_save = _scale_polydata_array(smoothed, ARRAY_NAME,  mult_factor_save)
+                    _to_save = _scale_polydata_array(_to_save, POWER_ARRAY, mult_factor_save)
+                    _write_vtp(_to_save, _perm_path)
+                    del _to_save
+                else:
+                    _write_vtp(smoothed, _perm_path)
+                # Write factor metadata so downstream tabs can detect it.
+                (_perm_dir / "_mult_factor.txt").write_text(str(mult_factor_save))
                 saved_smooth_path = str(_perm_path)
 
             del smoothed   # free after precompute + write

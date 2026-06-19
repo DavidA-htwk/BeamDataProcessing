@@ -128,8 +128,9 @@ def run_gui() -> None:
     log_outer = tk.Frame(root)
     log_outer.pack(fill="both", expand=True, padx=10, pady=(6, 4))
 
-    # Two side-by-side log panes — one per pipeline
+    # Three log panes, each with an inline stop button in the header
     def _make_log_pane(parent: tk.Frame, label: str) -> tk.Text:
+        """Simple pane without stop button (used before stop events exist)."""
         col = tk.Frame(parent)
         col.pack(side="left", fill="both", expand=True, padx=(0, 4))
         tk.Label(col, text=label, anchor="w",
@@ -283,54 +284,65 @@ def run_gui() -> None:
 
     t1["_xfm_cfg_fn"][0] = _cfg_dispatch
 
-    # -- Run Both + Stop buttons -----------------------------------------------
-    _stop_event       = threading.Event()
-    _active_proc      = [0]   # processing workers running
-    _active_pp        = [0]   # post-processing workers running
-    _active_xfm       = [0]   # transform workers running
+    # -- Independent stop events and counters ---------------------------------
+    _stop_proc  = threading.Event()
+    _stop_pp    = threading.Event()
+    _stop_xfm   = threading.Event()
+    _active_proc = [0]
+    _active_pp   = [0]
+    _active_xfm  = [0]
 
-    btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=(4, 10))
-    run_both_btn = tk.Button(
-        btn_frame, text="Run Both", width=12, bg="#6a0dad", fg="white",
-        font=("Segoe UI", 10, "bold"),
-    )
-    run_both_btn.pack(side="left", padx=6)
-    stop_btn = tk.Button(
-        btn_frame, text="Stop", width=12, bg="#555555", fg="white",
-        font=("Segoe UI", 10, "bold"), state="disabled",
-    )
-    stop_btn.pack(side="left", padx=6)
+    # Stop buttons live inline in the log column headers
+    def _add_stop_btn(log_box: tk.Text, stop_event: threading.Event) -> tk.Button:
+        """Insert a stop button into the header row above log_box."""
+        col_frame = log_box.master.master  # Text → inner Frame → col Frame
+        hdr = tk.Frame(col_frame)
+        hdr.pack(before=log_box.master, fill="x")
+        # Move the existing label into the new header frame
+        for child in list(col_frame.children.values()):
+            if isinstance(child, tk.Label):
+                child.pack_forget()
+                child.pack(in_=hdr, side="left", fill="x", expand=True)
+                break
+        btn = tk.Button(
+            hdr, text="■ Stop", width=7, state="disabled",
+            bg="#b91c1c", fg="white", font=("Segoe UI", 8, "bold"),
+            padx=2, pady=0,
+        )
+        btn.configure(command=lambda e=stop_event, b=btn: (
+            e.set(), b.configure(state="disabled", text="Stopping…")))
+        btn.pack(side="right")
+        return btn
 
-    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn, run_both_btn]
+    stop_btn_proc = _add_stop_btn(log_box_proc, _stop_proc)
+    stop_btn_pp   = _add_stop_btn(log_box_pp,   _stop_pp)
+    stop_btn_xfm  = _add_stop_btn(log_box_xfm,  _stop_xfm)
 
-    def on_stop():
-        _stop_event.set()
-        stop_btn.configure(state="disabled", text="Stopping...")
+    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn]
 
-    stop_btn.configure(command=on_stop)
-
-    def _set_busy(mode: str = "both") -> None:
-        """mode: 'proc' | 'pp' | 'xfm' | 'both' — which pane(s) to clear."""
-        _stop_event.clear()
+    def _set_busy(mode: str = "proc") -> None:
+        """mode: 'proc' | 'pp' | 'xfm' — clear the pane and arm stop button."""
         _run_start_time[0] = time.strftime("%Y-%m-%d_%H-%M-%S")
-        stop_btn.configure(state="normal", text="Stop")
-        # Disable only the button(s) being started; Run Both always disabled while anything runs
-        run_both_btn.configure(state="disabled")
-        if mode in ("proc", "both"):
+        if mode == "proc":
+            _stop_proc.clear()
             tab1_run_btn.configure(state="disabled")
+            stop_btn_proc.configure(state="normal", text="■ Stop")
             _log_lines_proc.clear()
             log_box_proc.configure(state="normal")
             log_box_proc.delete("1.0", "end")
             log_box_proc.configure(state="disabled")
-        if mode in ("pp",):
+        elif mode == "pp":
+            _stop_pp.clear()
             tab3_run_btn.configure(state="disabled")
+            stop_btn_pp.configure(state="normal", text="■ Stop")
             _log_lines_pp.clear()
             log_box_pp.configure(state="normal")
             log_box_pp.delete("1.0", "end")
             log_box_pp.configure(state="disabled")
-        if mode in ("xfm", "both"):
+        elif mode == "xfm":
+            _stop_xfm.clear()
             tab2_run_btn.configure(state="disabled")
+            stop_btn_xfm.configure(state="normal", text="■ Stop")
             _log_lines_xfm.clear()
             log_box_xfm.configure(state="normal")
             log_box_xfm.delete("1.0", "end")
@@ -340,25 +352,26 @@ def run_gui() -> None:
         _active_proc[0] = max(0, _active_proc[0] - 1)
         if _active_proc[0] == 0:
             tab1_run_btn.configure(state="normal")
+            stop_btn_proc.configure(state="disabled", text="■ Stop")
         _finish_if_idle()
 
     def _on_pp_done() -> None:
         _active_pp[0] = max(0, _active_pp[0] - 1)
         if _active_pp[0] == 0:
             tab3_run_btn.configure(state="normal")
+            stop_btn_pp.configure(state="disabled", text="■ Stop")
         _finish_if_idle()
 
     def _on_xfm_done() -> None:
         _active_xfm[0] = max(0, _active_xfm[0] - 1)
         if _active_xfm[0] == 0:
             tab2_run_btn.configure(state="normal")
+            stop_btn_xfm.configure(state="disabled", text="■ Stop")
         _finish_if_idle()
 
     def _finish_if_idle() -> None:
         if _active_proc[0] > 0 or _active_pp[0] > 0 or _active_xfm[0] > 0:
             return
-        run_both_btn.configure(state="normal")
-        stop_btn.configure(state="disabled", text="Stop")
         out_folder = output_folder_var.get().strip() or str(
             Path(__file__).resolve().parent / "output")
         try:
@@ -380,7 +393,7 @@ def run_gui() -> None:
     def _launch_processing(cfg: dict) -> None:
         def worker():
             try:
-                run_processing(cfg, log_proc, _stop_event)
+                run_processing(cfg, log_proc, _stop_proc)
             finally:
                 root.after(0, _on_proc_done)
         _active_proc[0] += 1
@@ -389,7 +402,7 @@ def run_gui() -> None:
     def _launch_post_processing(cfg: dict) -> None:
         def worker():
             try:
-                run_post_processing(cfg, log_pp, _stop_event)
+                run_post_processing(cfg, log_pp, _stop_pp)
             finally:
                 root.after(0, _on_pp_done)
         _active_pp[0] += 1
@@ -399,7 +412,7 @@ def run_gui() -> None:
         def worker():
             try:
                 run_transform(input_dirs=input_dirs, xfm_params=xfm_params,
-                              output_folder=out_folder, log=log_xfm, stop_event=_stop_event)
+                              output_folder=out_folder, log=log_xfm, stop_event=_stop_xfm)
             finally:
                 root.after(0, _on_xfm_done)
         _active_xfm[0] += 1
@@ -485,33 +498,9 @@ def run_gui() -> None:
         _set_busy("xfm")
         _launch_transform(input_dirs, xfm_params, output_folder_var.get())
 
-    def on_run_both():
-        xfm_params = get_transform_params()
-        if xfm_params is None:
-            return
-        xfm_input_dirs = xfm_params.pop("_selected_dirs", [])
-        if not xfm_input_dirs:
-            messagebox.showwarning("No cases selected",
-                                   "Select at least one case in the Cases section.")
-            return
-        cfg = _current_cfg()
-        if not cfg["input_dirs"]:
-            messagebox.showwarning("No directories", "Please paste at least one directory path.")
-            return
-        if not comp_widgets:
-            log('[!] No geometry loaded - please click "Load Geometry" before running.')
-            return
-        if not _confirm_overwrite():
-            return
-        save_settings(cfg)
-        _set_busy("both")
-        _launch_processing(cfg)
-        _launch_transform(xfm_input_dirs, xfm_params, output_folder_var.get())
-
     tab1_run_btn.configure(command=on_run_processing)
     tab3_run_btn.configure(command=on_run_post_processing)
     tab2_run_btn.configure(command=on_run_transform)
-    run_both_btn.configure(command=on_run_both)
     root.mainloop()
 
 

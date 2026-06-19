@@ -89,14 +89,14 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     try:
         from PIL import Image as _PILImage, ImageTk as _PILImageTk
         _pil     = _PILImage.open(_coord_img_path)
-        _th      = 70
+        _th      = 100
         _tw      = int(_th * _pil.width / _pil.height)
         _pil     = _pil.resize((_tw, _th), _PILImage.LANCZOS)
         _coord_photo = _PILImageTk.PhotoImage(_pil)
     except Exception:
         try:
             _raw         = tk.PhotoImage(file=_coord_img_path)
-            _factor      = max(1, _raw.height() // 70)
+            _factor      = max(1, _raw.height() // 100)
             _coord_photo = _raw.subsample(_factor, _factor)
         except Exception:
             _coord_photo = None
@@ -404,6 +404,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     _saved_sel: set[str] = set(xfm_s.get("case_selection", []))
     _last_click_path: list[str | None] = [None]   # for Shift+click range select
     _ordered_paths:   list[str]        = []        # display order, rebuilt each load
+    # Baked factor detected from post-smooth VTP metadata (same semantics as Tab 3)
+    _baked_factor_xfm: list[float] = [1.0]
 
     def _build_case_grid(cases_by_output: dict[str, list[Path]]) -> None:
         """Rebuild checkbox grid from cases_by_output = {output_name: [subfolder, ...]}.
@@ -547,6 +549,22 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                 if subs:
                     cases_by_output[name] = subs
                     n_total += len(subs)
+        # Detect baked factor from _mult_factor.txt metadata (post-smooth source)
+        if source == "smoothed":
+            _ff2: set[float] = set()
+            for _d in dirs:
+                for _sd in Path(_d).iterdir():
+                    if _sd.is_dir():
+                        _mf = _sd / "_mult_factor.txt"
+                        if _mf.exists():
+                            try: _ff2.add(float(_mf.read_text().strip()))
+                            except Exception: pass
+            _baked_factor_xfm[0] = (
+                _ff2.pop() if len(_ff2) == 1 else
+                0.0 if len(_ff2) > 1 else 1.0)
+        else:
+            _baked_factor_xfm[0] = 1.0
+        _update_xfm_mult_state()
         _build_case_grid(cases_by_output)
         if n_total:
             src_label = ("post-smoothed" if source == "smoothed"
@@ -612,23 +630,35 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
                    variable=xfm_ignore_zeros).pack(side="left")
 
     def _update_xfm_mult_state(*_):
-        src = xfm_source_var.get()
+        src   = xfm_source_var.get()
+        baked = _baked_factor_xfm[0]
         if src == "original":
+            _baked_factor_xfm[0] = 1.0
             xfm_mult_var.set("1.0")
             xfm_mult_entry.configure(state="normal")
             xfm_mult_label.configure(fg="black")
             xfm_mult_desc.configure(fg="#64748b")
             xfm_mult_note.configure(text="")
-        else:
-            # Show mult_factor_p — VTPs store raw values, factor is applied here
-            get_p = _get_mult_factor_p[0]
-            if get_p is not None:
-                xfm_mult_var.set(get_p())
+        elif baked == 0.0:
             xfm_mult_entry.configure(state="disabled")
             xfm_mult_label.configure(fg="#999999")
             xfm_mult_desc.configure(fg="#bbbbbb")
-            xfm_mult_note.configure(
-                text="(← mult_factor_p — applied here to raw VTP values)")
+            xfm_mult_note.configure(text="(mixed factors baked in VTPs — cannot re-apply)")
+        elif baked != 1.0:
+            xfm_mult_var.set(str(baked))
+            xfm_mult_entry.configure(state="disabled")
+            xfm_mult_label.configure(fg="#999999")
+            xfm_mult_desc.configure(fg="#bbbbbb")
+            xfm_mult_note.configure(text=f"(← factor {baked:.4g} already baked into VTPs)")
+        else:
+            # baked == 1.0: VTPs unscaled, allow user to set factor
+            get_p = _get_mult_factor_p[0]
+            if get_p is not None:
+                xfm_mult_var.set(get_p())
+            xfm_mult_entry.configure(state="normal")
+            xfm_mult_label.configure(fg="black")
+            xfm_mult_desc.configure(fg="#64748b")
+            xfm_mult_note.configure(text="(VTPs unscaled — factor applied here)")
 
     xfm_source_var.trace_add("write", _update_xfm_mult_state)
     _update_xfm_mult_state()
@@ -666,6 +696,12 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         except ValueError:
             messagebox.showerror("Invalid input", "Multiplication factor must be a number.")
             return None
+        # Effective mult: if factor is already baked into VTPs, use 1.0
+        baked = _baked_factor_xfm[0]
+        effective_mult = (
+            1.0 if (baked != 1.0 and xfm_source_var.get() != "original")
+            else mult
+        )
         exp_geom  = xfm_export_geom.get()
         exp_area  = xfm_export_area.get()
         exp_power = xfm_export_power.get()
@@ -686,7 +722,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             "name_filter":  xfm_filter_var.get().strip(),
             "export_geom":  exp_geom, "export_area":  exp_area,
             "export_power": exp_power, "export_pload": exp_pload,
-            "mult":         mult, "ignore_zeros": xfm_ignore_zeros.get(),
+            "mult":         effective_mult, "ignore_zeros": xfm_ignore_zeros.get(),
             "_selected_dirs": selected,
         }
 
