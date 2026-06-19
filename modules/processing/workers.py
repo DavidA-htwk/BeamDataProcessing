@@ -186,16 +186,12 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                         _bare = _bare[len(_pfx):]
                         break
                 _perm_path = _perm_dir / f"post_smooth_results_{_bare}{fp.suffix}"
-                if mult_factor_save != 1.0:
-                    # Bake the factor into the VTP so downstream tools see
-                    # scaled values directly and need not re-apply the factor.
-                    _to_save = _scale_polydata_array(smoothed, ARRAY_NAME,  mult_factor_save)
-                    _to_save = _scale_polydata_array(_to_save, POWER_ARRAY, mult_factor_save)
-                    _write_vtp(_to_save, _perm_path)
-                    del _to_save
-                else:
-                    _write_vtp(smoothed, _perm_path)
-                # Write factor metadata so downstream tabs can detect it.
+                # Always store raw smoothed values — do NOT bake the factor.
+                # Baking causes float32 precision issues and amplifies spike cells
+                # that passed the spike-detection threshold at raw scale.
+                # _mult_factor.txt tells downstream tools (Tab 3) what factor
+                # was used in Processing so they can pre-fill and apply it.
+                _write_vtp(smoothed, _perm_path)
                 (_perm_dir / "_mult_factor.txt").write_text(str(mult_factor_save))
                 saved_smooth_path = str(_perm_path)
 

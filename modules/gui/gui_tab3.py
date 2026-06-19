@@ -569,59 +569,39 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             is_active = (n == name)
             relief = "sunken" if is_active else "raised"
             bd     = 3 if is_active else 1
-            btn.configure(relief=relief, bd=bd)
+            bg     = _GROUP_COLORS.get(n, btn.cget("bg"))
+            btn.configure(relief=relief, bd=bd, bg=bg)
 
     def _rename_tool(key: str) -> None:
         """Prompt user to rename tool *key*; update button text and indicators."""
-        current = _group_labels.get(key, key)
+        from tkinter import simpledialog
 
-        # Custom dialog so we can apply the app icon
-        _result = [None]
-        dlg = tk.Toplevel(tab3)
-        dlg.title("Rename group")
-        dlg.resizable(False, False)
-        dlg.grab_set()
         _base_dir = Path(__file__).resolve().parent.parent.parent
         _ico = _base_dir / "Beam.ico"
         _png = _base_dir / "Beam.png"
-        try:
-            if _ico.exists() and sys.platform.startswith("win"):
-                dlg.iconbitmap(str(_ico))
-            elif _png.exists():
-                _dlg_icon = tk.PhotoImage(file=str(_png))
-                dlg.iconphoto(False, _dlg_icon)
-        except Exception:
-            pass
-        tk.Label(dlg, text=f"Enter a new name for the '{current}' tool:\n"
-                            "(used as VTP filename prefix)",
-                 justify="left", padx=12, pady=(10, 4)).pack()
-        _entry_var = tk.StringVar(value=current)
-        _entry = tk.Entry(dlg, textvariable=_entry_var, width=32)
-        _entry.pack(padx=12, pady=4)
-        _entry.select_range(0, "end")
-        _entry.focus_set()
-        _btn_row = tk.Frame(dlg)
-        _btn_row.pack(pady=(4, 10))
-        def _ok(_e=None):
-            _result[0] = _entry_var.get()
-            dlg.destroy()
-        def _cancel(_e=None):
-            dlg.destroy()
-        tk.Button(_btn_row, text="OK",     width=8, command=_ok).pack(side="left", padx=4)
-        tk.Button(_btn_row, text="Cancel", width=8, command=_cancel).pack(side="left", padx=4)
-        _entry.bind("<Return>", _ok)
-        _entry.bind("<Escape>", _cancel)
-        dlg.bind("<Return>", _ok)
-        # Centre over parent
-        tab3.update_idletasks()
-        px, py = tab3.winfo_rootx(), tab3.winfo_rooty()
-        pw, ph = tab3.winfo_width(), tab3.winfo_height()
-        dlg.update_idletasks()
-        dw, dh = dlg.winfo_width(), dlg.winfo_height()
-        dlg.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
-        tab3.wait_window(dlg)
 
-        new_name = _result[0]
+        class _IconQueryString(simpledialog._QueryString):
+            def body(self, master):
+                widget = super().body(master)
+                # Set the app icon now that the Toplevel window exists
+                try:
+                    if _ico.exists() and sys.platform.startswith("win"):
+                        self.iconbitmap(str(_ico))
+                    elif _png.exists():
+                        self._dlg_icon = tk.PhotoImage(file=str(_png))
+                        self.iconphoto(False, self._dlg_icon)
+                except Exception:
+                    pass
+                return widget
+
+        current = _group_labels.get(key, key)
+        new_name = _IconQueryString(
+            "Rename group",
+            f"Enter a new name for the '{current}' tool:\n"
+            "(used as VTP filename prefix)",
+            initialvalue=current,
+            parent=tab3,
+        ).result
         if not new_name or not new_name.strip():
             return
         new_name = new_name.strip()
@@ -636,8 +616,6 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 ind.configure(text=new_name[0].upper())
         # Re-assert active tool styling (dialog focus loss can visually reset buttons)
         _select_tool(active_group_var.get())
-        # If this is the active tool, refresh active_group_var display
-        # (the var holds the key, not the label, so no var change needed)
 
     for _gname, _gcol in MERGE_GROUPS:
         _btn = tk.Button(
@@ -762,18 +740,18 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             pp_mult_desc.configure(fg="#bbbbbb")
             pp_mult_note.configure(text="(click \u201cLoad Cases\u201d to detect baked factor)")
         elif baked == 0.0:
-            # Mixed factors detected across selected dirs
-            pp_mult_entry.configure(state="disabled")
-            pp_mult_label.configure(fg="#999999")
-            pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(text="(mixed factors baked in VTPs \u2014 cannot re-apply)")
+            # Mixed factors detected across selected dirs — warn but allow edit
+            pp_mult_entry.configure(state="normal")
+            pp_mult_label.configure(fg="black")
+            pp_mult_desc.configure(fg="#64748b")
+            pp_mult_note.configure(text="(\u26a0 mixed factors across cases \u2014 set manually)")
         elif baked != 1.0:
-            # Specific factor baked into VTPs \u2014 show it, use 1.0 internally
+            # VTPs store raw smoothed values; pre-fill factor from Processing
             pp_mult_var.set(str(baked))
-            pp_mult_entry.configure(state="disabled")
-            pp_mult_label.configure(fg="#999999")
-            pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(text=f"(\u2190 factor {baked:.4g} already baked into VTPs)")
+            pp_mult_entry.configure(state="normal")
+            pp_mult_label.configure(fg="black")
+            pp_mult_desc.configure(fg="#64748b")
+            pp_mult_note.configure(text=f"(\u2190 pre-filled from Processing; VTPs store raw values)")
         else:
             # baked == 1.0 and confirmed by Load Cases: VTPs unscaled
             get_p = _get_mult_factor_p[0]
@@ -839,12 +817,8 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                                  "Multiplication factor must be a number.")
             return None
         source = pp_source_var.get()
-        baked  = _baked_factor[0]
-        # If factor is already baked into VTPs, use 1.0 to avoid double-scaling.
-        effective_mult = (
-            1.0 if (baked != 1.0 and source != "original")
-            else mult
-        )
+        # VTPs always store raw values; apply the user-entered factor directly.
+        effective_mult = mult
         return {
             "groups":          groups,
             "group_labels":    dict(_group_labels),
