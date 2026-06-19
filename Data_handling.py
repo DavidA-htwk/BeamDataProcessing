@@ -442,10 +442,10 @@ def run_gui() -> None:
         if not out.exists():
             return True
         try:
-            has_files = any(p.is_file() for p in out.iterdir())
+            has_content = any(out.iterdir())
         except OSError:
             return True
-        if not has_files:
+        if not has_content:
             return True
         return messagebox.askyesno(
             "Output folder not empty",

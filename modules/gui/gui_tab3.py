@@ -17,6 +17,7 @@ The tab lets the user:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import tkinter as tk
@@ -41,12 +42,14 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     src_lframe = tk.LabelFrame(tab3, text="Input source", padx=8, pady=6)
     src_lframe.pack(fill="x", padx=10, pady=(8, 4))
 
-    pp_source_var = tk.StringVar(value=pp_s.get("pp_source", "original"))
+    pp_source_var = tk.StringVar(value=pp_s.get("pp_source", "original_smooth"))
 
     src_radio_frame = tk.Frame(src_lframe)
     src_radio_frame.pack(fill="x")
-    tk.Radiobutton(src_radio_frame, text="Original input folders",
-                   variable=pp_source_var, value="original").pack(side="left", padx=(0, 16))
+    tk.Radiobutton(src_radio_frame, text="Original input folders (RAW: results_*.vtp)",
+                   variable=pp_source_var, value="original_raw").pack(side="left", padx=(0, 12))
+    tk.Radiobutton(src_radio_frame, text="Original input folders (smoothed: smoothed_results_*.vtp)",
+                   variable=pp_source_var, value="original_smooth").pack(side="left", padx=(0, 12))
     tk.Radiobutton(src_radio_frame,
                    text="Post-smooth VTPs from Processing (output/post_smoothed/)",
                    variable=pp_source_var, value="post_smooth").pack(side="left")
@@ -160,34 +163,47 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     def _find_snapshot_pp(sf_path: str) -> str | None:
         """Return best matching processing snapshot PNG for sf_path."""
-        get_out = _get_output_folder[0]
-        if get_out is None:
-            return None
-        out_raw = get_out().strip()
-        if not out_raw:
-            return None
-        out_dir = Path(out_raw)
         source  = pp_source_var.get()
         try:
             output_name, case, scenario = extract_case_scenario(sf_path)
         except Exception:
             return None
-        snap_base = out_dir / "snapshots" / output_name / case / scenario
+
+        if source == "post_smooth":
+            # sf_path = {out}/post_smoothed/{output_name}/{case}/{scenario} → parents[3]={out}
+            derived = Path(sf_path).parents[3]
+            snap_base = derived / "snapshots" / output_name / case / scenario
+        else:
+            # original sources: use configured output folder
+            get_out = _get_output_folder[0]
+            if get_out is None:
+                return None
+            out_raw = get_out().strip()
+            if not out_raw:
+                return None
+            snap_base = Path(out_raw) / "snapshots" / output_name / case / scenario
+
         if not snap_base.exists():
             return None
         pngs = sorted(snap_base.glob("*.png"))
         if not pngs:
             return None
-        if source == "original":
-            for suffix in ("__before", "__pwr_density"):
-                cands = [p for p in pngs if suffix in p.stem and "after" not in p.stem]
-                if cands:
-                    return str(cands[0])
-        else:
-            cands = [p for p in pngs if "__after" in p.stem]
+        if source in ("original", "original_smooth"):
+            # Smoothed simulation input → __RAW_smoothed snapshot
+            cands = [p for p in pngs if "__RAW_smoothed" in p.stem]
             if cands:
                 return str(cands[0])
-        return str(pngs[0])
+        elif source == "original_raw":
+            # RAW input → __RAW snapshot (before post-smoothing)
+            cands = [p for p in pngs if "__RAW" in p.stem and "__RAW_smoothed" not in p.stem]
+            if cands:
+                return str(cands[0])
+        else:
+            # post_smooth source → show the __post_smooth snapshot from Processing
+            cands = [p for p in pngs if "__post_smooth" in p.stem]
+            if cands:
+                return str(cands[0])
+        return None
 
     def _render_preview_pp(snap: str) -> None:
         """Load and display *snap* with pan/zoom applied."""
@@ -288,13 +304,18 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     # ── Merge group definitions ───────────────────────────────────────────
     MERGE_GROUPS = [
-        ("blue",   "#2563eb"),  # output prefix: blue__merged__...
+        ("blue",   "#2563eb"),
         ("red",    "#dc2626"),
         ("green",  "#16a34a"),
         ("orange", "#ea580c"),
         ("purple", "#9333ea"),
     ]
     _GROUP_COLORS = {name: color for name, color in MERGE_GROUPS}
+    # User-visible labels (may be overridden via double-click rename)
+    _saved_labels: dict[str, str] = pp_s.get("group_labels", {})
+    _group_labels: dict[str, str] = {
+        k: _saved_labels.get(k, k) for k, _ in MERGE_GROUPS
+    }
     active_group_var = tk.StringVar(value=MERGE_GROUPS[0][0])   # currently active tool
     # case_group: {sf_path: group_name} — unkeyed = not in any group
     case_group: dict[str, str] = {}
@@ -307,6 +328,9 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     # 0.0 = mixed/unknown (disable field)
     # other = that factor was baked in (disable field, use 1.0 internally)
     _baked_factor: list[float] = [1.0]
+    # Set to True when post_smooth cases have been loaded (factor confirmed).
+    # Until then, the factor field stays locked for post_smooth source.
+    _cases_loaded_for_source: list[str] = [""]
 
     _last_click_path: list[str | None] = [None]   # for Shift+click range assign
     _ordered_paths:   list[str]        = []        # display order, rebuilt each load
@@ -320,13 +344,16 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             case_group.pop(sf_path, None)  # toggle off
         else:
             case_group[sf_path] = active
-        # Update indicator widget color
+        # Update indicator widget: show first letter of the custom label
         ind = _indicator_widgets.get(sf_path)
         if ind is not None:
             grp = case_group.get(sf_path)
-            ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
-                          text=grp[0].upper() if grp else "",
-                          fg="white" if grp else "#e5e7eb")
+            if grp:
+                lbl = _group_labels.get(grp, grp)
+                ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb"),
+                              text=lbl[0].upper(), fg="white")
+            else:
+                ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
         _last_click_path[0] = sf_path
         _update_preview_pp(sf_path)
 
@@ -345,10 +372,12 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 ind = _indicator_widgets.get(pp)
                 if ind is not None:
                     grp = case_group.get(pp)
-                    ind.configure(
-                        bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
-                        text=grp[0].upper() if grp else "",
-                        fg="white" if grp else "#e5e7eb")
+                    if grp:
+                        lbl = _group_labels.get(grp, grp)
+                        ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb"),
+                                      text=lbl[0].upper(), fg="white")
+                    else:
+                        ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
         else:
             _assign_group(sf_path)
         _last_click_path[0] = sf_path
@@ -379,9 +408,11 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 if sp in _saved_case_groups:
                     case_group[sp] = _saved_case_groups[sp]
                 grp = case_group.get(sp)
+                lbl_text = (_group_labels.get(grp, grp)[0].upper()
+                            if grp else "")
                 ind = tk.Label(
                     chk_inner,
-                    text=grp[0].upper() if grp else "",
+                    text=lbl_text,
                     width=2, font=("Segoe UI", 7, "bold"),
                     bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
                     fg="white",
@@ -448,14 +479,29 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
         cases_by_output: dict[str, list[Path]] = {}
         n_total = 0
+        _STORAGE = {"SMOOTHED", "RAW", "RESULTS", "OUTPUT"}
         for d in dirs:
             p = Path(d)
             if not p.is_dir():
                 continue
-            subs = sorted([s for s in p.iterdir() if s.is_dir()])
-            if subs:
-                cases_by_output[p.name] = subs
-                n_total += len(subs)
+            if source == "original_smooth":
+                # Show only the SMOOTHED subdir of each scenario dir
+                smoothed_sub = p / "SMOOTHED"
+                if smoothed_sub.is_dir():
+                    cases_by_output.setdefault(p.name, []).append(smoothed_sub)
+                    n_total += 1
+            elif source in ("original_raw", "original"):
+                # Show only non-storage subdirs (skip SMOOTHED, RAW, etc.)
+                subs = sorted([s for s in p.iterdir()
+                               if s.is_dir() and s.name.upper() not in _STORAGE])
+                if subs:
+                    cases_by_output[p.name] = subs
+                    n_total += len(subs)
+            else:
+                subs = sorted([s for s in p.iterdir() if s.is_dir()])
+                if subs:
+                    cases_by_output[p.name] = subs
+                    n_total += len(subs)
         # Detect baked factor from _mult_factor.txt metadata in scenario dirs
         if source == "post_smooth":
             _ff: set[float] = set()
@@ -471,6 +517,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 0.0 if len(_ff) > 1 else 1.0)
         else:
             _baked_factor[0] = 1.0
+        _cases_loaded_for_source[0] = source
         _update_pp_mult_state()
         _build_case_grid(cases_by_output)
         if n_total:
@@ -480,6 +527,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 f"  [{src_label}]")
         else:
             load_case_status.set("  No subfolders found in the given paths.")
+        _mark_load_fresh()
 
     load_case_btn.configure(command=on_load_cases)
 
@@ -493,12 +541,13 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 if ind:
                     ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
         else:
+            lbl = _group_labels.get(active, active)
             for sp in _indicator_widgets:
                 case_group[sp] = active
                 ind = _indicator_widgets.get(sp)
                 if ind:
                     ind.configure(bg=_GROUP_COLORS[active],
-                                  text=active[0].upper(), fg="white")
+                                  text=lbl[0].upper(), fg="white")
 
     def _desel_all():
         """Remove all cases from all groups."""
@@ -522,10 +571,78 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             bd     = 3 if is_active else 1
             btn.configure(relief=relief, bd=bd)
 
+    def _rename_tool(key: str) -> None:
+        """Prompt user to rename tool *key*; update button text and indicators."""
+        current = _group_labels.get(key, key)
+
+        # Custom dialog so we can apply the app icon
+        _result = [None]
+        dlg = tk.Toplevel(tab3)
+        dlg.title("Rename group")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        _base_dir = Path(__file__).resolve().parent.parent.parent
+        _ico = _base_dir / "Beam.ico"
+        _png = _base_dir / "Beam.png"
+        try:
+            if _ico.exists() and sys.platform.startswith("win"):
+                dlg.iconbitmap(str(_ico))
+            elif _png.exists():
+                _dlg_icon = tk.PhotoImage(file=str(_png))
+                dlg.iconphoto(False, _dlg_icon)
+        except Exception:
+            pass
+        tk.Label(dlg, text=f"Enter a new name for the '{current}' tool:\n"
+                            "(used as VTP filename prefix)",
+                 justify="left", padx=12, pady=(10, 4)).pack()
+        _entry_var = tk.StringVar(value=current)
+        _entry = tk.Entry(dlg, textvariable=_entry_var, width=32)
+        _entry.pack(padx=12, pady=4)
+        _entry.select_range(0, "end")
+        _entry.focus_set()
+        _btn_row = tk.Frame(dlg)
+        _btn_row.pack(pady=(4, 10))
+        def _ok(_e=None):
+            _result[0] = _entry_var.get()
+            dlg.destroy()
+        def _cancel(_e=None):
+            dlg.destroy()
+        tk.Button(_btn_row, text="OK",     width=8, command=_ok).pack(side="left", padx=4)
+        tk.Button(_btn_row, text="Cancel", width=8, command=_cancel).pack(side="left", padx=4)
+        _entry.bind("<Return>", _ok)
+        _entry.bind("<Escape>", _cancel)
+        dlg.bind("<Return>", _ok)
+        # Centre over parent
+        tab3.update_idletasks()
+        px, py = tab3.winfo_rootx(), tab3.winfo_rooty()
+        pw, ph = tab3.winfo_width(), tab3.winfo_height()
+        dlg.update_idletasks()
+        dw, dh = dlg.winfo_width(), dlg.winfo_height()
+        dlg.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        tab3.wait_window(dlg)
+
+        new_name = _result[0]
+        if not new_name or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        _group_labels[key] = new_name
+        # Update tool button label and re-apply bg (Windows may reset it after dialog focus)
+        btn = _tool_btns.get(key)
+        if btn:
+            btn.configure(text=new_name, bg=_GROUP_COLORS.get(key, btn.cget("bg")))
+        # Update all indicator squares that currently carry this group
+        for sp, ind in _indicator_widgets.items():
+            if case_group.get(sp) == key:
+                ind.configure(text=new_name[0].upper())
+        # Re-assert active tool styling (dialog focus loss can visually reset buttons)
+        _select_tool(active_group_var.get())
+        # If this is the active tool, refresh active_group_var display
+        # (the var holds the key, not the label, so no var change needed)
+
     for _gname, _gcol in MERGE_GROUPS:
         _btn = tk.Button(
             selall_frame,
-            text=_gname.capitalize(),
+            text=_group_labels.get(_gname, _gname),
             bg=_gcol, fg="white",
             font=("Segoe UI", 8, "bold"),
             relief="raised", bd=1, padx=6, pady=1,
@@ -533,6 +650,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             command=lambda n=_gname: _select_tool(n),
         )
         _btn.pack(side="left", padx=(0, 3))
+        _btn.bind("<Double-Button-1>", lambda _e, n=_gname: _rename_tool(n))
         _tool_btns[_gname] = _btn
 
     # Separator + utility buttons
@@ -541,14 +659,6 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
               command=_sel_all).pack(side="left", padx=(0, 3))
     tk.Button(selall_frame, text="Clear all",  width=9,
               command=_desel_all).pack(side="left", padx=(0, 3))
-    _clear_btn = tk.Button(
-        selall_frame, text="✕ Eraser", bg="#6b7280", fg="white",
-        font=("Segoe UI", 8), relief="raised", bd=1, padx=6, pady=1,
-        cursor="hand2",
-        command=lambda: _select_tool("_clear"),
-    )
-    _clear_btn.pack(side="left", padx=(0, 3))
-    _tool_btns["_clear"] = _clear_btn
 
     # Activate first tool by default
     _select_tool(MERGE_GROUPS[0][0])
@@ -630,46 +740,72 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     snap_lframe.pack(fill="x", padx=10, pady=(4, 2))
     btn_frame.pack(pady=(4, 10))
 
+    # src values where mult factor is editable (all original sources)
+    _PP_ORIGINAL_SRCS = {"original", "original_raw", "original_smooth"}
+
     def _update_pp_mult_state(*_):
         src   = pp_source_var.get()
         baked = _baked_factor[0]
-        if src == "original":
+        loaded_for_this_src = (_cases_loaded_for_source[0] == src)
+        if src in _PP_ORIGINAL_SRCS:
             _baked_factor[0] = 1.0
+            _cases_loaded_for_source[0] = src   # original dirs always confirmed
             pp_mult_var.set("1.0")
             pp_mult_entry.configure(state="normal")
             pp_mult_label.configure(fg="black")
             pp_mult_desc.configure(fg="#64748b")
             pp_mult_note.configure(text="")
+        elif not loaded_for_this_src:
+            # Source changed but Load Cases not yet clicked — lock the field
+            pp_mult_entry.configure(state="disabled")
+            pp_mult_label.configure(fg="#999999")
+            pp_mult_desc.configure(fg="#bbbbbb")
+            pp_mult_note.configure(text="(click \u201cLoad Cases\u201d to detect baked factor)")
         elif baked == 0.0:
             # Mixed factors detected across selected dirs
             pp_mult_entry.configure(state="disabled")
             pp_mult_label.configure(fg="#999999")
             pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(text="(mixed factors baked in VTPs — cannot re-apply)")
+            pp_mult_note.configure(text="(mixed factors baked in VTPs \u2014 cannot re-apply)")
         elif baked != 1.0:
-            # Specific factor baked into VTPs — show it, use 1.0 internally
+            # Specific factor baked into VTPs \u2014 show it, use 1.0 internally
             pp_mult_var.set(str(baked))
             pp_mult_entry.configure(state="disabled")
             pp_mult_label.configure(fg="#999999")
             pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(text=f"(← factor {baked:.4g} already baked into VTPs)")
+            pp_mult_note.configure(text=f"(\u2190 factor {baked:.4g} already baked into VTPs)")
         else:
-            # baked == 1.0: VTPs are unscaled — allow user to set a factor
+            # baked == 1.0 and confirmed by Load Cases: VTPs unscaled
             get_p = _get_mult_factor_p[0]
             if get_p is not None:
                 pp_mult_var.set(get_p())
             pp_mult_entry.configure(state="normal")
             pp_mult_label.configure(fg="black")
             pp_mult_desc.configure(fg="#64748b")
-            pp_mult_note.configure(text="(VTPs unscaled — factor applied here)")
+            pp_mult_note.configure(text="(VTPs unscaled \u2014 factor applied here)")
 
     pp_source_var.trace_add("write", _update_pp_mult_state)
     _update_pp_mult_state()   # apply on first render
 
+    # ── Load Cases button highlight when source changes ───────────────────────
+    _BTN_NORMAL  = {"bg": "#005f73", "fg": "white",   "relief": "raised", "bd": 1}
+    _BTN_STALE   = {"bg": "#e85d04", "fg": "white",   "relief": "raised", "bd": 3}
+
+    def _mark_load_stale(*_):
+        load_case_btn.configure(**_BTN_STALE)
+
+    def _mark_load_fresh():
+        load_case_btn.configure(**_BTN_NORMAL)
+
+    pp_source_var.trace_add("write", _mark_load_stale)
+
     # ── Auto-update pattern when source changes ───────────────────────────────
     _PATTERNS = {
-        "original":    "smoothed_results_*.vtp",
-        "post_smooth": "post_smooth__*.vtp",
+        "original_raw":    "results_*.vtp",
+        "original_smooth": "smoothed_results_*.vtp",
+        "post_smooth":     "post_smooth*.vtp",   # matches post_smooth_results_* and post_smooth__results_*
+        # backward compat
+        "original":        "smoothed_results_*.vtp",
     }
 
     def _update_pattern_default(*_):
@@ -711,6 +847,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         )
         return {
             "groups":          groups,
+            "group_labels":    dict(_group_labels),
             "pattern":         pp_pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":     pp_filter_var.get().strip(),
             "mult_factor":     effective_mult,
@@ -720,7 +857,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             "save_snapshots":  pp_save_snaps_var.get(),
             "snap_pwr_density": pp_snap_pd_var.get(),
             "snap_total_pwr":  pp_snap_tp_var.get(),
-            "pp_source":       source,
+            "pp_source":       source if source in {"original_raw", "original_smooth", "post_smooth"} else "original_smooth",
         }
 
     def get_pp_cfg_dict() -> dict:
@@ -730,20 +867,29 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             "pp_source":        src,
             "pattern":          pp_pattern_var.get(),
             "name_filter":      pp_filter_var.get(),
-            "mult_factor_pp":   pp_mult_var.get() if src == "original" else "1.0",
+            "mult_factor_pp":   pp_mult_var.get() if src in _PP_ORIGINAL_SRCS else "1.0",
             "merge_pd":         pp_merge_pd_var.get(),
             "merge_pwr":        pp_merge_pwr_var.get(),
             "save_snapshots":   pp_save_snaps_var.get(),
             "snap_pwr_density": pp_snap_pd_var.get(),
             "snap_total_pwr":   pp_snap_tp_var.get(),
             "case_groups":      dict(case_group),
+            "group_labels":     dict(_group_labels),
         }
 
     def apply_pp_cfg(pp: dict) -> None:
         if not pp:
             return
-        pp_source_var.set(pp.get("pp_source", "original"))
-        pp_pattern_var.set(pp.get("pattern", "smoothed_results_*.vtp"))
+        # Backward compat: remap old "original" to "original_smooth"
+        _src = pp.get("pp_source", "original_smooth")
+        if _src == "original":
+            _src = "original_smooth"
+        pp_source_var.set(_src)
+        _saved_pat = pp.get("pattern", "")
+        # Upgrade legacy exact patterns that no longer match the files on disk
+        if _saved_pat == "post_smooth_results_*.vtp":
+            _saved_pat = "post_smooth*.vtp"
+        pp_pattern_var.set(_saved_pat or _PATTERNS.get(_src, "smoothed_results_*.vtp"))
         pp_filter_var.set(pp.get("name_filter", ""))
         pp_mult_var.set(str(pp.get("mult_factor_pp", "1.0")))
         # Re-trigger state to populate from live comp_widgets if non-original
@@ -755,6 +901,11 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         pp_snap_tp_var.set(bool(pp.get("snap_total_pwr", False)))
         _saved_case_groups.clear()
         _saved_case_groups.update(pp.get("case_groups", {}))
+        # Restore custom group labels
+        _group_labels.update(pp.get("group_labels", {}))
+        for key, btn in _tool_btns.items():
+            if key in _group_labels:
+                btn.configure(text=_group_labels[key])
         # Re-apply saved assignments to already-loaded indicator widgets
         for sp, ind in _indicator_widgets.items():
             grp = _saved_case_groups.get(sp)

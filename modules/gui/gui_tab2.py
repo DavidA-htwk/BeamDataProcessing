@@ -153,27 +153,33 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     src_frame = tk.Frame(case_lframe)
     src_frame.pack(fill="x", pady=(0, 4))
     tk.Label(src_frame, text="Source:", anchor="w", width=8).pack(side="left")
-    xfm_source_var = tk.StringVar(value=xfm_s.get("xfm_source", "original"))
-    tk.Radiobutton(src_frame, text="Original input folders",
-                   variable=xfm_source_var, value="original").pack(side="left", padx=(0, 10))
+    xfm_source_var = tk.StringVar(value=xfm_s.get("xfm_source", "original_smooth"))
+    tk.Radiobutton(src_frame, text="Original (RAW: results_*.vtp)",
+                   variable=xfm_source_var, value="original_raw").pack(side="left", padx=(0, 8))
+    tk.Radiobutton(src_frame, text="Original (smoothed: smoothed_results_*.vtp)",
+                   variable=xfm_source_var, value="original_smooth").pack(side="left", padx=(0, 8))
     tk.Radiobutton(src_frame,
                    text="Post-smooth VTPs (output/post_smoothed/)",
-                   variable=xfm_source_var, value="smoothed").pack(side="left", padx=(0, 10))
+                   variable=xfm_source_var, value="smoothed").pack(side="left", padx=(0, 8))
     tk.Radiobutton(src_frame,
                    text="Post-processed VTPs (output/post_processed/)",
                    variable=xfm_source_var, value="post_processed").pack(side="left")
 
-    # Auto-update pattern default when source changes
+    _XFM_ORIGINAL_SRCS = {"original", "original_raw", "original_smooth"}
+
+    # Auto-update pattern default when source changes — always unconditional
     _XFM_PATTERNS = {
-        "original":       "smoothed_results_*.vtp",
-        "smoothed":       "post_smooth__*.vtp",
-        "post_processed": "merged__*.vtp",
+        "original":        "smoothed_results_*.vtp",
+        "original_raw":    "results_*.vtp",
+        "original_smooth": "smoothed_results_*.vtp",
+        "smoothed":        "post_smooth_results_*.vtp",
+        "post_processed":  "merged_results_*.vtp",
     }
 
     def _update_xfm_pattern(*_):
         src = xfm_source_var.get()
         default = _XFM_PATTERNS.get(src)
-        if default and xfm_pattern_var.get() in _XFM_PATTERNS.values():
+        if default:
             xfm_pattern_var.set(default)
 
     xfm_source_var.trace_add("write", _update_xfm_pattern)
@@ -269,37 +275,58 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
 
     def _find_snapshot_xfm(sf_path: str) -> str | None:
         """Return best matching snapshot PNG for sf_path given current source."""
-        get_out = _get_output_folder[0]
-        if get_out is None:
-            return None
-        out_raw = get_out().strip()
-        if not out_raw:
-            return None
-        out_dir = Path(out_raw)
         source  = xfm_source_var.get()
         try:
             output_name, case, scenario = extract_case_scenario(sf_path)
         except Exception:
             return None
-        if source == "post_processed":
-            snap_base = out_dir / "post_processed_snapshots" / output_name
+
+        if source in ("post_processed", "smoothed"):
+            # Derive out_dir from sf_path for generated sources:
+            # post_processed: {out}/post_processed/{output_name}/{label}  → parents[2]={out}
+            # smoothed:       {out}/post_smoothed/{output_name}/{case}/{scenario} → parents[3]={out}
+            if source == "post_processed":
+                derived   = Path(sf_path).parents[2]
+                snap_base = derived / "post_processed_snapshots" / output_name / case
+            else:
+                derived   = Path(sf_path).parents[3]
+                snap_base = derived / "snapshots" / output_name / case / scenario
         else:
-            snap_base = out_dir / "snapshots" / output_name / case / scenario
+            # original sources: snapshots live in the configured output folder
+            get_out = _get_output_folder[0]
+            if get_out is None:
+                return None
+            out_raw = get_out().strip()
+            if not out_raw:
+                return None
+            snap_base = Path(out_raw) / "snapshots" / output_name / case / scenario
+
         if not snap_base.exists():
             return None
         pngs = sorted(snap_base.glob("*.png"))
         if not pngs:
             return None
-        if source == "original":
-            for suffix in ("__before", "__pwr_density"):
-                cands = [p for p in pngs if suffix in p.stem and "after" not in p.stem]
-                if cands:
-                    return str(cands[0])
-        else:
-            cands = [p for p in pngs if "__after" in p.stem]
+        if source in ("original", "original_smooth"):
+            # Smoothed simulation input → __RAW_smoothed
+            cands = [p for p in pngs if "__RAW_smoothed" in p.stem]
             if cands:
                 return str(cands[0])
-        return str(pngs[0])
+        elif source == "original_raw":
+            # RAW input → __RAW (before post-smoothing)
+            cands = [p for p in pngs if "__RAW" in p.stem and "__RAW_smoothed" not in p.stem]
+            if cands:
+                return str(cands[0])
+        elif source == "smoothed":
+            # Post-smooth VTPs → show __post_smooth snapshot from Processing
+            cands = [p for p in pngs if "__post_smooth" in p.stem]
+            if cands:
+                return str(cands[0])
+        elif source == "post_processed":
+            # Merged results → __merged
+            cands = [p for p in pngs if "__merged" in p.stem]
+            if cands:
+                return str(cands[0])
+        return None
 
     def _render_preview_xfm(snap: str) -> None:
         """Load and display *snap* with pan/zoom applied."""
@@ -632,7 +659,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     def _update_xfm_mult_state(*_):
         src   = xfm_source_var.get()
         baked = _baked_factor_xfm[0]
-        if src == "original":
+        if src in _XFM_ORIGINAL_SRCS:
             _baked_factor_xfm[0] = 1.0
             xfm_mult_var.set("1.0")
             xfm_mult_entry.configure(state="normal")
@@ -699,7 +726,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         # Effective mult: if factor is already baked into VTPs, use 1.0
         baked = _baked_factor_xfm[0]
         effective_mult = (
-            1.0 if (baked != 1.0 and xfm_source_var.get() != "original")
+            1.0 if (baked != 1.0 and xfm_source_var.get() not in _XFM_ORIGINAL_SRCS)
             else mult
         )
         exp_geom  = xfm_export_geom.get()
@@ -754,7 +781,11 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     def apply_xfm_cfg(xfm: dict) -> None:
         if not xfm:
             return
-        xfm_source_var.set(xfm.get("xfm_source", "original"))
+        # Backward compat: remap old "original" to "original_smooth"
+        _xsrc = xfm.get("xfm_source", "original_smooth")
+        if _xsrc == "original":
+            _xsrc = "original_smooth"
+        xfm_source_var.set(_xsrc)
         _p = xfm.get("preset", "")
         if _p not in _trf.TRANSFORM_PRESETS:
             _p = list(_trf.TRANSFORM_PRESETS.keys())[0]

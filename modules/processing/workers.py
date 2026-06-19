@@ -178,7 +178,14 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             if save_smooth_vtp:
                 _perm_dir = Path(smooth_out_str) / on / c / s
                 _perm_dir.mkdir(parents=True, exist_ok=True)
-                _perm_path = _perm_dir / f"post_smooth__{fp.name}"
+                # Naming: post_smooth_results_{component}.vtp
+                # Strip any existing source prefix (results_, smoothed_results_) before prepending.
+                _bare = fp.stem
+                for _pfx in ("smoothed_results_", "results_"):
+                    if _bare.startswith(_pfx):
+                        _bare = _bare[len(_pfx):]
+                        break
+                _perm_path = _perm_dir / f"post_smooth_results_{_bare}{fp.suffix}"
                 if mult_factor_save != 1.0:
                     # Bake the factor into the VTP so downstream tools see
                     # scaled values directly and need not re-apply the factor.

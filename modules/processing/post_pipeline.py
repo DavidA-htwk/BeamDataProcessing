@@ -50,6 +50,8 @@ def run_post_processing(
     groups_cfg: dict[str, list[str]] = cfg.get("groups") or (
         {"merged": input_dirs_legacy} if input_dirs_legacy else {}
     )
+    # Custom labels: {internal_key: display_name} — used for output filenames
+    group_labels: dict[str, str] = cfg.get("group_labels", {})
     pattern     = cfg.get("pattern", "smoothed_results_*.vtp")
     name_filter = cfg.get("name_filter", "")
     out_root    = cfg.get("output_folder", "")
@@ -101,6 +103,9 @@ def run_post_processing(
     terms = ([t.strip().lower() for t in name_filter.split(",") if t.strip()]
              if name_filter else [])
 
+    n_raw_found   = 0   # files matching pattern (before name filter)
+    n_filtered_out = 0  # files excluded by name filter
+
     for group_name, dir_list in groups_cfg.items():
         for dir_str in dir_list:
             if stopped():
@@ -110,15 +115,26 @@ def run_post_processing(
                 log(f"  [SKIP] Not a directory: {dir_str}")
                 continue
             output_name, _, scenario_name = extract_case_scenario(str(p))
-            files = sorted(p.rglob(pattern))
+            raw_files = sorted(p.rglob(pattern))
+            n_raw_found += len(raw_files)
             if terms:
-                files = [f for f in files if any(t in f.stem.lower() for t in terms)]
+                kept  = [f for f in raw_files if any(t in f.stem.lower() for t in terms)]
+                n_filtered_out += len(raw_files) - len(kept)
+                files = kept
+            else:
+                files = raw_files
             for fp in files:
                 slot_groups[(group_name, output_name, fp.stem)].append(
                     (fp, scenario_name))
 
     if not slot_groups:
-        log("No files found. Check pattern and selected cases.")
+        if n_raw_found > 0 and n_filtered_out > 0:
+            log(f"No files passed the name filter.  "
+                f"{n_raw_found} file(s) matched the pattern but all were excluded "
+                f"by the name filter '{name_filter}'.")
+            log("  → Clear the name filter or adjust it to match your filenames.")
+        else:
+            log("No files found. Check pattern and selected cases.")
         return
 
     total_slots  = len(slot_groups)
@@ -232,11 +248,24 @@ def run_post_processing(
                 pre_cam = precompute_snapshot(merged, ARRAY_NAME)
 
             # ── Write merged VTP ──────────────────────────────────────────────
-            # Files go into a per-group subdir so each group can be
-            # selected individually in the Coordinate Transform tab.
-            out_subdir = pp_dir / output_name / group_name
+            # Use the custom label for the output subdir and filename prefix.
+            _group_label = group_labels.get(group_name, group_name)
+            # Sanitise label for use in filesystem names
+            import re as _re
+            _safe_label = _re.sub(r'[\\/:*?"<>|]', "_", _group_label).strip()
+            # Strip source prefix from stem for clean merged name
+            _bare_stem = stem
+            for _pfx in ("post_smooth_results_", "post_smooth__",
+                         "smoothed_results_", "merged_results_", "merged__"):
+                if _bare_stem.startswith(_pfx):
+                    _bare_stem = _bare_stem[len(_pfx):]
+                    break
+            if _bare_stem.startswith("results_"):
+                _bare_stem = _bare_stem[len("results_"):]
+            _merged_filename = f"merged_results_{_bare_stem}.vtp"
+            out_subdir = pp_dir / output_name / _safe_label
             out_subdir.mkdir(parents=True, exist_ok=True)
-            out_vtp = out_subdir / f"merged__{stem}.vtp"
+            out_vtp = out_subdir / _merged_filename
             _write_vtp(merged, out_vtp)
 
             elapsed = time.perf_counter() - t0
@@ -247,18 +276,17 @@ def run_post_processing(
             # ── Queue snapshot args ───────────────────────────────────────────
             snap_str = ""
             if save_snaps and pre_cam is not None:
-                snap_dir_case = snap_dir / output_name / group_name
+                snap_dir_case = snap_dir / output_name / _safe_label
                 snap_dir_case.mkdir(parents=True, exist_ok=True)
-                _snap_label = f"{group_name}__{output_name.replace('OUTPUT_', '', 1)}"
                 _extra = (pre_cam, pre_cam, max_pwr_v, max_pwr_v, total_pwr)
                 if snap_pd:
-                    p_pd = [str(snap_dir_case / f"merged__{stem}__pwr_density.png")]
+                    p_pd = [str(snap_dir_case / f"merged_results_{_bare_stem}__merged__pwr_density.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_pd,
                          ARRAY_NAME, True, stem, 1.0) + _extra)
                     snap_str = p_pd[0]
                 if snap_tp:
-                    p_tp = [str(snap_dir_case / f"merged__{stem}__total_pwr.png")]
+                    p_tp = [str(snap_dir_case / f"merged_results_{_bare_stem}__merged__total_pwr.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_tp,
                          POWER_ARRAY, True, stem, 1.0) + _extra)
@@ -269,8 +297,8 @@ def run_post_processing(
 
             snap_link = f'=HYPERLINK("{snap_str}","Open")' if snap_str else ""
             writer.writerow([
-                group_name, output_name, cases_str,
-                f"{group_name}__merged__{stem}.vtp", n_loaded,
+                _safe_label, output_name, cases_str,
+                f"{_merged_filename}", n_loaded,
                 f"{max_val:.6g}" if max_val is not None else "",
                 f"{total_pwr:.6g}" if total_pwr is not None else "",
                 f"{mult_factor:.6g}" if apply_mult else "1.0 (not applied)",

@@ -309,16 +309,20 @@ def run_processing(
                     # The path is relative to the CSV file (both in out_dir).
                     is_snap_only_csv = (ni == 0)
                     stem_csv = fp.stem
+                    # before-suffix depends on input type:
+                    # smoothed_results_*.vtp → __RAW_smoothed
+                    # results_*.vtp           → __RAW
+                    _before_sfx = "__RAW_smoothed" if stem_csv.startswith("smoothed_results_") else "__RAW"
                     if snap_pd:
                         if is_snap_only_csv:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density.png"
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density{_before_sfx}.png"
                         else:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density__after.png"
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density__post_smooth.png"
                     elif snap_tp:
                         if is_snap_only_csv:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr.png"
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr{_before_sfx}.png"
                         else:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr__after.png"
+                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr__post_smooth.png"
                     else:
                         _snap_rel = ""
                     _snap_link = f'=HYPERLINK("{_snap_rel}","Open")' if _snap_rel else ""
@@ -363,13 +367,16 @@ def run_processing(
                         # Common extra args for _render_subprocess
                         _snap_extra = (pre_orig, pre_smooth, max_pwr_o, max_pwr_s, tp)
 
+                        # before-suffix depends on input type (stem of the VTP file)
+                        _before_sfx = "__RAW_smoothed" if stem.startswith("smoothed_results_") else "__RAW"
+
                         if snap_pd:
                             if is_snap_only:
-                                paths_pd = [str(case_snap_dir / f"{s}__{stem}__pwr_density.png")]
+                                paths_pd = [str(case_snap_dir / f"{s}__{stem}__pwr_density{_before_sfx}.png")]
                             else:
                                 paths_pd = [
-                                    str(case_snap_dir / f"{s}__{stem}__pwr_density__before.png"),
-                                    str(case_snap_dir / f"{s}__{stem}__pwr_density__after.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__pwr_density{_before_sfx}.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__pwr_density__post_smooth.png"),
                                 ]
                             snap_proc_args.append(
                                 (str(fp), smooth_path, paths_pd,
@@ -377,11 +384,11 @@ def run_processing(
 
                         if snap_tp:
                             if is_snap_only:
-                                paths_tp = [str(case_snap_dir / f"{s}__{stem}__total_pwr.png")]
+                                paths_tp = [str(case_snap_dir / f"{s}__{stem}__total_pwr{_before_sfx}.png")]
                             else:
                                 paths_tp = [
-                                    str(case_snap_dir / f"{s}__{stem}__total_pwr__before.png"),
-                                    str(case_snap_dir / f"{s}__{stem}__total_pwr__after.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__total_pwr{_before_sfx}.png"),
+                                    str(case_snap_dir / f"{s}__{stem}__total_pwr__post_smooth.png"),
                                 ]
                             snap_proc_args.append(
                                 (str(fp), smooth_path, paths_tp,
