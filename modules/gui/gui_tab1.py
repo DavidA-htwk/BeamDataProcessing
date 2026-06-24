@@ -16,7 +16,41 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, SETTINGS_FILE, _safe_float, remember_cfg_path
+from modules.core.settings import SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, MIN_POWER_W, SETTINGS_FILE, _safe_float, remember_cfg_path
+
+
+class _Tooltip:
+    """Lightweight hover tooltip for any Tkinter widget."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self._widget = widget
+        self._text   = text
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event=None) -> None:
+        if self._tip:
+            return
+        x = self._widget.winfo_rootx() + 16
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        tip = tk.Toplevel(self._widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        tip.attributes("-topmost", True)
+        lbl = tk.Label(
+            tip, text=self._text, justify="left",
+            background="#fffde7", foreground="#222222",
+            relief="solid", borderwidth=1,
+            font=("Segoe UI", 8), wraplength=340, padx=6, pady=4,
+        )
+        lbl.pack()
+        self._tip = tip
+
+    def _hide(self, _event=None) -> None:
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
 
 
 def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
@@ -98,11 +132,26 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     comp_grid.pack(fill="x")
 
     _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
-            "Prox (edge)", "Mult", "Spk", "Pwr density", "Total pwr", "Save post-smooth VTP"]
-    for _c, _txt in enumerate(_HDR):
-        tk.Label(comp_grid, text=_txt, anchor="w",
-                 fg="#444444", font=("Segoe UI", 8, "bold"),
-                 padx=3).grid(row=0, column=_c, sticky="w")
+            "Prox (edge)", "Snap factor", "Min pwr (W)", "Pwr density", "Total pwr", "Save post-smooth VTP"]
+    _HDR_TIPS = [
+        "Component name (matched against VTP filename).",
+        "Number of VTP files found for this component.",
+        "Smoothing iterations (0 = no smoothing, only min-power sliver filter).",
+        "Smoothing mode:\n  auto — local z-score spike detection + edge classification.\n  edge — smooth all cells that touch a feature/boundary edge.",
+        "Sigma threshold (auto mode only).\nA cell is flagged if its value exceeds:\n  local_mean + sigma × local_std\nHigher = less aggressive (fewer cells flagged).\nDefault: 2.0",
+        "Proximity radius in mesh units (edge mode only).\nCells within this distance of a feature-edge point are also flagged.\nSet to 0 to disable proximity expansion.",
+        "Snapshot factor — multiplies power density values in rendered PNG snapshots only.\nNever applied to the VTP data itself.",
+        "Min deposited power filter (W).\nCells with Deposited_Power_W below this threshold are treated as mesh artifacts (sliver cells with near-zero area).\nTheir power density is replaced with the area-weighted neighbour mean.\nRuns before all other smoothing. Set to 0 to disable.\nRecommended: 1.0",
+        "Save a power-density snapshot PNG.",
+        "Save a total-deposited-power snapshot PNG.",
+        "Save the post-smoothed mesh as a VTP file (for use as input to Post Processing or Transform).",
+    ]
+    for _c, (_txt, _tip) in enumerate(zip(_HDR, _HDR_TIPS)):
+        _lbl = tk.Label(comp_grid, text=_txt, anchor="w",
+                        fg="#444444", font=("Segoe UI", 8, "bold"),
+                        padx=3, cursor="question_arrow")
+        _lbl.grid(row=0, column=_c, sticky="w")
+        _Tooltip(_lbl, _tip)
 
     _placeholder_lbl = tk.Label(comp_grid,
                                 text="(click Load Geometry to populate)",
@@ -125,7 +174,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         prox_var         = tk.StringVar(value=str(saved.get(
             "proximity_radius", settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))))
         mult_var         = tk.StringVar(value=str(saved.get("mult_factor", 1.0)))
-        smooth_spikes_var = tk.BooleanVar(value=bool(saved.get("smooth_spikes", False)))
+        min_pwr_var      = tk.StringVar(value=str(saved.get("min_power_W", 0.0)))
         snap_pd_var      = tk.BooleanVar(value=bool(saved.get("save_power_density", True)))
         snap_tp_var      = tk.BooleanVar(value=bool(saved.get("save_total_power", False)))
         count_var        = tk.StringVar(value=str(count))
@@ -148,8 +197,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         prox_entry_row.grid(row=r, column=5, sticky="w", padx=(0, 4))
         tk.Entry(comp_grid, textvariable=mult_var, width=6).grid(
             row=r, column=6, sticky="w", padx=(0, 4))
-        spk_chk = tk.Checkbutton(comp_grid, text="", variable=smooth_spikes_var)
-        spk_chk.grid(row=r, column=7, sticky="w")
+        min_pwr_entry = tk.Entry(comp_grid, textvariable=min_pwr_var, width=7)
+        min_pwr_entry.grid(row=r, column=7, sticky="w", padx=(0, 4))
         tk.Checkbutton(comp_grid, text="Pwr density",
                        variable=snap_pd_var).grid(row=r, column=8, sticky="w")
         tk.Checkbutton(comp_grid, text="Total pwr",
@@ -161,8 +210,9 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
 
         def _update_mode_state(*_,
                                _menu=mode_menu, _sig=sigma_entry,
-                               _prx=prox_entry_row, _spk=spk_chk,
+                               _prx=prox_entry_row,
                                _svp=save_vtp_chk,
+                               _mpw=min_pwr_entry,
                                _sv=smooth_var, _mv=smooth_mode_var):
             n_iter = 0
             try:
@@ -173,15 +223,15 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 _menu.configure(state="disabled")
                 _sig.configure(state="disabled")
                 _prx.configure(state="disabled")
-                _spk.configure(state="disabled")
                 _svp.configure(state="disabled")
+                _mpw.configure(state="normal")
             else:
                 mode = _mv.get()
                 _menu.configure(state="normal")
                 _sig.configure(state="normal" if mode == "auto" else "disabled")
                 _prx.configure(state="normal" if mode == "edge" else "disabled")
-                _spk.configure(state="normal" if mode == "auto" else "disabled")
                 _svp.configure(state="normal")
+                _mpw.configure(state="normal")
 
         _update_mode_state()
         smooth_var.trace_add("write", _update_mode_state)
@@ -190,9 +240,9 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         comp_widgets[name] = {
             "smooth_var":        smooth_var,        "smooth_mode_var":  smooth_mode_var,
             "spike_sigma_var":   spike_sigma_var,   "prox_var":         prox_var,
-            "smooth_spikes_var": smooth_spikes_var, "mult_var":         mult_var,
             "snap_pd_var":       snap_pd_var,        "snap_tp_var":      snap_tp_var,
             "save_vtp_var":      save_vtp_var,       "count_var":        count_var,
+            "min_pwr_var":       min_pwr_var,
         }
 
     def on_load_geometry():
@@ -202,11 +252,11 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
-                "smooth_spikes":      w["smooth_spikes_var"].get(),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
                 "save_smooth_vtp":    w["save_vtp_var"].get(),
+                "min_power_W":        _safe_float(w["min_pwr_var"].get(), 0.0),
             }
         raw  = text_box.get("1.0", "end").strip()
         dirs = [ln.strip().strip('"').strip("'") for ln in raw.splitlines() if ln.strip()]
@@ -279,11 +329,11 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 "smooth_mode":        w["smooth_mode_var"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
-                "smooth_spikes":      w["smooth_spikes_var"].get(),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
                 "save_power_density": w["snap_pd_var"].get(),
                 "save_total_power":   w["snap_tp_var"].get(),
                 "save_smooth_vtp":    w["save_vtp_var"].get(),
+                "min_power_W":        _safe_float(w["min_pwr_var"].get(), 0.0),
             }
             for name, w in comp_widgets.items()
         }

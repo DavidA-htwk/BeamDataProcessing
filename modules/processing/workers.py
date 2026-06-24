@@ -15,7 +15,7 @@ from pathlib import Path
 
 import vtk
 
-from modules.core.settings import ARRAY_NAME, POWER_ARRAY
+from modules.core.settings import ARRAY_NAME, POWER_ARRAY, MIN_POWER_W
 from modules.vtk.vtk_io import (
     read_vtp, find_max, find_total, _write_vtp, _scale_polydata_array,
 )
@@ -95,10 +95,10 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
         (fp, on, c, s,
          n_iter, stop_event, geo_cache,
          smooth_mode, spike_sigma, proximity_radius,
-         smooth_spikes, spike_ratio,
+         spike_ratio,
          needs_snap, snap_dir_str, pid,
          save_smooth_vtp, smooth_out_str,
-         mult_factor_save) = args
+         mult_factor_save, min_power_W) = args
 
         if stop_event is not None and stop_event.is_set():
             return None
@@ -139,7 +139,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                     geo_cache=geo_cache, spike_sigma=spike_sigma,
                     spike_ratio=spike_ratio,
                     proximity_radius=proximity_radius,
-                    smooth_spikes=smooth_spikes,
+                    smooth_spikes=True,
+                    min_power_W=min_power_W,
                 )
             else:
                 smoothed = apply_edge_smooth(
@@ -219,7 +220,7 @@ def _transform_one_file(args: tuple) -> tuple:
     Returns (filepath, out_path, None) or an Exception.
     """
     try:
-        filepath, dest_dir, scenario, xfm_params = args
+        filepath, dest_dir, output_name, case, scenario, xfm_params = args
         angle_deg    = xfm_params["angle_deg"]
         dx           = xfm_params["dx"]
         dy           = xfm_params["dy"]
@@ -234,9 +235,9 @@ def _transform_one_file(args: tuple) -> tuple:
 
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        csv_name = f"{scenario}__{filepath.stem}.csv"
+        csv_name = f"{output_name}__{case}__{scenario}__{filepath.stem}.csv"
         out_path = dest_dir / csv_name
-        tmp_csv  = dest_dir / f"{scenario}__{filepath.stem}.tmp.csv"
+        tmp_csv  = dest_dir / f"{output_name}__{case}__{scenario}__{filepath.stem}.tmp.csv"
 
         extract_cells_to_csv(
             str(filepath), str(tmp_csv),

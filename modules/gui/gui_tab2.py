@@ -640,13 +640,13 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
 
     xfm_misc_frame = tk.Frame(tab2)
     xfm_misc_frame.pack(fill="x", padx=10, pady=(2, 4))
-    xfm_mult_label = tk.Label(xfm_misc_frame, text="Multiplication factor:",
+    xfm_mult_label = tk.Label(xfm_misc_frame, text="CSV export factor:",
                               font=("Segoe UI", 9, "bold"))
     xfm_mult_label.pack(side="left")
     xfm_mult_var = tk.StringVar(value=str(xfm_s.get("mult_factor_t", xfm_s.get("mult", "1.0"))))
     xfm_mult_entry = tk.Entry(xfm_misc_frame, textvariable=xfm_mult_var, width=10)
     xfm_mult_entry.pack(side="left", padx=(8, 0))
-    xfm_mult_desc = tk.Label(xfm_misc_frame, text="(applied to power & power load)",
+    xfm_mult_desc = tk.Label(xfm_misc_frame, text="(multiplies power values in the exported CSV — the only step that modifies actual data)",
                              fg="#64748b")
     xfm_mult_desc.pack(side="left", padx=(8, 4))
     xfm_mult_note = tk.Label(xfm_misc_frame, text="", fg="#b45309",
@@ -659,33 +659,29 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     def _update_xfm_mult_state(*_):
         src   = xfm_source_var.get()
         baked = _baked_factor_xfm[0]
+        # CSV export factor: always editable — VTPs always store raw values.
+        # This is the only factor that actually modifies exported data.
+        xfm_mult_entry.configure(state="normal")
+        xfm_mult_label.configure(fg="black")
+        xfm_mult_desc.configure(fg="#64748b")
+        get_p = _get_mult_factor_p[0]
         if src in _XFM_ORIGINAL_SRCS:
             _baked_factor_xfm[0] = 1.0
             xfm_mult_var.set("1.0")
-            xfm_mult_entry.configure(state="normal")
-            xfm_mult_label.configure(fg="black")
-            xfm_mult_desc.configure(fg="#64748b")
             xfm_mult_note.configure(text="")
         elif baked == 0.0:
-            xfm_mult_entry.configure(state="disabled")
-            xfm_mult_label.configure(fg="#999999")
-            xfm_mult_desc.configure(fg="#bbbbbb")
-            xfm_mult_note.configure(text="(mixed factors baked in VTPs — cannot re-apply)")
-        elif baked != 1.0:
-            xfm_mult_var.set(str(baked))
-            xfm_mult_entry.configure(state="disabled")
-            xfm_mult_label.configure(fg="#999999")
-            xfm_mult_desc.configure(fg="#bbbbbb")
-            xfm_mult_note.configure(text=f"(← factor {baked:.4g} already baked into VTPs)")
-        else:
-            # baked == 1.0: VTPs unscaled, allow user to set factor
-            get_p = _get_mult_factor_p[0]
+            # Mixed snapshot factors across source dirs
             if get_p is not None:
                 xfm_mult_var.set(get_p())
-            xfm_mult_entry.configure(state="normal")
-            xfm_mult_label.configure(fg="black")
-            xfm_mult_desc.configure(fg="#64748b")
-            xfm_mult_note.configure(text="(VTPs unscaled — factor applied here)")
+            xfm_mult_note.configure(text="(\u26a0 mixed snapshot factors \u2014 set manually)")
+        elif baked != 1.0:
+            # Pre-fill from the snapshot factor recorded by Processing
+            xfm_mult_var.set(str(baked))
+            xfm_mult_note.configure(text="(\u2190 pre-filled from Processing snapshot factor)")
+        else:
+            if get_p is not None:
+                xfm_mult_var.set(get_p())
+            xfm_mult_note.configure(text="(\u2190 pre-filled from Processing tab)")
 
     xfm_source_var.trace_add("write", _update_xfm_mult_state)
     _update_xfm_mult_state()
@@ -723,12 +719,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         except ValueError:
             messagebox.showerror("Invalid input", "Multiplication factor must be a number.")
             return None
-        # Effective mult: if factor is already baked into VTPs, use 1.0
-        baked = _baked_factor_xfm[0]
-        effective_mult = (
-            1.0 if (baked != 1.0 and xfm_source_var.get() not in _XFM_ORIGINAL_SRCS)
-            else mult
-        )
+        # VTPs always store raw values — apply the user-entered factor directly to the CSV.
+        effective_mult = mult
         exp_geom  = xfm_export_geom.get()
         exp_area  = xfm_export_area.get()
         exp_power = xfm_export_power.get()

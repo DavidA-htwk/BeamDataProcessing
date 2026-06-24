@@ -268,6 +268,21 @@ def run_gui() -> None:
         t1["output_label_var"].set(out or "(script output/ folder)")
         pending_comp_cfg.clear()
         pending_comp_cfg.update(loaded.get("components", {}))
+        # Also update any currently-displayed component rows so the checkboxes
+        # reflect the loaded config immediately without needing "Load Geometry".
+        for _cname, _w in comp_widgets.items():
+            _cc = pending_comp_cfg.get(_cname, {})
+            if not _cc:
+                continue
+            _w["snap_pd_var"].set(bool(_cc.get("save_power_density", True)))
+            _w["snap_tp_var"].set(bool(_cc.get("save_total_power", False)))
+            _w["save_vtp_var"].set(bool(_cc.get("save_smooth_vtp", False)))
+            _w["min_pwr_var"].set(str(_cc.get("min_power_W", 0.0)))
+            try:
+                _w["smooth_var"].set(int(_cc.get("smooth_iterations", 1)))
+            except Exception:
+                pass
+            _w["mult_var"].set(str(_cc.get("mult_factor", 1.0)))
         apply_xfm_cfg(loaded.get("transform", {}))
         apply_pp_cfg(loaded.get("post_processing", {}))
 

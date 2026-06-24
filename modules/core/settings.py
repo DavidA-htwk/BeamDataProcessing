@@ -37,6 +37,12 @@ SMOOTH_K_RING  = 3
 # single highest neighbor to qualify — gradient slopes never satisfy this.
 # Not exposed in the GUI; set per-component in the config JSON if needed.
 SPIKE_RATIO    = 0.0
+# Sliver-cell power filter: cells with Deposited_Power_W below this threshold
+# are treated as mesh artifacts and replaced with their area-weighted neighbour
+# mean of Power_Density_W_m2.  Runs before sigma/edge smoothing and is
+# completely independent of it.  Set to 0.0 to disable.
+# Typical value: 1.0 (any cell depositing less than 1 W is suspect).
+MIN_POWER_W    = 0.0
 # Secondary edge-direct pass: edge-adjacent cells above this global percentile
 # of all non-zero values are added as candidates regardless of local z-score.
 # Catches tight clusters of 2–3 hot cells at an edge whose mutual elevation

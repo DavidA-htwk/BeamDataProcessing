@@ -29,8 +29,8 @@ import numpy as np
 from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 
 from modules.core.settings import (
-    ARRAY_NAME, FEATURE_ANGLE, SPIKE_SIGMA, MIN_NEIGHBORS, SMOOTH_K_RING,
-    SPIKE_RATIO, EDGE_TOP_PERCENTILE,
+    ARRAY_NAME, POWER_ARRAY, FEATURE_ANGLE, SPIKE_SIGMA, MIN_NEIGHBORS, SMOOTH_K_RING,
+    SPIKE_RATIO, EDGE_TOP_PERCENTILE, MIN_POWER_W,
 )
 from modules.vtk.smoothing import _build_active_csr
 
@@ -108,7 +108,8 @@ def smart_smooth_auto(
         feature_angle: float = FEATURE_ANGLE,
         dilation_rings: int = 1,
         proximity_radius: float = 0.0,
-        smooth_spikes: bool = False,
+        smooth_spikes: bool = True,
+        min_power_W: float = MIN_POWER_W,
 ) -> vtk.vtkPolyData | None:
     """Smart per-candidate smoothing: local z-score + local edge classification.
 
@@ -175,8 +176,57 @@ def smart_smooth_auto(
 
     _spk_label   = "spike=ON" if smooth_spikes else "spike=off"
     _ratio_label = f"  ratio={spike_ratio}" if spike_ratio > 0.0 else ""
+    _mp_label    = f"  min_pwr={min_power_W}W" if min_power_W > 0.0 else ""
     print(f"  [AUTO] Settings: iter={n_iter}  sigma={spike_sigma}{_ratio_label}  "
-          f"{_spk_label}  k_ring={k_ring}  dilation={dilation_rings}")
+          f"{_spk_label}  k_ring={k_ring}  dilation={dilation_rings}{_mp_label}")
+
+    # ── Min-power sliver filter ───────────────────────────────────────────────
+    # Cells with Deposited_Power_W below min_power_W are mesh artifacts
+    # (tiny sliver cells with near-zero area producing huge power density).
+    # Replace their Power_Density_W_m2 with the area-weighted neighbour mean.
+    # This is independent of sigma/edge smoothing and runs first.
+    if min_power_W > 0.0:
+        _pwr_arr_vtk = src.GetCellData().GetArray(POWER_ARRAY)
+        if _pwr_arr_vtk is not None and len(offs) >= num_cells + 1:
+            _pwr_vals  = vtk_to_numpy(_pwr_arr_vtk).astype(np.float64)
+            _sliver_ids = np.where(
+                (_pwr_vals > 0.0) & (_pwr_vals < min_power_W)
+            )[0].astype(np.int64)
+            if len(_sliver_ids) > 0:
+                print(f"  [AUTO] Min-power sliver filter: {len(_sliver_ids):,} "
+                      f"cell(s) with Deposited_Power_W < {min_power_W}W.")
+                _ca_mp  = geo_cache.get("cell_areas")
+                _orig   = raw_vals.copy()
+                _ncorr  = 0
+                for _cid in _sliver_ids.tolist():
+                    _ss, _se = int(offs[_cid]), int(offs[_cid + 1])
+                    _ns: set[int] = set()
+                    for _pid in conn[_ss:_se].tolist():
+                        if _pid < n_pts_cache:
+                            _ps, _pe = (int(pt_cell_offsets[_pid]),
+                                        int(pt_cell_offsets[_pid + 1]))
+                            for _nc in sorted_cell_ids[_ps:_pe].tolist():
+                                if _nc != _cid and _orig[_nc] != 0.0:
+                                    # only use neighbours that are NOT also slivers
+                                    if _pwr_vals[_nc] >= min_power_W:
+                                        _ns.add(int(_nc))
+                    if not _ns:
+                        continue
+                    _na = np.array(sorted(_ns), dtype=np.int64)
+                    if _ca_mp is not None and len(_ca_mp) == num_cells:
+                        _w  = np.asarray(_ca_mp, dtype=np.float64)[_na]
+                        _ws = float(_w.sum())
+                        raw_vals[_cid] = (float(np.dot(_w, _orig[_na]) / _ws)
+                                          if _ws > 0.0 else float(_orig[_na].mean()))
+                    else:
+                        raw_vals[_cid] = float(_orig[_na].mean())
+                    _ncorr += 1
+                del _orig
+                print(f"  [AUTO] Min-power sliver filter: {_ncorr:,} cell(s) corrected.")
+        else:
+            if _pwr_arr_vtk is None:
+                print(f"  [AUTO] Min-power sliver filter: '{POWER_ARRAY}' not found "
+                      f"— skipping.")
 
     # ── Sliver pre-correction ─────────────────────────────────────────────────
     # Degenerate near-zero-area triangles (mesh generation artifacts) produce

@@ -19,7 +19,7 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 from modules.core.settings import (
-    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, _safe_float,
+    ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, MIN_POWER_W, _safe_float,
 )
 from modules.vtk.vtk_io import _write_vtp, read_vtp
 from modules.core.path_utils import extract_case_scenario
@@ -52,8 +52,8 @@ def run_processing(
 
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
-                   smooth_mode, spike_sigma, proximity_radius, smooth_spikes,
-                   spike_ratio, save_smooth_vtp)."""
+                   smooth_mode, spike_sigma, proximity_radius,
+                   spike_ratio, save_smooth_vtp, min_power_W)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -67,9 +67,9 @@ def run_processing(
                     str(comp_cfg.get("smooth_mode", "auto")),
                     float(comp_cfg.get("spike_sigma", SPIKE_SIGMA)),
                     float(comp_cfg.get("proximity_radius", proximity_radius)),
-                    bool(comp_cfg.get("smooth_spikes", False)),
                     float(comp_cfg.get("spike_ratio", SPIKE_RATIO)),
                     bool(comp_cfg.get("save_smooth_vtp", False)),
+                    float(comp_cfg.get("min_power_W", MIN_POWER_W)),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -81,12 +81,12 @@ def run_processing(
                 str(c.get("smooth_mode", "auto")),
                 float(c.get("spike_sigma", SPIKE_SIGMA)),
                 float(c.get("proximity_radius", proximity_radius)),
-                bool(c.get("smooth_spikes", False)),
                 float(c.get("spike_ratio", SPIKE_RATIO)),
                 bool(c.get("save_smooth_vtp", False)),
+                float(c.get("min_power_W", MIN_POWER_W)),
             )
-        return (int(cfg.get("smooth_iterations", 1)), True, False, 1.0, "auto",
-                SPIKE_SIGMA, proximity_radius, False, SPIKE_RATIO, False)
+        return (int(cfg.get("smooth_iterations", 1)), False, False, 1.0, "auto",
+                SPIKE_SIGMA, proximity_radius, SPIKE_RATIO, False, MIN_POWER_W)
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -109,7 +109,7 @@ def run_processing(
 
     snap_dir   = out_dir / "snapshots"
     smooth_dir = out_dir / "post_smoothed"
-    csv_dir    = out_dir / "csv"
+    csv_dir    = out_dir / "csv_file_comparison"
     csv_dir.mkdir(parents=True, exist_ok=True)
     _ts       = time.strftime("%Y-%m-%d_%H-%M-%S")
     csv_path  = csv_dir / f"max_comparison_batch_{_ts}.csv"
@@ -129,7 +129,7 @@ def run_processing(
                          "max_before", "max_after", "delta", "discrepancy",
                          "total_power_before", "total_power_after",
                          "total_power_delta", "total_power_discrepancy",
-                         "mult_factor",
+                         "snap_factor",
                          "snapshot", "paraview", "post_smoothed_vtp"])
 
         # ── Phase 0: Collect all matching file paths (no loading) ────────────
@@ -174,27 +174,28 @@ def run_processing(
             if _comp not in _seen_comps:
                 _seen_comps[_comp] = _snap_map[_fp]
         for _comp, _s in _seen_comps.items():
-            (_ni, _spd, _stp, _mf, _sm, _ss, _pr, _spk, _sr, _sv) = _s
-            _spk_str  = "ON" if _spk else "off"
+            (_ni, _spd, _stp, _mf, _sm, _ss, _pr, _sr, _sv, _mp) = _s
             _sv_str   = "ON" if _sv  else "off"
             _snap_str = ("pwr-density" if _spd and not _stp
                          else "total-pwr" if not _spd and _stp
                          else "both" if _spd and _stp else "none")
             if _ni == 0:
                 log(f"    [{_comp}] iterations=0 (no smoothing)  "
-                    f"mult={_mf}  snapshots={_snap_str}")
+                    f"snap_factor={_mf}  snapshots={_snap_str}  "
+                    f"min_pwr={_mp}W")
             elif _sm == "auto":
                 _ratio_str = f"  spike_ratio={_sr}" if _sr > 0.0 else ""
                 log(f"    [{_comp}] mode=auto  iter={_ni}  "
                     f"sigma={_ss}{_ratio_str}  "
-                    f"spike_smooth={_spk_str}  "
                     f"save_post_smooth={_sv_str}  "
-                    f"mult={_mf}  snapshots={_snap_str}")
+                    f"snap_factor={_mf}  snapshots={_snap_str}  "
+                    f"min_pwr={_mp}W")
             else:
                 log(f"    [{_comp}] mode=edge  iter={_ni}  "
                     f"proximity={_pr}  "
                     f"save_post_smooth={_sv_str}  "
-                    f"mult={_mf}  snapshots={_snap_str}")
+                    f"snap_factor={_mf}  snapshots={_snap_str}  "
+                    f"min_pwr={_mp}W")
         log("")
 
         # ── Phase 1: Geo-cache precompute (load one file per component, free) ─
@@ -262,14 +263,14 @@ def run_processing(
              _snap_map[fp][4],            # smooth_mode
              _snap_map[fp][5],            # spike_sigma
              _snap_map[fp][6],            # proximity_radius
-             _snap_map[fp][7],            # smooth_spikes
-             _snap_map[fp][8],            # spike_ratio
+             _snap_map[fp][7],            # spike_ratio
              needs_snap_map[fp],          # write temp VTP?
              str(snap_dir),
              pid,
-             _snap_map[fp][9],            # save_smooth_vtp
+             _snap_map[fp][8],            # save_smooth_vtp
              str(smooth_dir),             # permanent smooth VTP root
              _snap_map[fp][3],            # mult_factor — baked into saved post-smooth VTP
+             _snap_map[fp][9],            # min_power_W — sliver filter threshold
             )
             for fp, on, c, s in all_meta
         ]
@@ -297,16 +298,17 @@ def run_processing(
                     pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
 
-                    # Write CSV rows immediately (no accumulation needed)
-                    mbs   = mb * mult
-                    mas   = ma * mult
+                    # Write CSV rows immediately — values are raw (snap_factor is visual only)
+                    mbs   = mb
+                    mas   = ma
                     delta = abs(mas - mbs)
                     # Build relative hyperlink path using backslashes.
                     # Excel passes relative paths to ShellExecute which uses the
                     # registered .png handler (Photos), not the browser.
                     # Backslashes are required — forward slashes cause Excel to
                     # treat the path as a URL fragment and open Edge instead.
-                    # The path is relative to the CSV file (both in out_dir).
+                    # The CSV lives in out_dir\csv\ so we need "..\\" to reach
+                    # out_dir\snapshots\.
                     is_snap_only_csv = (ni == 0)
                     stem_csv = fp.stem
                     # before-suffix depends on input type:
@@ -315,24 +317,24 @@ def run_processing(
                     _before_sfx = "__RAW_smoothed" if stem_csv.startswith("smoothed_results_") else "__RAW"
                     if snap_pd:
                         if is_snap_only_csv:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density{_before_sfx}.png"
+                            _snap_rel = f"..\\snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density{_before_sfx}.png"
                         else:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density__post_smooth.png"
+                            _snap_rel = f"..\\snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__pwr_density__post_smooth.png"
                     elif snap_tp:
                         if is_snap_only_csv:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr{_before_sfx}.png"
+                            _snap_rel = f"..\\snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr{_before_sfx}.png"
                         else:
-                            _snap_rel = f"snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr__post_smooth.png"
+                            _snap_rel = f"..\\snapshots\\{on}\\{c}\\{s}\\{s}__{stem_csv}__total_pwr__post_smooth.png"
                     else:
                         _snap_rel = ""
                     _snap_link = f'=HYPERLINK("{_snap_rel}","Open")' if _snap_rel else ""
                     # Plain absolute paths — copy-paste into Explorer address bar to open
                     _pv_path       = str(fp) if fp else ""
                     _smooth_vtp_path = saved_smooth_path if saved_smooth_path else ""
-                    tpbs_str = f"{tp       * mult:.6g}" if tp       is not None else ""
-                    tpas_str = f"{tp_after * mult:.6g}" if tp_after is not None else ""
+                    tpbs_str = f"{tp      :.6g}" if tp       is not None else ""
+                    tpas_str = f"{tp_after:.6g}" if tp_after is not None else ""
                     if tp is not None and tp_after is not None:
-                        tp_delta     = abs(tp_after * mult - tp * mult)
+                        tp_delta     = abs(tp_after - tp)
                         tp_delta_str = f"{tp_delta:.6g}"
                         tp_disc_str  = "YES" if tp_delta > 0.0 else "NO"
                     else:
@@ -490,7 +492,7 @@ def run_transform(
         for filepath in files:
             _, case, scenario = extract_case_scenario(str(filepath.parent))
             dest_dir = out_root / "transformed" / output_name / case
-            all_xfm_args.append((filepath, dest_dir, scenario, xfm_params))
+            all_xfm_args.append((filepath, dest_dir, output_name, case, scenario, xfm_params))
 
     n_total   = len(all_xfm_args)
     n_workers = min(os.cpu_count() or 4, n_total, 12)

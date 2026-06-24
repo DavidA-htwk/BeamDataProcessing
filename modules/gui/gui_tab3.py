@@ -642,17 +642,17 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     _select_tool(MERGE_GROUPS[0][0])
 
     # ── Multiplication factor ─────────────────────────────────────────────────
-    mult_lframe = tk.LabelFrame(tab3, text="Multiplication factor", padx=8, pady=4)
+    mult_lframe = tk.LabelFrame(tab3, text="Snapshot factor (visual only)", padx=8, pady=4)
     _mult_frame_row = tk.Frame(mult_lframe)
     _mult_frame_row.pack(fill="x")
     pp_mult_var = tk.StringVar(value=str(pp_s.get("mult_factor_pp", "1.0")))
-    pp_mult_label = tk.Label(_mult_frame_row, text="Factor:",
+    pp_mult_label = tk.Label(_mult_frame_row, text="Snapshot factor:",
                              font=("Segoe UI", 9, "bold"))
     pp_mult_label.pack(side="left")
     pp_mult_entry = tk.Entry(_mult_frame_row, textvariable=pp_mult_var, width=10)
     pp_mult_entry.pack(side="left", padx=(8, 0))
     pp_mult_desc = tk.Label(_mult_frame_row,
-                            text="(applied to power density and total power)",
+                            text="(applied to snapshots only — VTPs always store raw values)",
                             fg="#64748b")
     pp_mult_desc.pack(side="left", padx=(8, 4))
     pp_mult_note = tk.Label(_mult_frame_row, text="", fg="#b45309",
@@ -724,43 +724,33 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     def _update_pp_mult_state(*_):
         src   = pp_source_var.get()
         baked = _baked_factor[0]
-        loaded_for_this_src = (_cases_loaded_for_source[0] == src)
+        # Snapshot factor is always editable — VTPs always store raw values.
+        pp_mult_entry.configure(state="normal")
+        pp_mult_label.configure(fg="black")
+        pp_mult_desc.configure(fg="#64748b")
+        get_p = _get_mult_factor_p[0]
         if src in _PP_ORIGINAL_SRCS:
             _baked_factor[0] = 1.0
-            _cases_loaded_for_source[0] = src   # original dirs always confirmed
-            pp_mult_var.set("1.0")
-            pp_mult_entry.configure(state="normal")
-            pp_mult_label.configure(fg="black")
-            pp_mult_desc.configure(fg="#64748b")
-            pp_mult_note.configure(text="")
-        elif not loaded_for_this_src:
-            # Source changed but Load Cases not yet clicked — lock the field
-            pp_mult_entry.configure(state="disabled")
-            pp_mult_label.configure(fg="#999999")
-            pp_mult_desc.configure(fg="#bbbbbb")
-            pp_mult_note.configure(text="(click \u201cLoad Cases\u201d to detect baked factor)")
-        elif baked == 0.0:
-            # Mixed factors detected across selected dirs — warn but allow edit
-            pp_mult_entry.configure(state="normal")
-            pp_mult_label.configure(fg="black")
-            pp_mult_desc.configure(fg="#64748b")
-            pp_mult_note.configure(text="(\u26a0 mixed factors across cases \u2014 set manually)")
-        elif baked != 1.0:
-            # VTPs store raw smoothed values; pre-fill factor from Processing
-            pp_mult_var.set(str(baked))
-            pp_mult_entry.configure(state="normal")
-            pp_mult_label.configure(fg="black")
-            pp_mult_desc.configure(fg="#64748b")
-            pp_mult_note.configure(text=f"(\u2190 pre-filled from Processing; VTPs store raw values)")
-        else:
-            # baked == 1.0 and confirmed by Load Cases: VTPs unscaled
-            get_p = _get_mult_factor_p[0]
+            _cases_loaded_for_source[0] = src
             if get_p is not None:
                 pp_mult_var.set(get_p())
-            pp_mult_entry.configure(state="normal")
-            pp_mult_label.configure(fg="black")
-            pp_mult_desc.configure(fg="#64748b")
-            pp_mult_note.configure(text="(VTPs unscaled \u2014 factor applied here)")
+            else:
+                pp_mult_var.set("1.0")
+            pp_mult_note.configure(text="(\u2190 pre-filled from Processing tab)")
+        elif baked == 0.0:
+            # Mixed snapshot factors across selected dirs
+            if get_p is not None:
+                pp_mult_var.set(get_p())
+            pp_mult_note.configure(text="(\u26a0 mixed factors across cases \u2014 verify manually)")
+        elif baked != 1.0:
+            # Pre-fill from the snapshot factor recorded by Processing
+            pp_mult_var.set(str(baked))
+            pp_mult_note.configure(text="(\u2190 pre-filled from Processing snapshot factor)")
+        else:
+            # baked == 1.0: pre-fill from Processing tab if available
+            if get_p is not None:
+                pp_mult_var.set(get_p())
+            pp_mult_note.configure(text="(\u2190 pre-filled from Processing tab)")
 
     pp_source_var.trace_add("write", _update_pp_mult_state)
     _update_pp_mult_state()   # apply on first render

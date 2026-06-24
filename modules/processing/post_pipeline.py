@@ -84,12 +84,12 @@ def run_post_processing(
     # ── Phase 0: Collect and group files ─────────────────────────────────────
     log("Collecting files from selected cases...")
     log(f"  Pattern: {pattern}  |  filter: {name_filter or '(none)'}")
-    log(f"  Mult factor: {mult_factor:.6g} (always applied — VTPs store raw values)")
+    log(f"  Snapshot factor: {mult_factor:.6g} (applied to snapshots only — VTPs always store raw values)")
     log(f"  Merge arrays: "
         f"{'Power Density' if merge_pd else ''}"
         f"{' + ' if merge_pd and merge_pwr else ''}"
         f"{'Total Power' if merge_pwr else ''}")
-    log(f"  Groups: {list(groups_cfg.keys())}")
+    log(f"  Groups: {[group_labels.get(k, k) for k in groups_cfg.keys()]}")
     if not merge_pd:
         log("  [WARN] Power Density (Power_Density_W_m2) merge is OFF — "
             "the output VTP will inherit that array unchanged from whichever "
@@ -153,7 +153,7 @@ def run_post_processing(
         writer = csv.writer(fh)
         writer.writerow(["group", "output_name", "merged_cases", "filename",
                          "n_cases_merged", "max_val", "total_power",
-                         "mult_factor_applied", "source",
+                         "snap_factor", "source",
                          "snapshot", "vtp_path"])
 
         for (group_name, output_name, stem), file_case_pairs in sorted(slot_groups.items()):
@@ -169,7 +169,8 @@ def run_post_processing(
             n_loaded     = 0
             merged_cases: list[str] = []   # case names that contributed
 
-            log(f"  [{done_count}/{total_slots}] [{group_name}] {stem}  "
+            _slot_label = group_labels.get(group_name, group_name)
+            log(f"  [{done_count}/{total_slots}] [{_slot_label}] {stem}  "
                 f"({len(file_case_pairs)} source file(s)):")
             for fp, case_name in file_case_pairs:
                 log(f"    + [{case_name}]  {fp}")
@@ -215,11 +216,7 @@ def run_post_processing(
                     "no valid files — skipped.")
                 continue
 
-            # ── Apply multiplication factor if source is original ─────────────
-            if apply_mult and mult_factor != 1.0:
-                if running_pd  is not None: running_pd  *= mult_factor
-                if running_pwr is not None: running_pwr *= mult_factor
-
+            # VTPs always store raw values — snapshot factor is applied only during rendering.
             max_val   = float(running_pd.max())  if running_pd  is not None else None
             max_pwr_v = float(running_pwr.max()) if running_pwr is not None else None
             total_pwr = float(running_pwr.sum()) if running_pwr is not None else None
@@ -283,13 +280,13 @@ def run_post_processing(
                     p_pd = [str(snap_dir_case / f"merged_results_{_bare_stem}__merged__pwr_density.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_pd,
-                         ARRAY_NAME, True, stem, 1.0) + _extra)
+                         ARRAY_NAME, True, stem, mult_factor) + _extra)
                     snap_str = p_pd[0]
                 if snap_tp:
                     p_tp = [str(snap_dir_case / f"merged_results_{_bare_stem}__merged__total_pwr.png")]
                     snap_args.append(
                         (str(out_vtp), str(out_vtp), p_tp,
-                         POWER_ARRAY, True, stem, 1.0) + _extra)
+                         POWER_ARRAY, True, stem, mult_factor) + _extra)
                     if not snap_str:
                         snap_str = p_tp[0]
 
@@ -301,7 +298,7 @@ def run_post_processing(
                 f"{_merged_filename}", n_loaded,
                 f"{max_val:.6g}" if max_val is not None else "",
                 f"{total_pwr:.6g}" if total_pwr is not None else "",
-                f"{mult_factor:.6g}" if apply_mult else "1.0 (not applied)",
+                f"{mult_factor:.6g}",
                 cfg.get("pp_source", "original"),
                 snap_link, str(out_vtp),
             ])
