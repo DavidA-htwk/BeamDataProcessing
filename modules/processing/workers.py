@@ -20,7 +20,7 @@ from modules.vtk.vtk_io import (
     read_vtp, find_max, find_total, _write_vtp, _scale_polydata_array,
 )
 from modules.vtk.smoothing import apply_edge_smooth
-from modules.vtk.smart_smooth import smart_smooth_auto
+from modules.vtk.smart_smooth import smart_smooth_auto, apply_min_power_sliver_filter
 from modules.vtk.snapshot_max import save_max_snapshot, precompute_snapshot
 from modules.transform.generate_report import extract_cells_to_csv
 from modules.transform import transform_reference_frame as _trf
@@ -124,6 +124,9 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
             del polydata
             return None
 
+        if min_power_W > 0.0:
+            apply_min_power_sliver_filter(polydata, geo_cache, min_power_W)
+
         # ── Smooth + precompute camera ─────────────────────────────────────────
         smooth_vtp_path:   str | None  = None
         saved_smooth_path: str | None  = None
@@ -140,7 +143,7 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                     spike_ratio=spike_ratio,
                     proximity_radius=proximity_radius,
                     smooth_spikes=True,
-                    min_power_W=min_power_W,
+                    min_power_W=0.0,
                 )
             else:
                 smoothed = apply_edge_smooth(
@@ -203,9 +206,9 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                 max_pwr_orig   = find_max(polydata, POWER_ARRAY)
                 pre_smooth_cam = pre_orig_cam   # snapshot_only: same file for both
                 max_pwr_smooth = max_pwr_orig
+            max_after       = find_max(polydata, ARRAY_NAME)
+            total_pwr_after = find_total(polydata, POWER_ARRAY)
             del polydata
-            max_after       = max_before
-            total_pwr_after = total_pwr  # no smoothing applied
 
         return (fp, on, c, s, max_before, max_after, total_pwr, total_pwr_after, smooth_vtp_path,
                 saved_smooth_path, pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)

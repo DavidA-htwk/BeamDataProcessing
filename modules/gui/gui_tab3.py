@@ -88,44 +88,64 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     selall_frame = tk.Frame(case_lframe)
     selall_frame.pack(fill="x", pady=(0, 2))
 
-    # Scrollable checkbox area + snapshot preview pane
+    # ── Three-panel layout: Scenarios | Components | Snapshot preview ──────────
     case_content = tk.PanedWindow(case_lframe, orient="horizontal",
-                                    sashwidth=5, sashrelief="raised", bg="#d0d0d0")
+                                   sashwidth=5, sashrelief="raised", bg="#d0d0d0")
     case_content.pack(fill="both", expand=True)
 
-    chk_canvas_frame = tk.Frame(case_content)
-    case_content.add(chk_canvas_frame, stretch="always", minsize=200)
-    chk_canvas = tk.Canvas(chk_canvas_frame, height=150, bg="white",
-                            highlightthickness=0)
-    chk_vscroll = tk.Scrollbar(chk_canvas_frame, orient="vertical",
-                                command=chk_canvas.yview)
-    chk_hscroll = tk.Scrollbar(chk_canvas_frame, orient="horizontal",
-                                command=chk_canvas.xview)
-    chk_canvas.configure(yscrollcommand=chk_vscroll.set,
-                         xscrollcommand=chk_hscroll.set)
-    chk_vscroll.pack(side="right", fill="y")
-    chk_hscroll.pack(side="bottom", fill="x")
-    chk_canvas.pack(side="left", fill="both", expand=True)
-    chk_inner = tk.Frame(chk_canvas, bg="white")
-    chk_canvas.create_window((0, 0), window=chk_inner, anchor="nw")
+    # ── Left pane: scrollable scenario list (one row per scenario folder) ─────
+    scen_outer = tk.Frame(case_content)
+    case_content.add(scen_outer, stretch="always", minsize=200, width=300)
+    tk.Label(scen_outer, text="Scenarios  (click to assign colour group)",
+             font=("Segoe UI", 8, "bold"), fg="#444444", anchor="w").pack(
+        fill="x", padx=4, pady=(2, 0))
+    scen_canvas = tk.Canvas(scen_outer, bg="white", highlightthickness=0)
+    scen_vscroll = tk.Scrollbar(scen_outer, orient="vertical",
+                                command=scen_canvas.yview)
+    scen_canvas.configure(yscrollcommand=scen_vscroll.set)
+    scen_vscroll.pack(side="right", fill="y")
+    scen_canvas.pack(side="left", fill="both", expand=True)
+    scen_inner = tk.Frame(scen_canvas, bg="white")
+    _scen_win = scen_canvas.create_window((0, 0), window=scen_inner, anchor="nw")
+    scen_inner.bind("<Configure>",
+                    lambda e: scen_canvas.configure(
+                        scrollregion=scen_canvas.bbox("all")))
+    scen_canvas.bind("<Configure>",
+                     lambda e: scen_canvas.itemconfig(_scen_win, width=e.width))
 
-    def _on_chk_resize(event):
-        chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
+    def _on_scen_scroll(event):
+        scen_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    chk_inner.bind("<Configure>", _on_chk_resize)
+    scen_canvas.bind("<Enter>",
+                     lambda _: scen_canvas.bind_all("<MouseWheel>", _on_scen_scroll))
+    scen_canvas.bind("<Leave>",
+                     lambda _: scen_canvas.unbind_all("<MouseWheel>"))
 
-    def _on_mousewheel(event):
-        chk_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    # ── Middle pane: component list (click to filter snapshot preview) ────────
+    comp_outer = tk.Frame(case_content)
+    case_content.add(comp_outer, stretch="never", minsize=120, width=160)
+    comp_hdr_lbl = tk.Label(comp_outer, text="Components (0)",
+                            font=("Segoe UI", 8, "bold"), fg="#444444", anchor="w")
+    comp_hdr_lbl.pack(fill="x", padx=4, pady=(2, 0))
+    comp_list_frame = tk.Frame(comp_outer)
+    comp_list_frame.pack(fill="both", expand=True, padx=(4, 0), pady=(2, 4))
+    comp_listbox = tk.Listbox(comp_list_frame, selectmode="single",
+                               font=("Segoe UI", 8), activestyle="none",
+                               selectbackground="#005f73", selectforeground="white",
+                               bg="white", bd=0, highlightthickness=1,
+                               highlightcolor="#aaaaaa")
+    comp_vscroll = tk.Scrollbar(comp_list_frame, orient="vertical",
+                                command=comp_listbox.yview)
+    comp_listbox.configure(yscrollcommand=comp_vscroll.set)
+    comp_vscroll.pack(side="right", fill="y")
+    comp_listbox.pack(side="left", fill="both", expand=True)
+    _all_comp_names: list[str] = []   # populated by on_load_cases
 
-    chk_canvas.bind("<MouseWheel>", _on_mousewheel)
-    chk_inner.bind("<MouseWheel>",  _on_mousewheel)
+    def _get_selected_comp() -> str:
+        sel = comp_listbox.curselection()
+        return _all_comp_names[sel[0]] if sel and _all_comp_names else ""
 
-    def _bind_mousewheel_to_children(widget):
-        widget.bind("<MouseWheel>", _on_mousewheel)
-        for child in widget.winfo_children():
-            _bind_mousewheel_to_children(child)
-
-    # ── Snapshot preview pane (resizable via sash) ────────────────────────────
+    # ── Right pane: snapshot preview ──────────────────────────────────────────
     _PREVIEW_INIT_W = 280
     preview_outer = tk.Frame(case_content, bg="#f5f5f5", relief="sunken", bd=1)
     case_content.add(preview_outer, stretch="never", minsize=120,
@@ -133,7 +153,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     tk.Label(preview_outer, text="Snapshot preview", bg="#f5f5f5",
              font=("Segoe UI", 8, "italic"), fg="#999999").pack(pady=(4, 0))
     preview_img_lbl  = tk.Label(preview_outer, bg="#f5f5f5",
-                                text="(select a case)", fg="#bbbbbb",
+                                text="(select a scenario)", fg="#bbbbbb",
                                 font=("Segoe UI", 8), cursor="hand2")
     preview_img_lbl.pack(expand=True)
     preview_name_lbl = tk.Label(preview_outer, bg="#f5f5f5",
@@ -141,7 +161,6 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                                 font=("Segoe UI", 7), wraplength=0)
     preview_name_lbl.pack(pady=(2, 4))
 
-    # ── Zoom slider ───────────────────────────────────────────────────
     zoom_var = tk.DoubleVar(value=1.0)
     _zoom_frame = tk.Frame(preview_outer, bg="#f5f5f5")
     _zoom_frame.pack(fill="x", padx=6, pady=(0, 2))
@@ -156,25 +175,23 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
              length=1).pack(side="left", fill="x", expand=True, padx=(4, 2))
 
     _preview_ref  = [None, None]   # [0]=PhotoImage (GC guard), [1]=last snap path
-    _pan_offset   = [0.0, 0.0]     # [dx, dy] pan in original image pixels
-    _drag_start   = [None, None]   # screen pos at ButtonPress-1
-    _drag_pan_st  = [0.0, 0.0]    # _pan_offset snapshot at drag start
-    _img_orig_sz  = [None]         # (iw, ih) of last loaded image
+    _pan_offset   = [0.0, 0.0]
+    _drag_start   = [None, None]
+    _drag_pan_st  = [0.0, 0.0]
+    _img_orig_sz  = [None]
 
     def _find_snapshot_pp(sf_path: str) -> str | None:
-        """Return best matching processing snapshot PNG for sf_path."""
-        source  = pp_source_var.get()
+        """Return best matching snapshot PNG for scenario folder sf_path."""
+        source = pp_source_var.get()
         try:
             output_name, case, scenario = extract_case_scenario(sf_path)
         except Exception:
             return None
 
         if source == "post_smooth":
-            # sf_path = {out}/post_smoothed/{output_name}/{case}/{scenario} → parents[3]={out}
-            derived = Path(sf_path).parents[3]
+            derived   = Path(sf_path).parents[3]
             snap_base = derived / "snapshots" / output_name / case / scenario
         else:
-            # original sources: use configured output folder
             get_out = _get_output_folder[0]
             if get_out is None:
                 return None
@@ -188,19 +205,26 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         pngs = sorted(snap_base.glob("*.png"))
         if not pngs:
             return None
+
+        comp_filter = _get_selected_comp()
+
+        def _apply_comp_filter(lst):
+            if comp_filter:
+                f = [p for p in lst if comp_filter.lower() in p.stem.lower()]
+                return f if f else lst
+            return lst
+
         if source in ("original", "original_smooth"):
-            # Smoothed simulation input → __RAW_smoothed snapshot
-            cands = [p for p in pngs if "__RAW_smoothed" in p.stem]
+            cands = _apply_comp_filter([p for p in pngs if "__RAW_smoothed" in p.stem])
             if cands:
                 return str(cands[0])
         elif source == "original_raw":
-            # RAW input → __RAW snapshot (before post-smoothing)
-            cands = [p for p in pngs if "__RAW" in p.stem and "__RAW_smoothed" not in p.stem]
+            cands = _apply_comp_filter(
+                [p for p in pngs if "__RAW" in p.stem and "__RAW_smoothed" not in p.stem])
             if cands:
                 return str(cands[0])
         else:
-            # post_smooth source → show the __post_smooth snapshot from Processing
-            cands = [p for p in pngs if "__post_smooth" in p.stem]
+            cands = _apply_comp_filter([p for p in pngs if "__post_smooth" in p.stem])
             if cands:
                 return str(cands[0])
         return None
@@ -302,7 +326,14 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     preview_outer.bind("<Configure>", _on_preview_resize_pp)
 
-    # ── Merge group definitions ───────────────────────────────────────────
+    # Component listbox → refresh preview when selection changes
+    def _on_comp_select(event=None):
+        if _last_click_path[0]:
+            _update_preview_pp(_last_click_path[0])
+
+    comp_listbox.bind("<<ListboxSelect>>", _on_comp_select)
+
+    # ── Merge group definitions ───────────────────────────────────────────────
     MERGE_GROUPS = [
         ("blue",   "#2563eb"),
         ("red",    "#dc2626"),
@@ -310,131 +341,112 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         ("orange", "#ea580c"),
         ("purple", "#9333ea"),
     ]
-    _GROUP_COLORS = {name: color for name, color in MERGE_GROUPS}
-    # User-visible labels (may be overridden via double-click rename)
+    _GROUP_COLORS       = {name: color for name, color in MERGE_GROUPS}
     _saved_labels: dict[str, str] = pp_s.get("group_labels", {})
-    _group_labels: dict[str, str] = {
-        k: _saved_labels.get(k, k) for k, _ in MERGE_GROUPS
-    }
-    active_group_var = tk.StringVar(value=MERGE_GROUPS[0][0])   # currently active tool
-    # case_group: {sf_path: group_name} — unkeyed = not in any group
-    case_group: dict[str, str] = {}
-    # widgets: {sf_path: indicator_label}  — updated on click for immediate visual
-    _indicator_widgets: dict[str, tk.Label] = {}
-    # restore from saved config
-    _saved_case_groups: dict[str, str] = dict(pp_s.get("case_groups", {}))
-    # Baked factor: set by on_load_cases when loading post_smooth dirs.
-    # 1.0 = unscaled VTPs (allow user factor)
-    # 0.0 = mixed/unknown (disable field)
-    # other = that factor was baked in (disable field, use 1.0 internally)
-    _baked_factor: list[float] = [1.0]
-    # Set to True when post_smooth cases have been loaded (factor confirmed).
-    # Until then, the factor field stays locked for post_smooth source.
-    _cases_loaded_for_source: list[str] = [""]
+    _group_labels: dict[str, str] = {k: _saved_labels.get(k, k) for k, _ in MERGE_GROUPS}
+    active_group_var    = tk.StringVar(value=MERGE_GROUPS[0][0])
+    case_group:         dict[str, str]      = {}   # {scenario_path: group_name}
+    _scenario_indicators: dict[str, tk.Label] = {}  # {scenario_path: indicator_label}
+    _saved_case_groups: dict[str, str]      = dict(pp_s.get("case_groups", {}))
+    _baked_factor:       list[float]        = [1.0]
+    _cases_loaded_for_source: list[str]     = [""]
+    _last_click_path:    list               = [None]
+    _ordered_scenarios:  list[str]          = []
 
-    _last_click_path: list[str | None] = [None]   # for Shift+click range assign
-    _ordered_paths:   list[str]        = []        # display order, rebuilt each load
+    def _refresh_scenario_ind(sp: str) -> None:
+        ind = _scenario_indicators.get(sp)
+        if ind is None:
+            return
+        grp = case_group.get(sp)
+        if grp:
+            lbl_ch = _group_labels.get(grp, grp)
+            ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb"),
+                          text=lbl_ch[0].upper(), fg="white")
+        else:
+            ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
 
-    def _assign_group(sf_path: str) -> None:
-        """Assign sf_path to the active group, or clear it if already that group."""
+    def _assign_scenario(sp: str) -> None:
         active = active_group_var.get()
         if active == "_clear":
-            case_group.pop(sf_path, None)
-        elif case_group.get(sf_path) == active:
-            case_group.pop(sf_path, None)  # toggle off
+            case_group.pop(sp, None)
+        elif case_group.get(sp) == active:
+            case_group.pop(sp, None)
         else:
-            case_group[sf_path] = active
-        # Update indicator widget: show first letter of the custom label
-        ind = _indicator_widgets.get(sf_path)
-        if ind is not None:
-            grp = case_group.get(sf_path)
-            if grp:
-                lbl = _group_labels.get(grp, grp)
-                ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb"),
-                              text=lbl[0].upper(), fg="white")
-            else:
-                ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
-        _last_click_path[0] = sf_path
-        _update_preview_pp(sf_path)
+            case_group[sp] = active
+        _refresh_scenario_ind(sp)
+        _last_click_path[0] = sp
+        _update_preview_pp(sp)
 
-    def _assign_range(sf_path: str) -> None:
-        """Shift+click: assign active group to range from last click to sf_path."""
-        last = _last_click_path[0]
+    def _assign_scenario_range(sp: str) -> None:
+        last   = _last_click_path[0]
         active = active_group_var.get()
-        if last and last in _ordered_paths and sf_path in _ordered_paths:
-            lo = min(_ordered_paths.index(last), _ordered_paths.index(sf_path))
-            hi = max(_ordered_paths.index(last), _ordered_paths.index(sf_path))
-            for pp in _ordered_paths[lo:hi + 1]:
+        if last and last in _ordered_scenarios and sp in _ordered_scenarios:
+            lo = min(_ordered_scenarios.index(last), _ordered_scenarios.index(sp))
+            hi = max(_ordered_scenarios.index(last), _ordered_scenarios.index(sp))
+            for _item in _ordered_scenarios[lo:hi + 1]:
                 if active == "_clear":
-                    case_group.pop(pp, None)
+                    case_group.pop(_item, None)
                 else:
-                    case_group[pp] = active
-                ind = _indicator_widgets.get(pp)
-                if ind is not None:
-                    grp = case_group.get(pp)
-                    if grp:
-                        lbl = _group_labels.get(grp, grp)
-                        ind.configure(bg=_GROUP_COLORS.get(grp, "#e5e7eb"),
-                                      text=lbl[0].upper(), fg="white")
-                    else:
-                        ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
+                    case_group[_item] = active
+                _refresh_scenario_ind(_item)
         else:
-            _assign_group(sf_path)
-        _last_click_path[0] = sf_path
-        _update_preview_pp(sf_path)
+            _assign_scenario(sp)
+        _last_click_path[0] = sp
+        _update_preview_pp(sp)
 
-    def _build_case_grid(cases_by_output: dict[str, list[Path]]) -> None:
-        """One column per output_name: bold header row 0, cases stacked below."""
-        for w in chk_inner.winfo_children():
+    def _build_scenario_list(scenarios_by_output: dict[str, list[str]]) -> None:
+        """Populate the scenario pane; one row per scenario folder."""
+        for w in scen_inner.winfo_children():
             w.destroy()
         case_group.clear()
-        _indicator_widgets.clear()
-        _ordered_paths.clear()
-        if not cases_by_output:
-            tk.Label(chk_inner, text="(no subfolders found)",
-                     fg="#aaaaaa", bg="white").grid(
-                row=0, column=0, sticky="w", padx=4)
-            chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
+        _scenario_indicators.clear()
+        _ordered_scenarios.clear()
+
+        if not scenarios_by_output:
+            tk.Label(scen_inner, text="(no scenarios found)",
+                     fg="#aaaaaa", bg="white").pack(anchor="w", padx=6, pady=4)
+            scen_canvas.configure(scrollregion=scen_canvas.bbox("all"))
             return
-        for col_idx, (output_name, subfolders) in enumerate(
-                sorted(cases_by_output.items())):
-            tk.Label(chk_inner, text=output_name, anchor="w", bg="white",
-                     font=("Segoe UI", 9, "bold")).grid(
-                row=0, column=col_idx, sticky="w", padx=(4, 12), pady=(2, 4))
-            for row_idx, sf in enumerate(sorted(subfolders), start=1):
-                sp = str(sf)
-                _ordered_paths.append(sp)
-                # Restore saved assignment
+
+        for output_name, scen_paths in sorted(scenarios_by_output.items()):
+            hdr_frame = tk.Frame(scen_inner, bg="#e8f4f8")
+            hdr_frame.pack(fill="x", pady=(8, 0))
+            tk.Label(hdr_frame, text=output_name, bg="#e8f4f8", fg="#005f73",
+                     font=("Segoe UI", 8, "bold"), anchor="w").pack(
+                fill="x", padx=6, pady=3)
+            tk.Frame(scen_inner, bg="#94c7d8", height=1).pack(fill="x")
+
+            for sp in sorted(scen_paths):
                 if sp in _saved_case_groups:
                     case_group[sp] = _saved_case_groups[sp]
                 grp = case_group.get(sp)
-                lbl_text = (_group_labels.get(grp, grp)[0].upper()
-                            if grp else "")
-                ind = tk.Label(
-                    chk_inner,
-                    text=lbl_text,
-                    width=2, font=("Segoe UI", 7, "bold"),
-                    bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
-                    fg="white",
-                    relief="flat", cursor="hand2",
-                )
-                ind.grid(row=row_idx, column=col_idx,
-                         sticky="w", padx=(4, 0), pady=1)
-                name_lbl = tk.Label(
-                    chk_inner, text=sf.name, anchor="w",
-                    bg="white", cursor="hand2",
-                )
-                name_lbl.grid(row=row_idx, column=col_idx,
-                              sticky="w", padx=(22, 12), pady=1)
-                _indicator_widgets[sp] = ind
-                for widget in (ind, name_lbl):
+                _ordered_scenarios.append(sp)
+
+                row = tk.Frame(scen_inner, bg="white", cursor="hand2")
+                row.pack(fill="x", padx=2, pady=1)
+
+                grp_lbl_ch = _group_labels.get(grp, grp) if grp else ""
+                ind = tk.Label(row,
+                               text=grp_lbl_ch[0].upper() if grp_lbl_ch else "",
+                               width=2, font=("Segoe UI", 7, "bold"),
+                               bg=_GROUP_COLORS.get(grp, "#e5e7eb") if grp else "#e5e7eb",
+                               fg="white", relief="flat")
+                ind.pack(side="left", padx=(4, 6), pady=2)
+
+                name_lbl = tk.Label(row, text=Path(sp).name,
+                                    anchor="w", bg="white", font=("Segoe UI", 8))
+                name_lbl.pack(side="left", fill="x", expand=True, pady=2)
+
+                _scenario_indicators[sp] = ind
+
+                for widget in (row, ind, name_lbl):
                     widget.bind("<Button-1>",
-                                lambda _e, p=sp: _assign_group(p))
+                                lambda _e, p=sp: _assign_scenario(p))
                     widget.bind("<Shift-Button-1>",
-                                lambda _e, p=sp: _assign_range(p))
-        chk_inner.update_idletasks()
-        chk_canvas.configure(scrollregion=chk_canvas.bbox("all"))
-        _bind_mousewheel_to_children(chk_inner)
+                                lambda _e, p=sp: _assign_scenario_range(p))
+
+        scen_inner.update_idletasks()
+        scen_canvas.configure(scrollregion=scen_canvas.bbox("all"))
 
     def on_load_cases():
         source = pp_source_var.get()
@@ -460,7 +472,9 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 if output_dir.is_dir():
                     for case_dir in sorted(output_dir.iterdir()):
                         if case_dir.is_dir():
-                            dirs.append(str(case_dir))
+                            for scenario_dir in sorted(case_dir.iterdir()):
+                                if scenario_dir.is_dir():
+                                    dirs.append(str(scenario_dir))
             if not dirs:
                 load_case_status.set("  Post-smoothed folder exists but is empty.")
                 return
@@ -470,92 +484,116 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                 messagebox.showwarning("Not ready",
                                        "Tab 1 not yet initialised. Please wait.")
                 return
-            dirs = get_dirs()
-            if not dirs:
+            raw_dirs = get_dirs()
+            if not raw_dirs:
                 messagebox.showwarning(
                     "No directories",
                     "Please add at least one folder in the Tab 1 directory list.")
                 return
+            for d in raw_dirs:
+                p = Path(d)
+                if not p.is_dir():
+                    continue
+                if p.name.upper().startswith("OUTPUT_"):
+                    for sub in sorted(p.iterdir()):
+                        if sub.is_dir():
+                            dirs.append(str(sub))
+                else:
+                    dirs.append(d)
 
-        cases_by_output: dict[str, list[Path]] = {}
-        n_total = 0
-        _STORAGE = {"SMOOTHED", "RAW", "RESULTS", "OUTPUT"}
+        pat        = pp_pattern_var.get() or "smoothed_results_*.vtp"
+        raw_filter = pp_filter_var.get().strip()
+        terms      = ([t.strip().lower() for t in raw_filter.split(",") if t.strip()]
+                      if raw_filter else [])
+
+        # Build: {output_name: [scenario_path, ...]} and unique component names
+        scenarios_by_output: dict[str, list[str]] = {}
+        _all_comp_names.clear()
+        comp_set: set[str] = set()
+        n_files = 0
+
         for d in dirs:
             p = Path(d)
             if not p.is_dir():
                 continue
-            if source == "original_smooth":
-                # Show only the SMOOTHED subdir of each scenario dir
-                smoothed_sub = p / "SMOOTHED"
-                if smoothed_sub.is_dir():
-                    cases_by_output.setdefault(p.name, []).append(smoothed_sub)
-                    n_total += 1
-            elif source in ("original_raw", "original"):
-                # Show only non-storage subdirs (skip SMOOTHED, RAW, etc.)
-                subs = sorted([s for s in p.iterdir()
-                               if s.is_dir() and s.name.upper() not in _STORAGE])
-                if subs:
-                    cases_by_output[p.name] = subs
-                    n_total += len(subs)
-            else:
-                subs = sorted([s for s in p.iterdir() if s.is_dir()])
-                if subs:
-                    cases_by_output[p.name] = subs
-                    n_total += len(subs)
-        # Detect baked factor from _mult_factor.txt metadata in scenario dirs
+            output_name, _, _ = extract_case_scenario(str(p))
+            scan_dir = (p / "SMOOTHED"
+                        if source == "original_smooth" and (p / "SMOOTHED").is_dir()
+                        else p)
+            files = sorted(scan_dir.rglob(pat))
+            if terms:
+                files = [f for f in files
+                         if any(t in f.stem.lower() for t in terms)]
+            if not files:
+                continue
+            sp = str(p)
+            scenarios_by_output.setdefault(output_name, [])
+            if sp not in scenarios_by_output[output_name]:
+                scenarios_by_output[output_name].append(sp)
+            n_files += len(files)
+            for f in files:
+                comp = f.stem
+                for pfx in ("smoothed_results_", "results_",
+                            "post_smooth_results_", "merged_results_"):
+                    if comp.lower().startswith(pfx):
+                        comp = comp[len(pfx):]
+                        break
+                comp_set.add(comp)
+
         if source == "post_smooth":
             _ff: set[float] = set()
             for _d in dirs:
-                for _sd in Path(_d).iterdir():
-                    if _sd.is_dir():
-                        _mf = _sd / "_mult_factor.txt"
-                        if _mf.exists():
-                            try: _ff.add(float(_mf.read_text().strip()))
-                            except Exception: pass
+                _mf = Path(_d) / "_mult_factor.txt"
+                if _mf.exists():
+                    try: _ff.add(float(_mf.read_text().strip()))
+                    except Exception: pass
             _baked_factor[0] = (
                 _ff.pop() if len(_ff) == 1 else
                 0.0 if len(_ff) > 1 else 1.0)
         else:
             _baked_factor[0] = 1.0
         _cases_loaded_for_source[0] = source
+
+        # Populate component listbox
+        _all_comp_names.extend(sorted(comp_set))
+        comp_listbox.delete(0, "end")
+        for cn in _all_comp_names:
+            comp_listbox.insert("end", cn)
+        comp_hdr_lbl.configure(text=f"Components ({len(_all_comp_names)})")
+        if _all_comp_names:
+            comp_listbox.selection_set(0)
+
+        n_scenarios = sum(len(v) for v in scenarios_by_output.values())
         _update_pp_mult_state()
-        _build_case_grid(cases_by_output)
-        if n_total:
+        _build_scenario_list(scenarios_by_output)
+        if n_scenarios:
             src_label = "post-smoothed" if source == "post_smooth" else "input"
             load_case_status.set(
-                f"  {len(cases_by_output)} output(s), {n_total} case(s) found"
-                f"  [{src_label}]")
+                f"  {len(scenarios_by_output)} output(s), "
+                f"{n_scenarios} scenario(s), {n_files} file(s) found  [{src_label}]")
         else:
-            load_case_status.set("  No subfolders found in the given paths.")
+            load_case_status.set("  No matching files found.")
         _mark_load_fresh()
 
     load_case_btn.configure(command=on_load_cases)
 
     def _sel_all():
-        """Assign all visible cases to the active group."""
+        """Assign all visible scenarios to the active group."""
         active = active_group_var.get()
         if active == "_clear":
-            for sp in list(_indicator_widgets):
+            for sp in list(_scenario_indicators):
                 case_group.pop(sp, None)
-                ind = _indicator_widgets.get(sp)
-                if ind:
-                    ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
+                _refresh_scenario_ind(sp)
         else:
-            lbl = _group_labels.get(active, active)
-            for sp in _indicator_widgets:
+            for sp in _scenario_indicators:
                 case_group[sp] = active
-                ind = _indicator_widgets.get(sp)
-                if ind:
-                    ind.configure(bg=_GROUP_COLORS[active],
-                                  text=lbl[0].upper(), fg="white")
+                _refresh_scenario_ind(sp)
 
     def _desel_all():
-        """Remove all cases from all groups."""
-        for sp in list(_indicator_widgets):
+        """Remove all scenarios from all groups."""
+        for sp in list(_scenario_indicators):
             case_group.pop(sp, None)
-            ind = _indicator_widgets.get(sp)
-            if ind:
-                ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
+            _refresh_scenario_ind(sp)
 
     # ── Group toolbar ────────────────────────────────────────────────────────
     # Toolbar lives in selall_frame: active tool buttons + assign-all + clear-all
@@ -611,7 +649,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         if btn:
             btn.configure(text=new_name, bg=_GROUP_COLORS.get(key, btn.cget("bg")))
         # Update all indicator squares that currently carry this group
-        for sp, ind in _indicator_widgets.items():
+        for sp, ind in _scenario_indicators.items():
             if case_group.get(sp) == key:
                 ind.configure(text=new_name[0].upper())
         # Re-assert active tool styling (dialog focus loss can visually reset buttons)
@@ -871,7 +909,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             if key in _group_labels:
                 btn.configure(text=_group_labels[key])
         # Re-apply saved assignments to already-loaded indicator widgets
-        for sp, ind in _indicator_widgets.items():
+        for sp, ind in _scenario_indicators.items():
             grp = _saved_case_groups.get(sp)
             if grp:
                 case_group[sp] = grp

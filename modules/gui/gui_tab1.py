@@ -127,9 +127,32 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     comp_lframe = tk.LabelFrame(tab1, text="Components", padx=8, pady=4)
     comp_lframe.pack(fill="x", padx=10, pady=(6, 0))
 
-    # Single grid for header row + all data rows so columns align automatically.
-    comp_grid = tk.Frame(comp_lframe)
-    comp_grid.pack(fill="x")
+    # ── Scrollable canvas: header (row 0) + bulk-apply (row 1) + data rows ────
+    _comp_outer = tk.Frame(comp_lframe)
+    _comp_outer.pack(fill="x")
+    _comp_canvas = tk.Canvas(_comp_outer, height=220, highlightthickness=0)
+    _comp_ybar   = tk.Scrollbar(_comp_outer, orient="vertical",
+                                command=_comp_canvas.yview)
+    _comp_canvas.configure(yscrollcommand=_comp_ybar.set)
+    _comp_ybar.pack(side="right", fill="y")
+    _comp_canvas.pack(side="left", fill="both", expand=True)
+
+    comp_grid = tk.Frame(_comp_canvas)
+    _comp_win  = _comp_canvas.create_window((0, 0), window=comp_grid, anchor="nw")
+
+    comp_grid.bind("<Configure>",
+                   lambda e: _comp_canvas.configure(
+                       scrollregion=_comp_canvas.bbox("all")))
+    _comp_canvas.bind("<Configure>",
+                      lambda e: _comp_canvas.itemconfig(_comp_win, width=e.width))
+
+    def _canvas_scroll(event):
+        _comp_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    _comp_canvas.bind("<Enter>",
+                      lambda _: _comp_canvas.bind_all("<MouseWheel>", _canvas_scroll))
+    _comp_canvas.bind("<Leave>",
+                      lambda _: _comp_canvas.unbind_all("<MouseWheel>"))
 
     _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
             "Prox (edge)", "Snap factor", "Min pwr (W)", "Pwr density", "Total pwr", "Save post-smooth VTP"]
@@ -146,6 +169,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         "Save a total-deposited-power snapshot PNG.",
         "Save the post-smoothed mesh as a VTP file (for use as input to Post Processing or Transform).",
     ]
+
+    # ── Row 0: column headers ─────────────────────────────────────────────────
     for _c, (_txt, _tip) in enumerate(zip(_HDR, _HDR_TIPS)):
         _lbl = tk.Label(comp_grid, text=_txt, anchor="w",
                         fg="#444444", font=("Segoe UI", 8, "bold"),
@@ -153,12 +178,62 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         _lbl.grid(row=0, column=_c, sticky="w")
         _Tooltip(_lbl, _tip)
 
+    # ── Row 1: "Apply to all ↓" bulk-edit row ─────────────────────────────────
+    # Set these vars then click Apply ↓ to push all values to every component row.
+    _bulk_iter_var   = tk.IntVar(value=1)
+    _bulk_mode_var   = tk.StringVar(value="auto")
+    _bulk_sigma_var  = tk.StringVar(value=str(SPIKE_SIGMA))
+    _bulk_prox_var   = tk.StringVar(value=str(SMOOTH_PROXIMITY_RADIUS))
+    _bulk_mult_var   = tk.StringVar(value="1.0")
+    _bulk_minpwr_var = tk.StringVar(value="0.0")
+    _bulk_pd_var     = tk.BooleanVar(value=True)
+    _bulk_tp_var     = tk.BooleanVar(value=False)
+    _bulk_svtp_var   = tk.BooleanVar(value=False)
+
+    def _apply_bulk_to_all(*_):
+        for _w in comp_widgets.values():
+            _w["smooth_var"].set(_bulk_iter_var.get())
+            _w["smooth_mode_var"].set(_bulk_mode_var.get())
+            _w["spike_sigma_var"].set(_bulk_sigma_var.get())
+            _w["prox_var"].set(_bulk_prox_var.get())
+            _w["mult_var"].set(_bulk_mult_var.get())
+            _w["min_pwr_var"].set(_bulk_minpwr_var.get())
+            _w["snap_pd_var"].set(_bulk_pd_var.get())
+            _w["snap_tp_var"].set(_bulk_tp_var.get())
+            _w["save_vtp_var"].set(_bulk_svtp_var.get())
+
+    _BR = 1
+    tk.Label(comp_grid, text="↳ Apply to all", anchor="w", fg="#005f73",
+             font=("Segoe UI", 8, "italic")).grid(
+        row=_BR, column=0, sticky="w", padx=(0, 4))
+    tk.Label(comp_grid, text="", width=4).grid(row=_BR, column=1)
+    tk.Spinbox(comp_grid, from_=0, to=20, width=4,
+               textvariable=_bulk_iter_var).grid(row=_BR, column=2, sticky="w", padx=(0, 4))
+    _bk_mode = tk.OptionMenu(comp_grid, _bulk_mode_var, "edge", "auto")
+    _bk_mode.config(width=5)
+    _bk_mode.grid(row=_BR, column=3, sticky="w", padx=(0, 2))
+    tk.Entry(comp_grid, textvariable=_bulk_sigma_var,  width=5).grid(
+        row=_BR, column=4, sticky="w", padx=(0, 4))
+    tk.Entry(comp_grid, textvariable=_bulk_prox_var,   width=6).grid(
+        row=_BR, column=5, sticky="w", padx=(0, 4))
+    tk.Entry(comp_grid, textvariable=_bulk_mult_var,   width=6).grid(
+        row=_BR, column=6, sticky="w", padx=(0, 4))
+    tk.Entry(comp_grid, textvariable=_bulk_minpwr_var, width=7).grid(
+        row=_BR, column=7, sticky="w", padx=(0, 4))
+    tk.Checkbutton(comp_grid, variable=_bulk_pd_var).grid(  row=_BR, column=8,  sticky="w")
+    tk.Checkbutton(comp_grid, variable=_bulk_tp_var).grid(  row=_BR, column=9,  sticky="w")
+    tk.Checkbutton(comp_grid, variable=_bulk_svtp_var).grid(row=_BR, column=10, sticky="w")
+    tk.Button(comp_grid, text="Apply ↓", fg="#005f73", font=("Segoe UI", 8),
+              command=_apply_bulk_to_all, padx=4).grid(
+        row=_BR, column=11, sticky="w", padx=(8, 0))
+
+    # ── Placeholder (row 2, removed once Load Geometry populates) ────────────
     _placeholder_lbl = tk.Label(comp_grid,
                                 text="(click Load Geometry to populate)",
                                 fg="#aaaaaa")
-    _placeholder_lbl.grid(row=1, column=0, columnspan=len(_HDR), sticky="w", pady=4)
+    _placeholder_lbl.grid(row=2, column=0, columnspan=len(_HDR), sticky="w", pady=4)
 
-    _next_row = [1]   # mutable row counter for data rows
+    _next_row = [2]   # rows 0 (header) and 1 (bulk-apply) are permanently reserved
 
     comp_widgets:     dict = {}
     pending_comp_cfg: dict = dict(settings.get("components", {}))
@@ -240,6 +315,7 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         comp_widgets[name] = {
             "smooth_var":        smooth_var,        "smooth_mode_var":  smooth_mode_var,
             "spike_sigma_var":   spike_sigma_var,   "prox_var":         prox_var,
+            "mult_var":          mult_var,
             "snap_pd_var":       snap_pd_var,        "snap_tp_var":      snap_tp_var,
             "save_vtp_var":      save_vtp_var,       "count_var":        count_var,
             "min_pwr_var":       min_pwr_var,
@@ -267,7 +343,18 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         raw_filter = filter_var.get().strip()
         terms      = [t.strip() for t in raw_filter.split(",") if t.strip()] if raw_filter else []
 
-        counts: dict = {}
+        def _stem_to_comp(stem: str) -> str:
+            """Strip the standard VTP filename prefix to get the bare component name."""
+            for pfx in ("smoothed_results_", "results_"):
+                if stem.lower().startswith(pfx):
+                    return stem[len(pfx):]
+            return stem
+
+        # Count unique files per actual component name (derived from file stem).
+        # Using a seen-set prevents double-counting across folders or multiple
+        # filter terms that can match the same file.
+        comp_counts: dict[str, int] = {}
+        seen_files:  set = set()
         log_fn("Load Geometry: scanning...")
         for d in dirs:
             p = Path(d)
@@ -278,37 +365,38 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                 if p.name.upper().startswith("OUTPUT_") else [p]
             )
             for folder in folders:
-                files = sorted(folder.rglob(pat))
-                if terms:
-                    for t in terms:
-                        matched = [f for f in files if t.lower() in f.stem.lower()]
-                        if matched:
-                            log_fn(f"  [{t}] {folder.name}: {len(matched)} file(s)")
-                            for f in matched:
-                                log_fn(f"    {f.name}")
-                        counts[t] = counts.get(t, 0) + len(matched)
-                else:
-                    if files:
-                        log_fn(f"  [(all)] {folder.name}: {len(files)} file(s)")
-                        for f in files:
-                            log_fn(f"    {f.name}")
-                    counts["(all)"] = counts.get("(all)", 0) + len(files)
+                files   = sorted(folder.rglob(pat))
+                matched = (
+                    [f for f in files
+                     if any(t.lower() in f.stem.lower() for t in terms)]
+                    if terms else list(files)
+                )
+                n_new = 0
+                for f in matched:
+                    if f in seen_files:
+                        continue
+                    seen_files.add(f)
+                    comp_label = _stem_to_comp(f.stem)
+                    comp_counts[comp_label] = comp_counts.get(comp_label, 0) + 1
+                    n_new += 1
+                if n_new:
+                    log_fn(f"  {folder.name}: {n_new} file(s) matched")
 
-        if not any(v > 0 for v in counts.values()):
+        if not comp_counts:
             load_geo_status.set("  No matching files found."); return
 
+        # Destroy only data rows (row >= 2); preserve header (0) and bulk-apply (1).
         for widget in comp_grid.winfo_children():
             info = widget.grid_info()
-            if info and int(info.get("row", 0)) >= 1:
+            if info and int(info.get("row", 0)) >= 2:
                 widget.destroy()
         comp_widgets.clear()
-        _next_row[0] = 1
+        _next_row[0] = 2
 
         total = 0
-        for name, count in counts.items():
-            if count > 0:
-                _build_comp_row(name, count)
-                total += count
+        for name in sorted(comp_counts.keys()):
+            _build_comp_row(name, comp_counts[name])
+            total += comp_counts[name]
         load_geo_status.set(f"  {len(comp_widgets)} component(s), {total} file(s)")
         log_fn(f"Load Geometry done: {len(comp_widgets)} component(s), {total} file(s).")
 

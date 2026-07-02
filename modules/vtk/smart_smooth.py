@@ -94,6 +94,96 @@ def _k_ring_cells(
     return visited
 
 
+def apply_min_power_sliver_filter(
+        polydata: vtk.vtkPolyData,
+        geo_cache: dict,
+        min_power_W: float,
+) -> int:
+    """Replace tiny sliver-cell densities before any smoothing runs.
+
+    Cells with Deposited_Power_W in (0, min_power_W) are treated as mesh
+    artifacts. Their Power_Density_W_m2 is replaced with the area-weighted
+    mean of neighbouring non-sliver cells, and Deposited_Power_W is
+    recalculated from the corrected density and the cell area.
+
+    Returns the number of corrected cells.
+    """
+    if min_power_W <= 0.0:
+        return 0
+    if geo_cache is None:
+        print("  [AUTO] Min-power sliver filter: no geo_cache available — skipping.")
+        return 0
+
+    cd = polydata.GetCellData()
+    dep_vtk = cd.GetArray(POWER_ARRAY)
+    den_vtk = cd.GetArray(ARRAY_NAME)
+    if dep_vtk is None or den_vtk is None:
+        print(f"  [AUTO] Min-power sliver filter: '{POWER_ARRAY}' or '{ARRAY_NAME}' not found — skipping.")
+        return 0
+
+    conn = geo_cache.get("conn")
+    offs = geo_cache.get("offs")
+    pt_cell_offsets = geo_cache.get("pt_cell_offsets")
+    sorted_cell_ids = geo_cache.get("sorted_cell_ids")
+    cell_areas = geo_cache.get("cell_areas")
+    if conn is None or offs is None or pt_cell_offsets is None or sorted_cell_ids is None:
+        print("  [AUTO] Min-power sliver filter: incomplete geo_cache — skipping.")
+        return 0
+
+    dep_vals = vtk_to_numpy(dep_vtk).astype(np.float64, copy=True)
+    den_vals = vtk_to_numpy(den_vtk).astype(np.float64, copy=True)
+    num_cells = len(den_vals)
+    sliver_ids = np.where((dep_vals > 0.0) & (dep_vals < min_power_W))[0].astype(np.int64)
+    if len(sliver_ids) == 0:
+        return 0
+
+    n_pts_cache = len(pt_cell_offsets) - 1
+    area_vals = (np.asarray(cell_areas, dtype=np.float64)
+                 if cell_areas is not None and len(cell_areas) == num_cells
+                 else None)
+
+    print(f"  [AUTO] Min-power sliver filter: {len(sliver_ids):,} cell(s) "
+          f"with Deposited_Power_W < {min_power_W}W.")
+
+    corrected = 0
+    for cid in sliver_ids.tolist():
+        ss, se = int(offs[cid]), int(offs[cid + 1])
+        nbr_ids: set[int] = set()
+        for pid in conn[ss:se].tolist():
+            if pid < n_pts_cache:
+                ps, pe = int(pt_cell_offsets[pid]), int(pt_cell_offsets[pid + 1])
+                for nc in sorted_cell_ids[ps:pe].tolist():
+                    if nc != cid and dep_vals[nc] >= min_power_W:
+                        nbr_ids.add(int(nc))
+        if not nbr_ids:
+            continue
+        na = np.array(sorted(nbr_ids), dtype=np.int64)
+        if area_vals is not None:
+            w = area_vals[na]
+            ws = float(w.sum())
+            new_den = float(np.dot(w, den_vals[na]) / ws) if ws > 0.0 else float(den_vals[na].mean())
+            den_vals[cid] = new_den
+            dep_vals[cid] = new_den * float(area_vals[cid])
+        else:
+            new_den = float(den_vals[na].mean())
+            den_vals[cid] = new_den
+        corrected += 1
+
+    if corrected > 0:
+        den_new = numpy_to_vtk(den_vals, deep=True, array_type=den_vtk.GetDataType())
+        den_new.SetName(ARRAY_NAME)
+        dep_new = numpy_to_vtk(dep_vals, deep=True, array_type=dep_vtk.GetDataType())
+        dep_new.SetName(POWER_ARRAY)
+        cd.RemoveArray(ARRAY_NAME)
+        cd.AddArray(den_new)
+        cd.RemoveArray(POWER_ARRAY)
+        cd.AddArray(dep_new)
+        cd.SetActiveScalars(ARRAY_NAME)
+
+    print(f"  [AUTO] Min-power sliver filter: {corrected:,} cell(s) corrected.")
+    return corrected
+
+
 # ── Main smart-smooth entry point ─────────────────────────────────────────────
 
 def smart_smooth_auto(

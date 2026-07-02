@@ -205,7 +205,9 @@ def run_processing(
         _geo_cache: dict[str, dict] = {}
         _needs_smooth = [(fp, on, c, s) for fp, on, c, s in all_meta
                          if _snap_map[fp][0] > 0]
-        if _needs_smooth:
+        _needs_sliver = [(fp, on, c, s) for fp, on, c, s in all_meta
+                         if _snap_map[fp][0] == 0 and _snap_map[fp][9] > 0.0]
+        if _needs_smooth or _needs_sliver:
             log("\n  Pre-computing edge geometry per component...")
             seen: set = set()
             for fp, on_c, c_c, s_c in _needs_smooth:
@@ -237,6 +239,29 @@ def run_processing(
                         log(f"    [{comp}] {n_ec:,} direct edge cells cached  "
                             f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
                             f"  [mode=edge]")
+                    _geo_cache[comp] = cache
+
+        # Also build geo-cache for sliver-filter-only files (n_iter=0, min_power_W>0)
+        if _needs_sliver:
+            seen_sv: set = set()
+            for fp, on_c, c_c, s_c in _needs_sliver:
+                comp = next(
+                    (n for n in components if n != "(all)" and n.lower() in fp.stem.lower()),
+                    "(all)",
+                )
+                if comp not in seen_sv and comp not in _geo_cache:
+                    seen_sv.add(comp)
+                    t0g    = time.perf_counter()
+                    pd_tmp = read_vtp(str(fp))
+                    cache  = precompute_smooth_geometry(
+                        pd_tmp,
+                        proximity_radius=_snap_map[fp][6],
+                        log_fn=log,
+                        skip_edge_expansion=True,  # only need conn/offs/cell_areas
+                    )
+                    del pd_tmp
+                    log(f"    [{comp}] sliver-filter geo cached "
+                        f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})")
                     _geo_cache[comp] = cache
 
         def _geo_for(fp: Path) -> dict | None:

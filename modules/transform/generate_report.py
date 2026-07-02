@@ -49,13 +49,15 @@ DEFAULT_REPORT_FILENAME = "summary_report.csv"
 def extract_cells_to_csv(input_path, output_path,
                           export_geom=True, export_area=True,
                           export_power=True, export_pload=True,
-                          mult=1.0, ignore_zeros=False):
+                          mult=1.0, ignore_zeros=False,
+                          export_total_power=True):
     """
     Extract per-cell data from a single .vtp/.vtm file and write to a CSV.
     Uses vtk directly (no pyvista dependency).
 
-    Output columns (all enabled by default):
-      X, Y, Z, Area, Deposited_Power_W, Power_Density_W_m2
+        Output columns (all enabled by default):
+            X, Y, Z, Area, Deposited_Power_W, Power_Density_W_m2,
+            total_deposited_power_W
     where X/Y/Z are cell-centre coordinates.
 
     Parameters
@@ -131,6 +133,10 @@ def extract_cells_to_csv(input_path, output_path,
     cd = mesh.GetCellData()
     dep_arr  = cd.GetArray("Deposited_Power_W")
     dens_arr = cd.GetArray("Power_Density_W_m2")
+    total_power = 0.0
+    if dep_arr:
+        for i in range(n):
+            total_power += float(dep_arr.GetValue(i)) * mult
 
     header = []
     if export_geom:
@@ -141,6 +147,8 @@ def extract_cells_to_csv(input_path, output_path,
         header += ["Deposited_Power_W"]
     if export_pload:
         header += ["Power_Density_W_m2"]
+    if export_total_power:
+        header += ["total_deposited_power_W"]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
@@ -179,6 +187,8 @@ def extract_cells_to_csv(input_path, output_path,
                 row += [f"{dep_scaled:.6e}"]
             if export_pload:
                 row += [f"{dens_scaled:.6e}"]
+            if export_total_power:
+                row += [f"{total_power:.6e}"]
             writer.writerow(row)
 
     return output_path
