@@ -348,20 +348,18 @@ def apply_edge_smooth(
     cell_neighbours: dict = {}
 
     if geo_cache is not None and geo_cache.get("pt_cell_offsets") is not None:
-        # ── Cached path: zero-filter only (proximity already baked in precompute) ──
+        # ── Cached path (proximity already baked in precompute) ──
+        # No zero-value filtering: every topology+proximity edge cell is smoothed
+        # unconditionally, matching the ParaView macro's behaviour (a flagged cell
+        # is smoothed regardless of its current scalar value, including zeros).
         edge_cells_all = geo_cache["edge_cells_arr"]
-
-        # Only per-file operation: exclude cells that are zero in THIS file.
-        # Proximity expansion is already included in edge_cells_all from precompute.
-        active_cells = (edge_cells_all[raw_vals[edge_cells_all] != 0.0]
-                        if len(edge_cells_all) > 0
-                        else np.array([], dtype=np.int64))
+        active_cells   = edge_cells_all
 
         if len(active_cells) == 0:
             return out
 
-        print(f"  Active: {len(active_cells):,}  (zero-filtered from "
-              f"{len(edge_cells_all):,} topology+proximity cells)")
+        print(f"  Active: {len(active_cells):,} topology+proximity cells "
+              f"(no zero-value filter — matches macro behaviour)")
 
         # Build neighbour CSR using cached conn/offs — no GetCellPoints/GetPointCells.
         # Same mesh → same point numbering → cached connectivity is valid for every file.
@@ -484,9 +482,9 @@ def apply_edge_smooth(
     current_vals = np.copy(raw_vals)
     if csr_nbr_ids is not None and len(csr_nbr_ids) > 0:
         csr_counts  = np.diff(csr_offsets).astype(np.float64)
-        has_nbrs    = csr_counts > 0
-        nonzero_val = raw_vals[edge_cell_arr] != 0.0  # skip permanently-zero cells
-        active      = has_nbrs & nonzero_val
+        # No zero-value filter here: every active cell (with >=1 neighbour) is
+        # smoothed unconditionally, matching the ParaView macro's behaviour.
+        active      = csr_counts > 0
         for iteration in range(n_iter):
             if _cancelled():
                 return None

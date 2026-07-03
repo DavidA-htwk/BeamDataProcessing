@@ -483,6 +483,20 @@ def run_transform(
     pattern     = xfm_params["pattern"]
     name_filter = xfm_params["name_filter"]
 
+    preset      = xfm_params.get("preset", "custom")
+    angle_deg   = xfm_params["angle_deg"]
+    dx          = xfm_params["dx"]
+    dy          = xfm_params["dy"]
+    dz          = xfm_params["dz"]
+    in_unit     = xfm_params.get("unit", "m")
+    out_unit    = xfm_params.get("output_unit", in_unit)
+    coord_scale = xfm_params.get("coord_scale", 1.0)
+    mult        = xfm_params.get("mult", 1.0)
+    log(f"Coordinate transform: {preset}  (input unit: {in_unit} -> output unit: {out_unit})")
+    log(f"  Rotation: {angle_deg} deg about Z   "
+        f"Translation: dx={dx} {in_unit}, dy={dy} {in_unit}, dz={dz} {in_unit}")
+    log(f"  Coordinate scale factor: {coord_scale}   Power multiplier: {mult}")
+
     expanded: list[Path] = []
     for d in input_dirs:
         p = Path(d)

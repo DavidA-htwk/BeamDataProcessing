@@ -800,6 +800,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         unit_to_m   = {"m": 1.0, "mm": 0.001}
         coord_scale = unit_to_m[unit] / unit_to_m[output_unit]
         return {
+            "preset":       xfm_preset_var.get(),
             "angle_deg":    angle, "dx": dx, "dy": dy, "dz": dz,
             "unit":         unit,  "output_unit":  output_unit,
             "coord_scale":  coord_scale,
