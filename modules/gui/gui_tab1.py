@@ -154,15 +154,17 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     _comp_canvas.bind("<Leave>",
                       lambda _: _comp_canvas.unbind_all("<MouseWheel>"))
 
-    _HDR = ["Component", "Files", "Iter", "Mode", "Sigma",
+    _HDR = ["Component", "Files", "1. Iter", "1. Mode", "2. Iter", "2. Mode", "Sigma",
             "Prox (edge)", "Snap factor", "Min pwr (W)", "Pwr density", "Total pwr", "Save post-smooth VTP"]
     _HDR_TIPS = [
         "Component name (matched against VTP filename).",
         "Number of VTP files found for this component.",
-        "Smoothing iterations (0 = no smoothing, only min-power sliver filter).",
-        "Smoothing mode:\n  auto — local z-score spike detection + edge classification.\n  edge — smooth all cells that touch a feature/boundary edge.",
-        "Sigma threshold (auto mode only).\nA cell is flagged if its value exceeds:\n  local_mean + sigma × local_std\nHigher = less aggressive (fewer cells flagged).\nDefault: 2.0",
-        "Proximity radius in mesh units (edge mode only).\nCells within this distance of a feature-edge point are also flagged.\nSet to 0 to disable proximity expansion.",
+        "Stage 1 smoothing iterations (0 = no smoothing, only min-power sliver filter).\nApplied first.",
+        "Stage 1 smoothing mode:\n  auto — local z-score spike detection + edge classification.\n  edge — smooth all cells that touch a feature/boundary edge.",
+        "Stage 2 smoothing iterations (0 = disabled).\nApplied after stage 1, on stage 1's output — lets you combine e.g. auto then edge smoothing in one run.",
+        "Stage 2 smoothing mode:\n  auto — local z-score spike detection + edge classification.\n  edge — smooth all cells that touch a feature/boundary edge.",
+        "Sigma threshold (auto mode only).\nA cell is flagged if its value exceeds:\n  local_mean + sigma × local_std\nHigher = less aggressive (fewer cells flagged).\nDefault: 2.0\nUsed by whichever stage(s) are set to auto.",
+        "Proximity radius in mesh units (edge mode only).\nCells within this distance of a feature-edge point are also flagged.\nSet to 0 to disable proximity expansion.\nUsed by whichever stage(s) are set to edge.",
         "Snapshot factor — multiplies power density values in rendered PNG snapshots only.\nNever applied to the VTP data itself.",
         "Min deposited power filter (W).\nCells with Deposited_Power_W below this threshold are treated as mesh artifacts (sliver cells with near-zero area).\nTheir power density is replaced with the area-weighted neighbour mean.\nRuns before all other smoothing. Set to 0 to disable.\nRecommended: 1.0",
         "Save a power-density snapshot PNG.",
@@ -182,6 +184,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     # Set these vars then click Apply ↓ to push all values to every component row.
     _bulk_iter_var   = tk.IntVar(value=1)
     _bulk_mode_var   = tk.StringVar(value="auto")
+    _bulk_iter2_var  = tk.IntVar(value=0)
+    _bulk_mode2_var  = tk.StringVar(value="edge")
     _bulk_sigma_var  = tk.StringVar(value=str(SPIKE_SIGMA))
     _bulk_prox_var   = tk.StringVar(value=str(SMOOTH_PROXIMITY_RADIUS))
     _bulk_mult_var   = tk.StringVar(value="1.0")
@@ -194,6 +198,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         for _w in comp_widgets.values():
             _w["smooth_var"].set(_bulk_iter_var.get())
             _w["smooth_mode_var"].set(_bulk_mode_var.get())
+            _w["smooth_var2"].set(_bulk_iter2_var.get())
+            _w["smooth_mode_var2"].set(_bulk_mode2_var.get())
             _w["spike_sigma_var"].set(_bulk_sigma_var.get())
             _w["prox_var"].set(_bulk_prox_var.get())
             _w["mult_var"].set(_bulk_mult_var.get())
@@ -212,20 +218,25 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     _bk_mode = tk.OptionMenu(comp_grid, _bulk_mode_var, "edge", "auto")
     _bk_mode.config(width=5)
     _bk_mode.grid(row=_BR, column=3, sticky="w", padx=(0, 2))
+    tk.Spinbox(comp_grid, from_=0, to=20, width=4,
+               textvariable=_bulk_iter2_var).grid(row=_BR, column=4, sticky="w", padx=(0, 4))
+    _bk_mode2 = tk.OptionMenu(comp_grid, _bulk_mode2_var, "edge", "auto")
+    _bk_mode2.config(width=5)
+    _bk_mode2.grid(row=_BR, column=5, sticky="w", padx=(0, 2))
     tk.Entry(comp_grid, textvariable=_bulk_sigma_var,  width=5).grid(
-        row=_BR, column=4, sticky="w", padx=(0, 4))
-    tk.Entry(comp_grid, textvariable=_bulk_prox_var,   width=6).grid(
-        row=_BR, column=5, sticky="w", padx=(0, 4))
-    tk.Entry(comp_grid, textvariable=_bulk_mult_var,   width=6).grid(
         row=_BR, column=6, sticky="w", padx=(0, 4))
-    tk.Entry(comp_grid, textvariable=_bulk_minpwr_var, width=7).grid(
+    tk.Entry(comp_grid, textvariable=_bulk_prox_var,   width=6).grid(
         row=_BR, column=7, sticky="w", padx=(0, 4))
-    tk.Checkbutton(comp_grid, variable=_bulk_pd_var).grid(  row=_BR, column=8,  sticky="w")
-    tk.Checkbutton(comp_grid, variable=_bulk_tp_var).grid(  row=_BR, column=9,  sticky="w")
-    tk.Checkbutton(comp_grid, variable=_bulk_svtp_var).grid(row=_BR, column=10, sticky="w")
+    tk.Entry(comp_grid, textvariable=_bulk_mult_var,   width=6).grid(
+        row=_BR, column=8, sticky="w", padx=(0, 4))
+    tk.Entry(comp_grid, textvariable=_bulk_minpwr_var, width=7).grid(
+        row=_BR, column=9, sticky="w", padx=(0, 4))
+    tk.Checkbutton(comp_grid, variable=_bulk_pd_var).grid(  row=_BR, column=10, sticky="w")
+    tk.Checkbutton(comp_grid, variable=_bulk_tp_var).grid(  row=_BR, column=11, sticky="w")
+    tk.Checkbutton(comp_grid, variable=_bulk_svtp_var).grid(row=_BR, column=12, sticky="w")
     tk.Button(comp_grid, text="Apply ↓", fg="#005f73", font=("Segoe UI", 8),
               command=_apply_bulk_to_all, padx=4).grid(
-        row=_BR, column=11, sticky="w", padx=(8, 0))
+        row=_BR, column=13, sticky="w", padx=(8, 0))
 
     # ── Placeholder (row 2, removed once Load Geometry populates) ────────────
     _placeholder_lbl = tk.Label(comp_grid,
@@ -245,6 +256,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         saved            = pending_comp_cfg.get(name, {})
         smooth_var       = tk.IntVar(value=int(saved.get("smooth_iterations", 1)))
         smooth_mode_var  = tk.StringVar(value=str(saved.get("smooth_mode", "auto")))
+        smooth_var2      = tk.IntVar(value=int(saved.get("smooth_iterations_2", 0)))
+        smooth_mode_var2 = tk.StringVar(value=str(saved.get("smooth_mode_2", "edge")))
         spike_sigma_var  = tk.StringVar(value=str(saved.get("spike_sigma", SPIKE_SIGMA)))
         prox_var         = tk.StringVar(value=str(saved.get(
             "proximity_radius", settings.get("proximity_radius", SMOOTH_PROXIMITY_RADIUS))))
@@ -266,54 +279,63 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
         mode_menu = tk.OptionMenu(comp_grid, smooth_mode_var, "edge", "auto")
         mode_menu.config(width=5)
         mode_menu.grid(row=r, column=3, sticky="w", padx=(0, 2))
+        tk.Spinbox(comp_grid, from_=0, to=20, width=4,
+                   textvariable=smooth_var2).grid(row=r, column=4, sticky="w", padx=(0, 4))
+        mode_menu2 = tk.OptionMenu(comp_grid, smooth_mode_var2, "edge", "auto")
+        mode_menu2.config(width=5)
+        mode_menu2.grid(row=r, column=5, sticky="w", padx=(0, 2))
         sigma_entry = tk.Entry(comp_grid, textvariable=spike_sigma_var, width=5)
-        sigma_entry.grid(row=r, column=4, sticky="w", padx=(0, 4))
+        sigma_entry.grid(row=r, column=6, sticky="w", padx=(0, 4))
         prox_entry_row = tk.Entry(comp_grid, textvariable=prox_var, width=6)
-        prox_entry_row.grid(row=r, column=5, sticky="w", padx=(0, 4))
+        prox_entry_row.grid(row=r, column=7, sticky="w", padx=(0, 4))
         tk.Entry(comp_grid, textvariable=mult_var, width=6).grid(
-            row=r, column=6, sticky="w", padx=(0, 4))
+            row=r, column=8, sticky="w", padx=(0, 4))
         min_pwr_entry = tk.Entry(comp_grid, textvariable=min_pwr_var, width=7)
-        min_pwr_entry.grid(row=r, column=7, sticky="w", padx=(0, 4))
+        min_pwr_entry.grid(row=r, column=9, sticky="w", padx=(0, 4))
         tk.Checkbutton(comp_grid, text="Pwr density",
-                       variable=snap_pd_var).grid(row=r, column=8, sticky="w")
+                       variable=snap_pd_var).grid(row=r, column=10, sticky="w")
         tk.Checkbutton(comp_grid, text="Total pwr",
-                       variable=snap_tp_var).grid(row=r, column=9, sticky="w")
+                       variable=snap_tp_var).grid(row=r, column=11, sticky="w")
         save_vtp_var = tk.BooleanVar(value=bool(saved.get("save_smooth_vtp", False)))
         save_vtp_chk = tk.Checkbutton(comp_grid, text="Save post-smooth VTP",
                                       variable=save_vtp_var)
-        save_vtp_chk.grid(row=r, column=10, sticky="w")
+        save_vtp_chk.grid(row=r, column=12, sticky="w")
 
         def _update_mode_state(*_,
-                               _menu=mode_menu, _sig=sigma_entry,
+                               _menu=mode_menu, _menu2=mode_menu2,
+                               _sig=sigma_entry,
                                _prx=prox_entry_row,
                                _svp=save_vtp_chk,
                                _mpw=min_pwr_entry,
-                               _sv=smooth_var, _mv=smooth_mode_var):
-            n_iter = 0
-            try:
-                n_iter = int(_sv.get())
-            except Exception:
-                pass
-            if n_iter == 0:
-                _menu.configure(state="disabled")
-                _sig.configure(state="disabled")
-                _prx.configure(state="disabled")
-                _svp.configure(state="disabled")
-                _mpw.configure(state="normal")
-            else:
-                mode = _mv.get()
-                _menu.configure(state="normal")
-                _sig.configure(state="normal" if mode == "auto" else "disabled")
-                _prx.configure(state="normal" if mode == "edge" else "disabled")
-                _svp.configure(state="normal")
-                _mpw.configure(state="normal")
+                               _sv=smooth_var, _mv=smooth_mode_var,
+                               _sv2=smooth_var2, _mv2=smooth_mode_var2):
+            def _as_int(var) -> int:
+                try:
+                    return int(var.get())
+                except Exception:
+                    return 0
+
+            n_iter  = _as_int(_sv)
+            n_iter2 = _as_int(_sv2)
+            _menu.configure(state="normal" if n_iter > 0 else "disabled")
+            _menu2.configure(state="normal" if n_iter2 > 0 else "disabled")
+
+            uses_auto = (n_iter > 0 and _mv.get() == "auto") or (n_iter2 > 0 and _mv2.get() == "auto")
+            uses_edge = (n_iter > 0 and _mv.get() == "edge") or (n_iter2 > 0 and _mv2.get() == "edge")
+            _sig.configure(state="normal" if uses_auto else "disabled")
+            _prx.configure(state="normal" if uses_edge else "disabled")
+            _svp.configure(state="normal" if (n_iter > 0 or n_iter2 > 0) else "disabled")
+            _mpw.configure(state="normal")
 
         _update_mode_state()
         smooth_var.trace_add("write", _update_mode_state)
         smooth_mode_var.trace_add("write", _update_mode_state)
+        smooth_var2.trace_add("write", _update_mode_state)
+        smooth_mode_var2.trace_add("write", _update_mode_state)
 
         comp_widgets[name] = {
             "smooth_var":        smooth_var,        "smooth_mode_var":  smooth_mode_var,
+            "smooth_var2":       smooth_var2,        "smooth_mode_var2": smooth_mode_var2,
             "spike_sigma_var":   spike_sigma_var,   "prox_var":         prox_var,
             "mult_var":          mult_var,
             "snap_pd_var":       snap_pd_var,        "snap_tp_var":      snap_tp_var,
@@ -326,6 +348,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
             pending_comp_cfg[name] = {
                 "smooth_iterations":  w["smooth_var"].get(),
                 "smooth_mode":        w["smooth_mode_var"].get(),
+                "smooth_iterations_2": w["smooth_var2"].get(),
+                "smooth_mode_2":      w["smooth_mode_var2"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),
@@ -415,6 +439,8 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
             name: {
                 "smooth_iterations":  w["smooth_var"].get(),
                 "smooth_mode":        w["smooth_mode_var"].get(),
+                "smooth_iterations_2": w["smooth_var2"].get(),
+                "smooth_mode_2":      w["smooth_mode_var2"].get(),
                 "spike_sigma":        _safe_float(w["spike_sigma_var"].get(), SPIKE_SIGMA),
                 "proximity_radius":   _safe_float(w["prox_var"].get(), SMOOTH_PROXIMITY_RADIUS),
                 "mult_factor":        _safe_float(w["mult_var"].get(), 1.0),

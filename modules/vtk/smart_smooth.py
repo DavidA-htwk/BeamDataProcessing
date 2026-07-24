@@ -31,67 +31,9 @@ from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 from modules.core.settings import (
     ARRAY_NAME, POWER_ARRAY, FEATURE_ANGLE, SPIKE_SIGMA, MIN_NEIGHBORS, SMOOTH_K_RING,
     SPIKE_RATIO, EDGE_TOP_PERCENTILE, MIN_POWER_W,
+    TRUE_MAX_GUARD_K_RING, TRUE_MAX_GUARD_RATIO, TRUE_MAX_GUARD_MIN_SUPPORT,
 )
-from modules.vtk.smoothing import _build_active_csr
-
-
-# ── k-ring BFS (topology, uses cached CSR) ────────────────────────────────────
-
-def _k_ring_cells(
-        seed_id: int,
-        k: int,
-        conn: np.ndarray,
-        offs: np.ndarray,
-        pt_cell_offsets: np.ndarray,
-        sorted_cell_ids: np.ndarray,
-) -> np.ndarray:
-    """Return sorted unique cell IDs within k topological hops of seed_id.
-
-    Uses the same vectorised BFS as precompute_smooth_geometry Step 5
-    but operates on a single seed rather than an initial frontier set.
-    Returns an array that always includes seed_id itself.
-    """
-    visited = np.array([seed_id], dtype=np.int64)
-    ring    = visited
-
-    for _ in range(k):
-        # Points of all cells in the current frontier ring
-        r_starts  = offs[ring]
-        r_ends    = offs[ring + 1]
-        r_sizes   = (r_ends - r_starts).astype(np.int64)
-        total_r   = int(r_sizes.sum())
-        if total_r == 0:
-            break
-        cum_r     = np.empty(len(ring) + 1, dtype=np.int64)
-        cum_r[0]  = 0
-        np.cumsum(r_sizes, out=cum_r[1:])
-        local_r   = (np.arange(total_r, dtype=np.int64)
-                     - np.repeat(cum_r[:-1], r_sizes))
-        pts_flat  = np.unique(conn[np.repeat(r_starts, r_sizes) + local_r])
-
-        # Cells sharing those points
-        p_starts  = pt_cell_offsets[pts_flat]
-        p_ends    = pt_cell_offsets[pts_flat + 1]
-        p_sizes   = (p_ends - p_starts).astype(np.int64)
-        total_p   = int(p_sizes.sum())
-        if total_p == 0:
-            break
-        cum_p     = np.empty(len(pts_flat) + 1, dtype=np.int64)
-        cum_p[0]  = 0
-        np.cumsum(p_sizes, out=cum_p[1:])
-        local_p   = (np.arange(total_p, dtype=np.int64)
-                     - np.repeat(cum_p[:-1], p_sizes))
-        all_nbrs  = sorted_cell_ids[
-            np.repeat(p_starts, p_sizes) + local_p
-        ].astype(np.int64)
-
-        new_ids = np.setdiff1d(np.unique(all_nbrs), visited, assume_unique=False)
-        if len(new_ids) == 0:
-            break
-        visited = np.union1d(visited, new_ids)
-        ring    = new_ids
-
-    return visited
+from modules.vtk.smoothing import _build_active_csr, _k_ring_cells, true_max_area_guard
 
 
 def apply_min_power_sliver_filter(
@@ -545,6 +487,34 @@ def smart_smooth_auto(
                       f"candidate(s) above {EDGE_TOP_PERCENTILE:.4g}th percentile "
                       f"(val >= {_g_thresh:.3e}, isolation ratio {_ATER_ISOLATION_RATIO}).")
 
+    # ── True max area guard ──────────────────────────────────────────────────
+    # Phase A's sigma test and A-ter's isolation check only look at the
+    # immediate 1-ring of point-connected neighbours. Phase A-bis (edge-direct)
+    # applies NO neighbour check at all — any edge-adjacent cell above the
+    # global percentile is flagged, regardless of what surrounds it. This can
+    # wrongly catch a genuine, physically real hot-spot that happens to sit
+    # near a feature/boundary edge and is surrounded by other comparably high
+    # values (a real "max area"), not a lone sliver/mesh artifact.
+    # Re-check every candidate (from all three detection phases above) against
+    # a WIDER neighbourhood (more topological hops) and drop it if enough
+    # cells in that bigger area already carry a comparably high value.
+    if candidates:
+        _cand_arr = np.array(sorted(set(candidates)), dtype=np.int64)
+        _protect  = true_max_area_guard(
+            _cand_arr, raw_vals, conn, offs, pt_cell_offsets, sorted_cell_ids,
+            k_ring=TRUE_MAX_GUARD_K_RING, ratio=TRUE_MAX_GUARD_RATIO,
+            min_support=TRUE_MAX_GUARD_MIN_SUPPORT,
+        )
+        n_protected = int(_protect.sum())
+        if n_protected > 0:
+            _protected_ids = set(_cand_arr[_protect].tolist())
+            candidates = [c for c in candidates if c not in _protected_ids]
+            edge_direct_set -= _protected_ids
+            print(f"  [AUTO] True-max guard: protecting {n_protected:,} "
+                  f"candidate(s) inside a genuine high-value area "
+                  f"(k_ring={TRUE_MAX_GUARD_K_RING}, ratio={TRUE_MAX_GUARD_RATIO}, "
+                  f"min_support={TRUE_MAX_GUARD_MIN_SUPPORT}).")
+
     if not candidates:
         print("  [AUTO] No candidates found — output unchanged.")
         return out
@@ -675,6 +645,24 @@ def smart_smooth_auto(
         if n_dilated > 0:
             print(f"  [AUTO] Edge dilation: +{n_dilated:,} cells "
                   f"({dilation_rings} ring(s)).")
+            # True-max guard: dilation blindly pulls in topological neighbours
+            # of an edge candidate regardless of their own value. If one of
+            # those newly-added cells is itself part of a genuine high-value
+            # area (not the original candidate, just swept in by BFS growth),
+            # withhold it from smoothing rather than dragging a real result
+            # toward its (possibly lower) neighbours.
+            _new_dilated = np.setdiff1d(visited_arr, edge_set, assume_unique=False)
+            if len(_new_dilated) > 0:
+                _protect_d = true_max_area_guard(
+                    _new_dilated, raw_vals, conn, offs, pt_cell_offsets, sorted_cell_ids,
+                    k_ring=TRUE_MAX_GUARD_K_RING, ratio=TRUE_MAX_GUARD_RATIO,
+                    min_support=TRUE_MAX_GUARD_MIN_SUPPORT,
+                )
+                _blocked = _new_dilated[_protect_d]
+                if len(_blocked) > 0:
+                    visited_arr = np.setdiff1d(visited_arr, _blocked, assume_unique=False)
+                    print(f"  [AUTO] True-max guard: withheld {len(_blocked):,} "
+                          f"dilated cell(s) inside a genuine high-value area.")
         edge_candidates_final = visited_arr
     else:
         edge_candidates_final = (

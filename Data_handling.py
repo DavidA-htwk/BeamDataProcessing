@@ -282,6 +282,10 @@ def run_gui() -> None:
                 _w["smooth_var"].set(int(_cc.get("smooth_iterations", 1)))
             except Exception:
                 pass
+            try:
+                _w["smooth_var2"].set(int(_cc.get("smooth_iterations_2", 0)))
+            except Exception:
+                pass
             _w["mult_var"].set(str(_cc.get("mult_factor", 1.0)))
         apply_xfm_cfg(loaded.get("transform", {}))
         apply_pp_cfg(loaded.get("post_processing", {}))

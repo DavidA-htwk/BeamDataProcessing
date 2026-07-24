@@ -98,7 +98,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
          spike_ratio,
          needs_snap, snap_dir_str, pid,
          save_smooth_vtp, smooth_out_str,
-         mult_factor_save, min_power_W) = args
+         mult_factor_save, min_power_W,
+         n_iter_2, smooth_mode_2) = args
 
         if stop_event is not None and stop_event.is_set():
             return None
@@ -135,21 +136,44 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
         max_pwr_orig:      float | None = None
         max_pwr_smooth:    float | None = None
 
-        if n_iter > 0:
-            if smooth_mode == "auto":
-                smoothed = smart_smooth_auto(
-                    polydata, n_iter=n_iter, stop_event=stop_event,
-                    geo_cache=geo_cache, spike_sigma=spike_sigma,
-                    spike_ratio=spike_ratio,
-                    proximity_radius=proximity_radius,
-                    smooth_spikes=True,
-                    min_power_W=0.0,
-                )
-            else:
-                smoothed = apply_edge_smooth(
-                    polydata, n_iter=n_iter,
+        # Ordered list of active smoothing stages: stage 1 runs first, and its
+        # output feeds stage 2 (e.g. 1=auto then 2=edge in a single pass).
+        # Stage 2 is skipped entirely when n_iter_2 == 0 (default / single-stage).
+        _stages = [(smooth_mode, n_iter), (smooth_mode_2, n_iter_2)]
+        _stages = [(_m, _n) for _m, _n in _stages if _n > 0]
+
+        if _stages:
+            def _run_stage(src_pd, s_mode: str, s_iter: int):
+                if s_mode == "auto":
+                    return smart_smooth_auto(
+                        src_pd, n_iter=s_iter, stop_event=stop_event,
+                        geo_cache=geo_cache, spike_sigma=spike_sigma,
+                        spike_ratio=spike_ratio,
+                        proximity_radius=proximity_radius,
+                        smooth_spikes=True,
+                        min_power_W=0.0,
+                    )
+                return apply_edge_smooth(
+                    src_pd, n_iter=s_iter,
                     stop_event=stop_event, geo_cache=geo_cache,
                 )
+
+            current = polydata
+            smoothed = None
+            for _s_mode, _s_iter in _stages:
+                if stop_event is not None and stop_event.is_set():
+                    if current is not polydata:
+                        del current
+                    del polydata
+                    return None
+                _next = _run_stage(current, _s_mode, _s_iter)
+                if current is not polydata:
+                    del current   # free the previous stage's intermediate result
+                if _next is None:
+                    del polydata
+                    return None
+                current = _next
+            smoothed = current
 
             # Precompute camera from original while still in memory.
             # Camera placement uses vtkCellLocator (expensive on large meshes);

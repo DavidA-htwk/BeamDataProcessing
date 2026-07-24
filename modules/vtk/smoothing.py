@@ -14,7 +14,10 @@ import vtk
 import numpy as np
 from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 
-from modules.core.settings import ARRAY_NAME, FEATURE_ANGLE, SMOOTH_PROXIMITY_RADIUS
+from modules.core.settings import (
+    ARRAY_NAME, FEATURE_ANGLE, SMOOTH_PROXIMITY_RADIUS,
+    TRUE_MAX_GUARD_K_RING, TRUE_MAX_GUARD_RATIO, TRUE_MAX_GUARD_MIN_SUPPORT,
+)
 
 
 # ── Geometry pre-computation ──────────────────────────────────────────────────
@@ -32,10 +35,13 @@ def precompute_smooth_geometry(
     component, then pass the result via geo_cache= to skip Steps 1-4 for all
     subsequent files.
 
-    skip_edge_expansion: when True (AUTO mode), Steps 3 and 5 are skipped.
-        Step 3 (flag 6M edge cells) and Step 5 (BFS-expand those cells) are
-        only needed by "edge" mode.  AUTO mode finds its own candidates via
-        local z-score and only needs the CSR connectivity + edge_pt_ids_arr.
+    skip_edge_expansion: when True (AUTO mode), Step 3 is skipped.
+        Step 3 (flag cells touching a feature/boundary edge point) is only
+        needed by "edge" mode.  AUTO mode finds its own candidates via local
+        z-score and only needs the CSR connectivity + edge_pt_ids_arr.
+        NOTE: "edge" mode no longer grows outward from those direct edge
+        cells (proximity-based topological expansion was reverted — it was
+        over-smoothing good/undamaged cells).
 
     Returns a dict with keys:
         edge_cell_list, cell_neighbours, n_cells, n_direct,
@@ -192,67 +198,16 @@ def precompute_smooth_geometry(
         del sorted_pts_tmp
         _log("    Step 4/5: done")
 
-        # Step 5 — topological ring expansion (fully vectorised, no Python loops).
-        # Skipped in AUTO mode: smart_smooth_auto does per-candidate k-ring BFS
-        # instead of a single global expansion over all 6M direct edge cells.
-        if not skip_edge_expansion and len(edge_cells_arr) > 0:
-            # Grow the direct edge-cell set outward by n_expand topological layers.
-            # n_expand=2 catches cells that are 1-2 hops from a physical edge cell,
-            # which is equivalent to the original spatial proximity=0.03 for most meshes.
-            n_expand = max(2, round(proximity_radius / 0.03)) if proximity_radius > 0.0 else 2
-            n_expand = min(n_expand, 6)
-            _log(f"    Step 5/5: topological expansion ({n_expand} layer(s), "
-                 f"{n_direct:,} direct cells)...")
-
-            visited_arr = edge_cells_arr   # sorted unique array, grows each layer
-            ring        = edge_cells_arr   # only the NEW cells added last iteration
-
-            for _layer in range(n_expand):
-                # ── Step A: all point IDs of ring cells (vectorised) ─────────────
-                r_starts = offs[ring]
-                r_ends   = offs[ring + 1]
-                r_sizes  = (r_ends - r_starts).astype(np.int64)
-                total_r  = int(r_sizes.sum())
-                if total_r == 0:
-                    break
-                cum_r    = np.empty(len(ring) + 1, dtype=np.int64)
-                cum_r[0] = 0
-                np.cumsum(r_sizes, out=cum_r[1:])
-                local_r  = (np.arange(total_r, dtype=np.int64)
-                            - np.repeat(cum_r[:-1], r_sizes))
-                pts_flat = np.unique(conn[np.repeat(r_starts, r_sizes) + local_r])
-
-                # ── Step B: all cell IDs sharing those points (vectorised) ────────
-                p_starts = pt_cell_offsets[pts_flat]
-                p_ends   = pt_cell_offsets[pts_flat + 1]
-                p_sizes  = (p_ends - p_starts).astype(np.int64)
-                total_p  = int(p_sizes.sum())
-                if total_p == 0:
-                    break
-                cum_p    = np.empty(len(pts_flat) + 1, dtype=np.int64)
-                cum_p[0] = 0
-                np.cumsum(p_sizes, out=cum_p[1:])
-                local_p  = (np.arange(total_p, dtype=np.int64)
-                            - np.repeat(cum_p[:-1], p_sizes))
-                all_nbrs = sorted_cell_ids[
-                    np.repeat(p_starts, p_sizes) + local_p
-                ].astype(np.int64)
-
-                # ── Step C: cells not yet in the ring ─────────────────────────────
-                new_ids = np.setdiff1d(np.unique(all_nbrs), visited_arr,
-                                       assume_unique=False)
-                if len(new_ids) == 0:
-                    break
-                visited_arr = np.union1d(visited_arr, new_ids)
-                ring = new_ids
-                _log(f"    Step 5/5: layer {_layer+1} done — "
-                     f"+{len(new_ids):,} cells ({len(visited_arr):,} total)")
-
-            edge_cells_arr = visited_arr
-            _log(f"    Step 5/5: done — {len(edge_cells_arr):,} cells in smoothing ring "
-                 f"({len(edge_cells_arr) - n_direct:,} added by expansion)")
-        elif skip_edge_expansion:
+        # Step 5 — REVERTED: topological ring expansion used to grow the
+        # direct edge-cell set outward by n_expand layers, but this ended up
+        # smoothing good/undamaged cells too aggressively. "edge" mode now
+        # only smooths cells that directly touch a feature/boundary edge
+        # point (Step 3's edge_cells_arr) — no outward growth.
+        if skip_edge_expansion:
             _log("    Step 5/5: skipped (AUTO mode — per-candidate k-ring used instead)")
+        else:
+            _log(f"    Step 5/5: disabled — smoothing restricted to the "
+                 f"{n_direct:,} direct edge cells (no outward proximity growth)")
 
     return {
         "edge_cells_arr":   edge_cells_arr,
@@ -312,6 +267,117 @@ def _build_active_csr(
     return np.array(offsets_out, dtype=np.int64), np.array(nbrs_out, dtype=np.int64)
 
 
+# ── k-ring BFS (topology, uses cached CSR) ────────────────────────────────────
+
+def _k_ring_cells(
+        seed_id: int,
+        k: int,
+        conn: np.ndarray,
+        offs: np.ndarray,
+        pt_cell_offsets: np.ndarray,
+        sorted_cell_ids: np.ndarray,
+) -> np.ndarray:
+    """Return sorted unique cell IDs within k topological hops of seed_id.
+
+    Vectorised BFS: each hop gathers all points of the current frontier's
+    cells, then all cells sharing those points. Shared by smart_smooth_auto
+    (per-candidate classification patch) and the "true max area" guard below
+    (wider-area support check). Always includes seed_id itself.
+    """
+    visited = np.array([seed_id], dtype=np.int64)
+    ring    = visited
+
+    for _ in range(k):
+        r_starts  = offs[ring]
+        r_ends    = offs[ring + 1]
+        r_sizes   = (r_ends - r_starts).astype(np.int64)
+        total_r   = int(r_sizes.sum())
+        if total_r == 0:
+            break
+        cum_r     = np.empty(len(ring) + 1, dtype=np.int64)
+        cum_r[0]  = 0
+        np.cumsum(r_sizes, out=cum_r[1:])
+        local_r   = (np.arange(total_r, dtype=np.int64)
+                     - np.repeat(cum_r[:-1], r_sizes))
+        pts_flat  = np.unique(conn[np.repeat(r_starts, r_sizes) + local_r])
+
+        p_starts  = pt_cell_offsets[pts_flat]
+        p_ends    = pt_cell_offsets[pts_flat + 1]
+        p_sizes   = (p_ends - p_starts).astype(np.int64)
+        total_p   = int(p_sizes.sum())
+        if total_p == 0:
+            break
+        cum_p     = np.empty(len(pts_flat) + 1, dtype=np.int64)
+        cum_p[0]  = 0
+        np.cumsum(p_sizes, out=cum_p[1:])
+        local_p   = (np.arange(total_p, dtype=np.int64)
+                     - np.repeat(cum_p[:-1], p_sizes))
+        all_nbrs  = sorted_cell_ids[
+            np.repeat(p_starts, p_sizes) + local_p
+        ].astype(np.int64)
+
+        new_ids = np.setdiff1d(np.unique(all_nbrs), visited, assume_unique=False)
+        if len(new_ids) == 0:
+            break
+        visited = np.union1d(visited, new_ids)
+        ring    = new_ids
+
+    return visited
+
+
+# ── "True max area" guard ──────────────────────────────────────────────────
+
+def true_max_area_guard(
+        cell_ids: np.ndarray,
+        raw_vals: np.ndarray,
+        conn: np.ndarray,
+        offs: np.ndarray,
+        pt_cell_offsets: np.ndarray,
+        sorted_cell_ids: np.ndarray,
+        k_ring: int = TRUE_MAX_GUARD_K_RING,
+        ratio: float = TRUE_MAX_GUARD_RATIO,
+        min_support: int = TRUE_MAX_GUARD_MIN_SUPPORT,
+) -> np.ndarray:
+    """Identify candidates that sit inside a genuine wide high-value area.
+
+    Both EDGE mode (every boundary/feature-edge cell is otherwise smoothed
+    unconditionally) and AUTO mode's edge-direct / global-fallback passes can
+    flag a cell for smoothing using only its immediate 1-ring neighbours or a
+    bare percentile threshold — neither distinguishes a real, physically
+    meaningful hot-spot (surrounded by other comparably high values) from an
+    isolated sliver/mesh-artifact spike (surrounded by low/zero values).
+
+    This check looks at a WIDER neighbourhood (``k_ring`` topological hops,
+    intentionally bigger than the 1-ring used elsewhere) around each
+    candidate. If at least ``min_support`` cells in that bigger area already
+    carry a value >= ``ratio`` * the candidate's own value, the candidate is
+    considered part of a genuine high-value area and must be protected from
+    smoothing.
+
+    Returns a boolean mask (same length/order as cell_ids): True = protect
+    (do NOT smooth), False = safe to smooth (isolated outlier).
+    """
+    n = len(cell_ids)
+    protect = np.zeros(n, dtype=bool)
+    if n == 0 or conn is None or offs is None or pt_cell_offsets is None or sorted_cell_ids is None:
+        return protect
+
+    for i, cid in enumerate(cell_ids.tolist()):
+        cval = float(raw_vals[cid])
+        if cval <= 0.0:
+            continue
+        ring = _k_ring_cells(cid, k_ring, conn, offs, pt_cell_offsets, sorted_cell_ids)
+        ring = ring[ring != cid]
+        if len(ring) == 0:
+            continue
+        nbr_vals = raw_vals[ring]
+        n_support = int(np.count_nonzero(nbr_vals >= cval * ratio))
+        if n_support >= min_support:
+            protect[i] = True
+
+    return protect
+
+
 # ── Smoothing ─────────────────────────────────────────────────────────────────
 
 def apply_edge_smooth(
@@ -357,6 +423,27 @@ def apply_edge_smooth(
 
         if len(active_cells) == 0:
             return out
+
+        # Wide-area guard: a cell that touches a feature/boundary edge would
+        # otherwise be smoothed unconditionally, even if it's a genuine,
+        # physically meaningful hot-spot sitting in a real high-value area
+        # (e.g. a beam peak that happens to fall near the component boundary).
+        # Only protect cells that have real support in a WIDER neighbourhood —
+        # isolated slivers/artifacts have no such support and are still smoothed.
+        conn_g = geo_cache.get("conn")
+        if conn_g is not None:
+            protect_mask = true_max_area_guard(
+                active_cells, raw_vals, conn_g, geo_cache["offs"],
+                geo_cache["pt_cell_offsets"],
+                geo_cache["sorted_cell_ids"].astype(np.int64),
+            )
+            n_protected = int(protect_mask.sum())
+            if n_protected:
+                print(f"  True-max guard: protecting {n_protected:,} cell(s) "
+                      f"inside a genuine high-value area from edge smoothing.")
+                active_cells = active_cells[~protect_mask]
+            if len(active_cells) == 0:
+                return out
 
         print(f"  Active: {len(active_cells):,} topology+proximity cells "
               f"(no zero-value filter — matches macro behaviour)")

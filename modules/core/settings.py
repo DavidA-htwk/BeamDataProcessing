@@ -50,6 +50,30 @@ MIN_POWER_W    = 0.0
 # 99.9 → top 0.1 % of non-zero values; for 300 k non-zero cells that is ~300 seeds.
 EDGE_TOP_PERCENTILE = 99.9
 
+# ── "True max area" guard ──────────────────────────────────────────────────
+# Protects genuine, physically-real hot-spots from being smoothed away just
+# because they sit on/near a feature edge or in the global top percentile.
+# A lone sliver/mesh-artifact spike has essentially no support around it
+# (its neighbours quickly drop to low/zero values); a real hot-spot instead
+# sits inside a broader plateau of comparably high values. Both the AUTO
+# candidate pipeline and EDGE mode look at a WIDER neighbourhood (more
+# topological hops than the immediate 1-ring used elsewhere) before
+# accepting a cell for smoothing: if enough cells within that bigger area
+# are already comparably high, the candidate is left untouched.
+# TRUE_MAX_GUARD_K_RING     — topological hop radius of the wider check area
+#                             (bigger than the 1-ring used by the sigma/ratio
+#                             tests, so a real plateau of high cells is seen).
+# TRUE_MAX_GUARD_RATIO      — a neighbour counts as "supporting" the
+#                             candidate's value if it is >= this fraction of
+#                             the candidate's own value.
+# TRUE_MAX_GUARD_MIN_SUPPORT— minimum number of supporting neighbours inside
+#                             the wider area required to treat the candidate
+#                             as part of a genuine high-value area (and thus
+#                             skip smoothing it).
+TRUE_MAX_GUARD_K_RING      = 3
+TRUE_MAX_GUARD_RATIO       = 0.5
+TRUE_MAX_GUARD_MIN_SUPPORT = 4
+
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"
 

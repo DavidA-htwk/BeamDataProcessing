@@ -53,7 +53,13 @@ def run_processing(
     def _file_settings(filepath: Path) -> tuple:
         """Return (n_iter, snap_pwr_density, snap_total_pwr, mult_factor,
                    smooth_mode, spike_sigma, proximity_radius,
-                   spike_ratio, save_smooth_vtp, min_power_W)."""
+                   spike_ratio, save_smooth_vtp, min_power_W,
+                   n_iter_2, smooth_mode_2).
+
+        Stage 1 (n_iter/smooth_mode) is applied first, then stage 2
+        (n_iter_2/smooth_mode_2) is applied to stage 1's output — this lets a
+        component run e.g. AUTO smoothing followed by EDGE smoothing in one
+        pass. Stage 2 is skipped when n_iter_2 == 0 (default)."""
         stem = filepath.stem.lower()
         for comp_name, comp_cfg in components.items():
             if comp_name == "(all)":
@@ -70,6 +76,8 @@ def run_processing(
                     float(comp_cfg.get("spike_ratio", SPIKE_RATIO)),
                     bool(comp_cfg.get("save_smooth_vtp", False)),
                     float(comp_cfg.get("min_power_W", MIN_POWER_W)),
+                    int(comp_cfg.get("smooth_iterations_2", 0)),
+                    str(comp_cfg.get("smooth_mode_2", "edge")),
                 )
         if "(all)" in components:
             c = components["(all)"]
@@ -84,9 +92,12 @@ def run_processing(
                 float(c.get("spike_ratio", SPIKE_RATIO)),
                 bool(c.get("save_smooth_vtp", False)),
                 float(c.get("min_power_W", MIN_POWER_W)),
+                int(c.get("smooth_iterations_2", 0)),
+                str(c.get("smooth_mode_2", "edge")),
             )
         return (int(cfg.get("smooth_iterations", 1)), False, False, 1.0, "auto",
-                SPIKE_SIGMA, proximity_radius, SPIKE_RATIO, False, MIN_POWER_W)
+                SPIKE_SIGMA, proximity_radius, SPIKE_RATIO, False, MIN_POWER_W,
+                0, "edge")
 
     # Expand OUTPUT_* folders
     expanded_dirs: list[Path] = []
@@ -164,6 +175,12 @@ def run_processing(
         _snap_map = {fp: _file_settings(fp) for fp, *_ in all_meta}
 
         # ── Settings summary (once per run) ──────────────────────────────────
+        def _stage_desc(mode: str, ni: int, sigma: float, ratio: float, prox: float) -> str:
+            if mode == "auto":
+                _ratio_str = f"  spike_ratio={ratio}" if ratio > 0.0 else ""
+                return f"mode=auto iter={ni} sigma={sigma}{_ratio_str}"
+            return f"mode=edge iter={ni} proximity={prox}"
+
         log("\n  Smoothing settings per component:")
         _seen_comps: dict[str, tuple] = {}
         for _fp, *_ in all_meta:
@@ -174,25 +191,23 @@ def run_processing(
             if _comp not in _seen_comps:
                 _seen_comps[_comp] = _snap_map[_fp]
         for _comp, _s in _seen_comps.items():
-            (_ni, _spd, _stp, _mf, _sm, _ss, _pr, _sr, _sv, _mp) = _s
+            (_ni, _spd, _stp, _mf, _sm, _ss, _pr, _sr, _sv, _mp, _ni2, _sm2) = _s
             _sv_str   = "ON" if _sv  else "off"
             _snap_str = ("pwr-density" if _spd and not _stp
                          else "total-pwr" if not _spd and _stp
                          else "both" if _spd and _stp else "none")
-            if _ni == 0:
+            if _ni == 0 and _ni2 == 0:
                 log(f"    [{_comp}] iterations=0 (no smoothing)  "
                     f"snap_factor={_mf}  snapshots={_snap_str}  "
                     f"min_pwr={_mp}W")
-            elif _sm == "auto":
-                _ratio_str = f"  spike_ratio={_sr}" if _sr > 0.0 else ""
-                log(f"    [{_comp}] mode=auto  iter={_ni}  "
-                    f"sigma={_ss}{_ratio_str}  "
-                    f"save_post_smooth={_sv_str}  "
-                    f"snap_factor={_mf}  snapshots={_snap_str}  "
-                    f"min_pwr={_mp}W")
             else:
-                log(f"    [{_comp}] mode=edge  iter={_ni}  "
-                    f"proximity={_pr}  "
+                _stages = []
+                if _ni > 0:
+                    _stages.append("1. " + _stage_desc(_sm, _ni, _ss, _sr, _pr))
+                if _ni2 > 0:
+                    _stages.append("2. " + _stage_desc(_sm2, _ni2, _ss, _sr, _pr))
+                _stage_str = "  ->  ".join(_stages)
+                log(f"    [{_comp}] {_stage_str}  "
                     f"save_post_smooth={_sv_str}  "
                     f"snap_factor={_mf}  snapshots={_snap_str}  "
                     f"min_pwr={_mp}W")
@@ -204,9 +219,10 @@ def run_processing(
         # in RAM for the full run; no VTK objects are retained.
         _geo_cache: dict[str, dict] = {}
         _needs_smooth = [(fp, on, c, s) for fp, on, c, s in all_meta
-                         if _snap_map[fp][0] > 0]
+                         if _snap_map[fp][0] > 0 or _snap_map[fp][10] > 0]
         _needs_sliver = [(fp, on, c, s) for fp, on, c, s in all_meta
-                         if _snap_map[fp][0] == 0 and _snap_map[fp][9] > 0.0]
+                         if _snap_map[fp][0] == 0 and _snap_map[fp][10] == 0
+                         and _snap_map[fp][9] > 0.0]
         if _needs_smooth or _needs_sliver:
             log("\n  Pre-computing edge geometry per component...")
             seen: set = set()
@@ -217,28 +233,36 @@ def run_processing(
                 )
                 if comp not in seen:
                     seen.add(comp)
-                    t0g       = time.perf_counter()
-                    comp_mode = _snap_map[fp][4]
-                    comp_prox = _snap_map[fp][6]
+                    t0g        = time.perf_counter()
+                    comp_mode  = _snap_map[fp][4]
+                    comp_prox  = _snap_map[fp][6]
+                    comp_ni2   = _snap_map[fp][10]
+                    comp_mode2 = _snap_map[fp][11]
+                    # Full edge topology (Steps 3+5) is needed if ANY active
+                    # stage uses "edge" mode; AUTO-only components can skip it.
+                    needs_edge_topology = (
+                        comp_mode == "edge" or (comp_ni2 > 0 and comp_mode2 == "edge")
+                    )
                     pd_tmp    = read_vtp(str(fp))           # load for cache only
                     cache     = precompute_smooth_geometry(
                         pd_tmp,
                         proximity_radius=comp_prox,
                         log_fn=log,
-                        skip_edge_expansion=(comp_mode == "auto"),
+                        skip_edge_expansion=not needs_edge_topology,
                     )
                     del pd_tmp                              # free immediately
                     n_ec = cache.get("n_direct", 0) if cache else 0
                     n_ep = len(cache.get("edge_pt_ids_arr", [])) if cache else 0
-                    if comp_mode == "auto":
+                    _mode_lbl = comp_mode + (f"+{comp_mode2}" if comp_ni2 > 0 else "")
+                    if not needs_edge_topology:
                         log(f"    [{comp}] {n_ep:,} edge points cached "
                             f"(cell flagging skipped)  "
                             f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
-                            f"  [mode=auto]")
+                            f"  [mode={_mode_lbl}]")
                     else:
                         log(f"    [{comp}] {n_ec:,} direct edge cells cached  "
                             f"({time.perf_counter()-t0g:.1f}s)  (from {fp.name})"
-                            f"  [mode=edge]")
+                            f"  [mode={_mode_lbl}]")
                     _geo_cache[comp] = cache
 
         # Also build geo-cache for sliver-filter-only files (n_iter=0, min_power_W>0)
@@ -296,6 +320,8 @@ def run_processing(
              str(smooth_dir),             # permanent smooth VTP root
              _snap_map[fp][3],            # mult_factor — baked into saved post-smooth VTP
              _snap_map[fp][9],            # min_power_W — sliver filter threshold
+             _snap_map[fp][10],           # n_iter (stage 2)
+             _snap_map[fp][11],           # smooth_mode (stage 2)
             )
             for fp, on, c, s in all_meta
         ]
@@ -322,6 +348,7 @@ def run_processing(
                     saved_smooth_path, \
                     pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
+                    ni2, mode2 = _snap_map[fp][10], _snap_map[fp][11]
 
                     # Write CSV rows immediately — values are raw (snap_factor is visual only)
                     mbs   = mb
@@ -334,7 +361,7 @@ def run_processing(
                     # treat the path as a URL fragment and open Edge instead.
                     # The CSV lives in out_dir\csv\ so we need "..\\" to reach
                     # out_dir\snapshots\.
-                    is_snap_only_csv = (ni == 0)
+                    is_snap_only_csv = (ni == 0 and ni2 == 0)
                     stem_csv = fp.stem
                     # before-suffix depends on input type:
                     # smoothed_results_*.vtp → __RAW_smoothed
@@ -373,18 +400,21 @@ def run_processing(
                                      _snap_link, _pv_path, _smooth_vtp_path])
                     total_files += 1
 
-                    if ni > 0:
+                    if ni > 0 or ni2 > 0:
+                        _stage_log = f"{ni} iter, mode={mode}"
+                        if ni2 > 0:
+                            _stage_log += f" -> {ni2} iter, mode={mode2}"
                         log(f"  [{done}/{n_all}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  "
                             f"before={mb:.4g}  after={ma:.4g}  "
-                            f"({ni} iter, mode={mode})")
+                            f"({_stage_log})")
                     else:
                         log(f"  [{done}/{n_all}] {fp.name}  "
                             f"(elapsed: {time.perf_counter()-t0:.1f}s)  no smoothing")
 
                     # Queue snapshot args — paths + precomputed camera dicts only
                     if snap_pd or snap_tp:
-                        is_snap_only  = (ni == 0)
+                        is_snap_only  = (ni == 0 and ni2 == 0)
                         stem          = fp.stem
                         case_snap_dir = snap_dir / on / c / s
                         case_snap_dir.mkdir(parents=True, exist_ok=True)
