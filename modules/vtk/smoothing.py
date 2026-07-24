@@ -17,6 +17,8 @@ from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 from modules.core.settings import (
     ARRAY_NAME, FEATURE_ANGLE, SMOOTH_PROXIMITY_RADIUS,
     TRUE_MAX_GUARD_K_RING, TRUE_MAX_GUARD_RATIO, TRUE_MAX_GUARD_MIN_SUPPORT,
+    MAIN_AREA_SUPPORT_K_RING, MAIN_AREA_SUPPORT_RATIO,
+    MAIN_AREA_SUPPORT_MIN_COUNT, MAIN_AREA_MAX_SCAN_CANDIDATES,
 )
 
 
@@ -376,6 +378,112 @@ def true_max_area_guard(
             protect[i] = True
 
     return protect
+
+
+# ── Main high-value area detection ────────────────────────────────────────
+
+def find_main_area_max(
+        polydata: vtk.vtkPolyData,
+        array_name: str = ARRAY_NAME,
+        geo_cache: dict | None = None,
+        k_ring: int = MAIN_AREA_SUPPORT_K_RING,
+        support_ratio: float = MAIN_AREA_SUPPORT_RATIO,
+        min_support: int = MAIN_AREA_SUPPORT_MIN_COUNT,
+        max_candidates: int = MAIN_AREA_MAX_SCAN_CANDIDATES,
+) -> float | None:
+    """Return the peak value that genuinely represents a broad load area.
+
+    The file's plain global max can be a small, spatially tiny stress-
+    concentration spike (e.g. at a fillet/hole) that is even a literal
+    topological SUBSET of / embedded inside the main load area — touching
+    or surrounded by it, not a separate island elsewhere on the mesh. That
+    rules out a single global threshold + connected-components approach:
+    whatever threshold is inclusive enough to capture the real broad area
+    also reconnects it to the embedded spike, merging them into one region
+    whose max is trivially the spike's value again.
+
+    Instead, cells are scanned in descending value order. A candidate is
+    accepted as the representative peak only if a WIDE topological
+    neighbourhood around it (``k_ring`` hops — deliberately much bigger than
+    the 1-ring/local checks used elsewhere in this module) contains at
+    least ``min_support`` other cells whose own value is also
+    >= ``support_ratio`` * the candidate's value. A small embedded spike
+    cluster (a handful to a few dozen cells) cannot manufacture that many
+    comparably-high neighbours across a wide radius, so it is skipped and
+    the next-highest candidate is tried, until one is found that truly has
+    broad support — i.e. sits inside a large, contiguous elevated area
+    rather than being a narrow peak riding on top of it.
+
+    ``max_candidates`` bounds the scan (the answer is normally found within
+    the first few dozen candidates, since spikes are rare/small); if nothing
+    qualifies within the budget the plain global max is returned as a safe
+    fallback.
+
+    Reuses cached topology (conn/offs/pt_cell_offsets/sorted_cell_ids) from
+    ``geo_cache`` when it matches this mesh's cell count; otherwise rebuilds
+    the CSR connectivity directly from ``polydata``.
+
+    Returns None if the array is missing, or the plain max if there's no
+    usable topology / no non-zero cells.
+    """
+    arr = polydata.GetCellData().GetArray(array_name)
+    if arr is None:
+        return None
+    vals = vtk_to_numpy(arr).astype(np.float64)
+    n_cells = len(vals)
+    if n_cells == 0:
+        return None
+    global_max = float(vals.max())
+    if global_max <= 0.0:
+        return global_max
+
+    nonzero_ids = np.nonzero(vals > 0.0)[0]
+    if len(nonzero_ids) == 0:
+        return global_max
+
+    # ── Connectivity: reuse cache if it matches this mesh, else rebuild ──────
+    conn = offs = pt_cell_offsets = sorted_cell_ids = None
+    if geo_cache is not None and geo_cache.get("n_cells") == n_cells:
+        conn            = geo_cache.get("conn")
+        offs            = geo_cache.get("offs")
+        pt_cell_offsets = geo_cache.get("pt_cell_offsets")
+        sorted_cell_ids = geo_cache.get("sorted_cell_ids")
+
+    if conn is None or offs is None or pt_cell_offsets is None or sorted_cell_ids is None:
+        polys = polydata.GetPolys()
+        if polys is None or polys.GetNumberOfCells() == 0:
+            return global_max
+        conn  = vtk_to_numpy(polys.GetConnectivityArray())
+        offs  = vtk_to_numpy(polys.GetOffsetsArray())
+        n_pts = polydata.GetNumberOfPoints()
+        cell_sizes_all  = np.diff(offs).astype(np.int64)
+        cell_of_conn    = np.repeat(np.arange(n_cells, dtype=np.int64), cell_sizes_all)
+        order_by_pt     = np.argsort(conn, kind='stable')
+        sorted_cell_ids = cell_of_conn[order_by_pt]
+        sorted_pts_tmp  = conn[order_by_pt]
+        pt_cell_offsets = np.zeros(n_pts + 1, dtype=np.int64)
+        np.add.at(pt_cell_offsets[1:], sorted_pts_tmp, 1)
+        np.cumsum(pt_cell_offsets, out=pt_cell_offsets)
+
+    sorted_cell_ids = sorted_cell_ids.astype(np.int64)
+
+    # ── Descending scan with a wide-neighbourhood support check ─────────────
+    order  = nonzero_ids[np.argsort(-vals[nonzero_ids])]
+    n_scan = min(len(order), max_candidates)
+    for cid in order[:n_scan].tolist():
+        cval = float(vals[cid])
+        ring = _k_ring_cells(cid, k_ring, conn, offs, pt_cell_offsets, sorted_cell_ids)
+        ring = ring[ring != cid]
+        if len(ring) == 0:
+            continue
+        support = int(np.count_nonzero(vals[ring] >= cval * support_ratio))
+        if support >= min_support:
+            return cval
+
+    # Nothing in the scanned budget had enough wide-area support (unusual) —
+    # fall back to the plain global max rather than an unbounded scan.
+    return global_max
+
 
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────

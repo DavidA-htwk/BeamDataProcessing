@@ -19,7 +19,7 @@ from modules.core.settings import ARRAY_NAME, POWER_ARRAY, MIN_POWER_W
 from modules.vtk.vtk_io import (
     read_vtp, find_max, find_total, _write_vtp, _scale_polydata_array,
 )
-from modules.vtk.smoothing import apply_edge_smooth
+from modules.vtk.smoothing import apply_edge_smooth, find_main_area_max
 from modules.vtk.smart_smooth import smart_smooth_auto, apply_min_power_sliver_filter
 from modules.vtk.snapshot_max import save_max_snapshot, precompute_snapshot
 from modules.transform.generate_report import extract_cells_to_csv
@@ -87,7 +87,8 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
     Returns (filepath, output_name, case, scenario, max_before, max_after,
              total_pwr, total_pwr_after, smooth_vtp_path, saved_smooth_path,
-             pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
+             pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth,
+             main_area_max)
     or an Exception or None if stopped.
     """
     try:
@@ -188,6 +189,11 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
             max_after      = find_max(smoothed, ARRAY_NAME)
             total_pwr_after = find_total(smoothed, POWER_ARRAY)
+            # Always computed (not a UI toggle) — the peak value inside the
+            # largest connected high-value area, so the user can compare it
+            # against the plain global max and spot spikes far from the main
+            # load footprint.
+            main_area_max  = find_main_area_max(smoothed, ARRAY_NAME, geo_cache)
 
             if needs_snap:
                 # BuildLinks() needed so _robust_normal → GetPointCells works
@@ -232,10 +238,12 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
                 max_pwr_smooth = max_pwr_orig
             max_after       = find_max(polydata, ARRAY_NAME)
             total_pwr_after = find_total(polydata, POWER_ARRAY)
+            main_area_max   = find_main_area_max(polydata, ARRAY_NAME, geo_cache)
             del polydata
 
         return (fp, on, c, s, max_before, max_after, total_pwr, total_pwr_after, smooth_vtp_path,
-                saved_smooth_path, pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth)
+                saved_smooth_path, pre_orig_cam, pre_smooth_cam, max_pwr_orig, max_pwr_smooth,
+                main_area_max)
 
     except Exception as exc:
         return exc

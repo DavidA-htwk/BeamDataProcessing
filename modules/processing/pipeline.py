@@ -137,7 +137,8 @@ def run_processing(
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["case", "scenario", "filename",
-                         "max_before", "max_after", "delta", "discrepancy",
+                         "max_before", "max_after", "main_area_max",
+                         "delta", "discrepancy",
                          "total_power_before", "total_power_after",
                          "total_power_delta", "total_power_discrepancy",
                          "snap_factor",
@@ -346,7 +347,7 @@ def run_processing(
 
                     fp, on, c, s, mb, ma, tp, tp_after, smooth_path, \
                     saved_smooth_path, \
-                    pre_orig, pre_smooth, max_pwr_o, max_pwr_s = result
+                    pre_orig, pre_smooth, max_pwr_o, max_pwr_s, main_area_max = result
                     ni, snap_pd, snap_tp, mult, mode, *_ = _snap_map[fp]
                     ni2, mode2 = _snap_map[fp][10], _snap_map[fp][11]
 
@@ -394,6 +395,7 @@ def run_processing(
                         tp_disc_str  = ""
                     writer.writerow([c, s, fp.name,
                                      f"{mbs:.6g}", f"{mas:.6g}",
+                                     f"{main_area_max:.6g}" if main_area_max is not None else "",
                                      f"{delta:.6g}", "YES" if delta > 0.0 else "NO",
                                      tpbs_str, tpas_str, tp_delta_str, tp_disc_str,
                                      f"{mult:.6g}",

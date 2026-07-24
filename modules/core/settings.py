@@ -74,6 +74,38 @@ TRUE_MAX_GUARD_K_RING      = 3
 TRUE_MAX_GUARD_RATIO       = 0.5
 TRUE_MAX_GUARD_MIN_SUPPORT = 4
 
+# ── Main high-value area detection (always computed, reported in CSV) ─────
+# Reports the peak value that is genuinely representative of a broad,
+# physically significant load area — NOT necessarily the file's plain global
+# max, which can be a small stress-concentration spike (e.g. at a fillet/
+# hole) that is even a literal topological SUBSET of / embedded inside the
+# main load area itself. Because it can be embedded inside the main area
+# (touching/surrounded by it, not a separate island elsewhere on the mesh),
+# a single global threshold + connected-components pass cannot separate it:
+# whatever threshold is inclusive enough to capture the real broad area also
+# reconnects it to the embedded spike, merging them into one region whose
+# max is trivially the spike's value again.
+# Instead, cells are scanned in descending value order; each candidate is
+# accepted as "the" representative peak only if a WIDE topological
+# neighbourhood around it (MAIN_AREA_SUPPORT_K_RING hops — deliberately much
+# bigger than the 1-ring/local checks used elsewhere) contains at least
+# MAIN_AREA_SUPPORT_MIN_COUNT other cells whose value is itself >=
+# MAIN_AREA_SUPPORT_RATIO * the candidate's value. A small embedded spike
+# cluster (a handful to a few dozen cells) cannot manufacture that many
+# comparably-high neighbours across a wide radius, so it is skipped in
+# favour of the next-highest candidate, until one is found that truly has
+# broad support — i.e. sits inside a large contiguous elevated area.
+# MAIN_AREA_MAX_SCAN_CANDIDATES bounds the scan (the answer is normally found
+# within the first few dozen candidates since spikes are rare/small); if
+# nothing qualifies within the budget the plain global max is returned.
+# Not exposed in the GUI — always computed and written to the CSV. These are
+# heuristic knobs — tune here per-dataset if a specific mesh still needs a
+# bigger/smaller neighbourhood or a stricter/looser support requirement.
+MAIN_AREA_SUPPORT_K_RING        = 6
+MAIN_AREA_SUPPORT_RATIO         = 0.7
+MAIN_AREA_SUPPORT_MIN_COUNT     = 50
+MAIN_AREA_MAX_SCAN_CANDIDATES   = 2000
+
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"
 
