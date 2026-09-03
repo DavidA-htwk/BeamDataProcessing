@@ -334,3 +334,135 @@ def run_post_processing(
         log("STOPPED by user.")
     else:
         log(f"Post-processing complete. CSV saved to:\n  {csv_path}")
+
+
+def run_component_worst_case_merge(
+        cfg: dict,
+        log,
+        stop_event: threading.Event | None = None,
+) -> None:
+    """Assembly merge: ONE user-picked scenario file per component, appended
+    together (vtkAppendPolyData) into a SINGLE combined VTK file.
+
+    This is intentionally a completely separate code path from
+    run_post_processing() above:
+      - run_post_processing() cell-wise MAX-merges multiple scenario files of
+        the SAME component (one output file per component, per group).
+      - run_component_worst_case_merge() takes exactly one already-chosen file
+        per component (different components, potentially different meshes)
+        and concatenates their geometry/arrays into one assembled mesh. No
+        per-cell maximum is computed here — each component keeps the raw
+        values from its single selected scenario. The same scenario file may
+        be selected for more than one component.
+
+    cfg keys:
+      component_selection: {component_name: file_path}
+      assembly_name:        str, used for output folder/filename
+      output_folder:        str
+      merge_pd / merge_pwr: bool, which cell arrays to keep in the output
+    """
+
+    def stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    selection: dict = cfg.get("component_selection", {}) or {}
+    assembly_name = str(cfg.get("assembly_name", "assembly")).strip() or "assembly"
+    out_root  = cfg.get("output_folder", "")
+    merge_pd  = bool(cfg.get("merge_pd",  True))
+    merge_pwr = bool(cfg.get("merge_pwr", True))
+
+    if not selection:
+        log("No components selected for the assembly merge.")
+        return
+
+    script_dir = Path(__file__).resolve().parent.parent.parent
+    out_dir    = Path(out_root) if out_root else script_dir / "output"
+    pp_dir     = out_dir / "post_processed"
+    csv_dir    = out_dir / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    _ts       = time.strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path  = csv_dir / f"assembly_merge_batch_{_ts}.csv"
+
+    import re as _re
+    _safe_name = _re.sub(r'[\\/:*?"<>|]', "_", assembly_name).strip() or "assembly"
+    out_subdir = pp_dir / "assembly" / _safe_name
+    out_subdir.mkdir(parents=True, exist_ok=True)
+    out_vtp    = out_subdir / f"assembly_{_safe_name}.vtp"
+
+    log(f"Assembly merge: {len(selection)} component(s) \u2192 single VTK")
+    log(f"  Merge arrays: "
+        f"{'Power Density' if merge_pd else ''}"
+        f"{' + ' if merge_pd and merge_pwr else ''}"
+        f"{'Total Power' if merge_pwr else ''}")
+    log("=" * 80)
+
+    t0 = time.perf_counter()
+    append_filter = vtk.vtkAppendPolyData()
+    rows: list[list] = []
+    n_added = 0
+
+    for comp_name, fp_str in sorted(selection.items()):
+        if stopped():
+            break
+        fp = Path(fp_str)
+        if not fp.is_file():
+            log(f"  [SKIP] {comp_name}: file not found \u2014 {fp}")
+            continue
+        try:
+            pd = read_vtp(str(fp))
+        except Exception as exc:
+            log(f"  [ERROR] {comp_name}: {exc}")
+            continue
+
+        cd = pd.GetCellData()
+        arr_pd  = cd.GetArray(ARRAY_NAME)  if merge_pd  else None
+        arr_pwr = cd.GetArray(POWER_ARRAY) if merge_pwr else None
+
+        if merge_pd and arr_pd is None:
+            log(f"  [WARN] {comp_name}: '{ARRAY_NAME}' not found in {fp.name}.")
+        if merge_pwr and arr_pwr is None:
+            log(f"  [WARN] {comp_name}: '{POWER_ARRAY}' not found in {fp.name}.")
+
+        # Drop arrays the user didn't ask to keep so vtkAppendPolyData doesn't
+        # have to reconcile mismatched array sets across components.
+        if not merge_pd and cd.GetArray(ARRAY_NAME) is not None:
+            cd.RemoveArray(ARRAY_NAME)
+        if not merge_pwr and cd.GetArray(POWER_ARRAY) is not None:
+            cd.RemoveArray(POWER_ARRAY)
+
+        max_pd  = float(vtk_to_numpy(arr_pd).max())  if arr_pd  is not None else None
+        max_pwr = float(vtk_to_numpy(arr_pwr).max()) if arr_pwr is not None else None
+
+        append_filter.AddInputData(pd)
+        n_added += 1
+        log(f"  + [{comp_name}]  {fp}")
+        rows.append([comp_name, fp.name, str(fp),
+                     f"{max_pd:.6g}"  if max_pd  is not None else "",
+                     f"{max_pwr:.6g}" if max_pwr is not None else ""])
+
+    if n_added == 0:
+        log("No valid component files found \u2014 nothing to merge.")
+        return
+
+    if stopped():
+        log("STOPPED by user.")
+        return
+
+    append_filter.Update()
+    merged = append_filter.GetOutput()
+    _write_vtp(merged, out_vtp)
+    del merged
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["component", "filename", "source_path",
+                         "max_power_density", "max_total_power"])
+        writer.writerows(rows)
+
+    elapsed = time.perf_counter() - t0
+    log("=" * 80)
+    log(f"Assembly merge complete: {n_added}/{len(selection)} component(s) "
+        f"in {elapsed:.1f}s")
+    log(f"  Output VTP: {out_vtp}")
+    log(f"  CSV saved to: {csv_path}")
+

@@ -42,7 +42,7 @@ from modules.core.settings import (
     load_settings, save_settings, _safe_float, SMOOTH_PROXIMITY_RADIUS,
 )
 from modules.processing.pipeline import run_processing, run_transform
-from modules.processing.post_pipeline import run_post_processing
+from modules.processing.post_pipeline import run_post_processing, run_component_worst_case_merge
 from modules.gui.gui_tab1 import build_processing_tab
 from modules.gui.gui_tab2 import build_transform_tab
 from modules.gui.gui_tab3 import build_post_processing_tab
@@ -115,18 +115,51 @@ def run_gui() -> None:
         # Keep GUI launch robust even if icon loading fails.
         pass
 
+    # -- Tabs (each independently scrollable) / fixed log area below ----------
+    # A tab's content (e.g. Post Processing) can grow taller than the screen.
+    # Rather than one global drag-sash (which could hide buttons below the
+    # fold), each notebook tab gets its OWN simple vertical scrollbar so it can
+    # use whatever height its content needs, while the log area always stays
+    # fully visible at a fixed height. All existing "local" scrollbars/split
+    # panes inside each tab (scenario list, component list, assembly list,
+    # the Cases 3-pane splitter, etc.) are untouched and keep working as before.
+    def _make_scrollable_tab(parent: tk.Widget) -> tuple[tk.Frame, tk.Frame]:
+        """Return (outer, inner). Add *outer* to the notebook; build tab
+        content into *inner* exactly as before — a single scrollbar on the
+        right lets the user slide through content taller than the view."""
+        outer = tk.Frame(parent)
+        canvas = tk.Canvas(outer, highlightthickness=0, width=900, height=520)
+        vscroll = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        def _on_wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _: canvas.bind_all("<MouseWheel>", _on_wheel))
+        canvas.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
+        return outer, inner
+
     notebook = ttk.Notebook(root)
-    notebook.pack(fill="both", expand=False, padx=10, pady=(10, 0))
-    tab1 = tk.Frame(notebook)
-    tab2 = tk.Frame(notebook)
-    notebook.add(tab1, text="Processing")
-    tab3 = tk.Frame(notebook)
-    notebook.add(tab3, text="Post Processing")
-    notebook.add(tab2, text="Coordinate Transform")
+    notebook.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+    tab1_outer, tab1 = _make_scrollable_tab(notebook)
+    tab2_outer, tab2 = _make_scrollable_tab(notebook)
+    tab3_outer, tab3 = _make_scrollable_tab(notebook)
+    notebook.add(tab1_outer, text="Processing")
+    notebook.add(tab3_outer, text="Post Processing")
+    notebook.add(tab2_outer, text="Coordinate Transform")
 
     # -- Log area (created early so log_fn can be passed to tab builders) ------
     log_outer = tk.Frame(root)
-    log_outer.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+    log_outer.pack(side="bottom", fill="x", padx=10, pady=(4, 8))
 
     # Three log panes, each with an inline stop button in the header
     def _make_log_pane(parent: tk.Frame, label: str) -> tk.Text:
@@ -206,6 +239,8 @@ def run_gui() -> None:
     get_pp_cfg             = t3["get_pp_cfg"]
     get_pp_cfg_dict        = t3["get_pp_cfg_dict"]
     apply_pp_cfg           = t3["apply_pp_cfg"]
+    assembly_run_btn       = t3["assembly_run_btn"]
+    get_assembly_cfg       = t3["get_assembly_cfg"]
 
     # Wire Tab 1 directory reader into Tab 2 and Tab 3 Load Cases buttons
     def _get_tab1_dirs_for_t2() -> list[str]:
@@ -337,7 +372,7 @@ def run_gui() -> None:
     stop_btn_pp   = _add_stop_btn(log_box_pp,   _stop_pp)
     stop_btn_xfm  = _add_stop_btn(log_box_xfm,  _stop_xfm)
 
-    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn]
+    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn, assembly_run_btn]
 
     def _set_busy(mode: str = "proc") -> None:
         """mode: 'proc' | 'pp' | 'xfm' — clear the pane and arm stop button."""
@@ -353,6 +388,7 @@ def run_gui() -> None:
         elif mode == "pp":
             _stop_pp.clear()
             tab3_run_btn.configure(state="disabled")
+            assembly_run_btn.configure(state="disabled")
             stop_btn_pp.configure(state="normal", text="■ Stop")
             _log_lines_pp.clear()
             log_box_pp.configure(state="normal")
@@ -378,6 +414,7 @@ def run_gui() -> None:
         _active_pp[0] = max(0, _active_pp[0] - 1)
         if _active_pp[0] == 0:
             tab3_run_btn.configure(state="normal")
+            assembly_run_btn.configure(state="normal")
             stop_btn_pp.configure(state="disabled", text="■ Stop")
         _finish_if_idle()
 
@@ -422,6 +459,15 @@ def run_gui() -> None:
         def worker():
             try:
                 run_post_processing(cfg, log_pp, _stop_pp)
+            finally:
+                root.after(0, _on_pp_done)
+        _active_pp[0] += 1
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_assembly_merge(cfg: dict) -> None:
+        def worker():
+            try:
+                run_component_worst_case_merge(cfg, log_pp, _stop_pp)
             finally:
                 root.after(0, _on_pp_done)
         _active_pp[0] += 1
@@ -502,6 +548,17 @@ def run_gui() -> None:
         _set_busy("pp")
         _launch_post_processing(pp_run_cfg)
 
+    def on_run_assembly_merge():
+        assembly_cfg = get_assembly_cfg()
+        if assembly_cfg is None:
+            return
+        assembly_cfg["output_folder"] = output_folder_var.get()
+        if not _confirm_overwrite():
+            return
+        save_settings(_current_cfg())
+        _set_busy("pp")
+        _launch_assembly_merge(assembly_cfg)
+
     def on_run_transform():
         xfm_params = get_transform_params()
         if xfm_params is None:
@@ -519,7 +576,23 @@ def run_gui() -> None:
 
     tab1_run_btn.configure(command=on_run_processing)
     tab3_run_btn.configure(command=on_run_post_processing)
+    assembly_run_btn.configure(command=on_run_assembly_merge)
     tab2_run_btn.configure(command=on_run_transform)
+
+    # -- Final window sizing ----------------------------------------------------
+    # Cap the window to the screen height (a tab's natural content can exceed
+    # it) — each tab now scrolls internally so this just picks a sensible
+    # starting size; the log area keeps its own fixed height regardless.
+    def _finalize_window_geometry() -> None:
+        root.update_idletasks()
+        screen_h = root.winfo_screenheight()
+        avail_h  = max(500, screen_h - 120)
+        win_h    = min(root.winfo_reqheight(), avail_h)
+        win_w    = root.winfo_reqwidth()
+        root.geometry(f"{win_w}x{win_h}")
+        root.minsize(min(win_w, 700), 400)
+
+    _finalize_window_geometry()
     root.mainloop()
 
 

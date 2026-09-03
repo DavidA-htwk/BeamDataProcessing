@@ -35,7 +35,8 @@ def extract_case_scenario(folder: str) -> tuple[str, str, str]:
     tail of sub before depth logic is applied, so files sitting inside a SMOOTHED
     sub-folder resolve identically to files in the parent scenario folder.
 
-    Falls back to ("snapshots", parts[-2], parts[-1]) if no OUTPUT_* is found.
+    With no OUTPUT_* ancestor the three levels are derived from the tail of the
+    path itself — see _fallback_case_scenario.
     """
     # Folder names that are pure storage artefacts and carry no case/scenario info
     _STORAGE_FOLDERS = {"SMOOTHED", "RAW", "RESULTS", "OUTPUT"}
@@ -72,7 +73,32 @@ def extract_case_scenario(folder: str) -> tuple[str, str, str]:
             case     = sub[-2]
             scenario = sub[-1]
     except StopIteration:
-        output_name = "snapshots"
-        case        = parts[-2] if len(parts) >= 2 else "unknown"
-        scenario    = parts[-1] if len(parts) >= 1 else "unknown"
+        output_name, case, scenario = _fallback_case_scenario(parts)
+    return output_name, case, scenario
+
+
+def _fallback_case_scenario(parts: tuple) -> tuple[str, str, str]:
+    """(output_name, case, scenario) for a path with no OUTPUT_* ancestor.
+
+    This used to return the literal "snapshots" as the output_name, which then
+    leaked into every derived path — a coordinate transform of an assembly
+    merge landed in "transformed/snapshots/assembly/", which reads as a bug
+    because nothing there is a snapshot. The name is now taken from the path.
+    """
+    # Drop drive/root components ("d:\", "\\", "/") so they can never become
+    # a folder name in a derived output path.
+    names = [p for p in parts
+             if p not in ("/", "\\") and ":" not in p and p.strip(" \\/")]
+
+    # The tool's own assembly-merge output: .../post_processed/assembly/<name>.
+    # Group those under "assembly" so a transform of an assembled mesh mirrors
+    # the input layout as transformed/assembly/<name>/.
+    if len(names) >= 2 and names[-2].lower() == "assembly":
+        return "assembly", names[-1], names[-1]
+
+    scenario = names[-1] if names else "unknown"
+    case     = names[-2] if len(names) >= 2 else scenario
+    # One level above case, so the three levels stay distinct instead of
+    # inventing a name that is not on the path at all.
+    output_name = names[-3] if len(names) >= 3 else case
     return output_name, case, scenario

@@ -17,11 +17,12 @@ The tab lets the user:
 
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 from modules.core.path_utils import extract_case_scenario
 
@@ -510,6 +511,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         scenarios_by_output: dict[str, list[str]] = {}
         _all_comp_names.clear()
         comp_set: set[str] = set()
+        _comp_files.clear()   # {comp: {scenario_path: file_path}} — for Assembly Merge panel
         n_files = 0
 
         for d in dirs:
@@ -539,6 +541,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
                         comp = comp[len(pfx):]
                         break
                 comp_set.add(comp)
+                _comp_files.setdefault(comp, {}).setdefault(sp, str(f))
 
         if source == "post_smooth":
             _ff: set[float] = set()
@@ -566,6 +569,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         n_scenarios = sum(len(v) for v in scenarios_by_output.values())
         _update_pp_mult_state()
         _build_scenario_list(scenarios_by_output)
+        _build_assembly_rows()
         if n_scenarios:
             src_label = "post-smoothed" if source == "post_smooth" else "input"
             load_case_status.set(
@@ -679,8 +683,19 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     # Activate first tool by default
     _select_tool(MERGE_GROUPS[0][0])
 
+    # ── Tool-specific settings, organised as sub-tabs ─────────────────────────
+    # Input source, Cases (scenario browser + colour-group assignment) above,
+    # and "Merge arrays" below are shared by both merge tools. Each tool's OWN
+    # settings + its own Run button live in a separate sub-tab so the two
+    # workflows are visually separated instead of being interleaved.
+    pp_tools_nb = ttk.Notebook(tab3)
+    tab_cg  = tk.Frame(pp_tools_nb)   # colour-group (cell-wise max) tool
+    tab_asm = tk.Frame(pp_tools_nb)   # worst-case assembly tool
+    pp_tools_nb.add(tab_cg,  text="Colour-Group Merge  (cell-wise max)")
+    pp_tools_nb.add(tab_asm, text="Worst-Case Assembly Merge")
+
     # ── Multiplication factor ─────────────────────────────────────────────────
-    mult_lframe = tk.LabelFrame(tab3, text="Snapshot factor (visual only)", padx=8, pady=4)
+    mult_lframe = tk.LabelFrame(tab_cg, text="Snapshot factor (visual only)", padx=8, pady=4)
     _mult_frame_row = tk.Frame(mult_lframe)
     _mult_frame_row.pack(fill="x")
     pp_mult_var = tk.StringVar(value=str(pp_s.get("mult_factor_pp", "1.0")))
@@ -715,8 +730,429 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     tk.Label(merge_row, text="  (at least one required)",
              fg="#888888", font=("Segoe UI", 8, "italic")).pack(side="left", padx=(12, 0))
 
+    # ── Worst-Case Assembly Merge (per-component scenario picker) ────────────
+    # This is a SEPARATE tool from the colour-group merge above:
+    #   - Colour-group tool: cell-wise MAX-merges multiple scenario files of the
+    #     SAME component (one output file per component).
+    #   - Assembly tool: picks exactly ONE scenario file per component (the
+    #     user's chosen "worst case" for that component) and appends all of
+    #     them together (vtkAppendPolyData) into a SINGLE combined VTK file.
+    #     The same scenario may be picked for more than one component.
+    # It shares "Merge arrays" (pp_merge_pd_var/pp_merge_pwr_var) above but has
+    # its own data, its own button and does not touch case_group/_saved_case_groups.
+    assembly_lframe = tk.Frame(tab_asm, padx=8, pady=6)
+    tk.Label(
+        assembly_lframe,
+        text="Pick one scenario per component below, then merge all selections "
+             "into a single VTK file. The same scenario may be reused for "
+             "multiple components.",
+        fg="#444444", anchor="w", justify="left", wraplength=760,
+    ).pack(fill="x", pady=(0, 6))
+
+    _comp_files: dict[str, dict[str, str]] = {}       # {comp: {scenario_path: file_path}}
+    _comp_selected_scenario: dict[str, str] = {}      # {comp: scenario_path}
+    _comp_label_maps: dict[str, dict[str, str]] = {}  # {comp: {display_label: scenario_path}}
+    _saved_assembly_selection: dict[str, str] = dict(pp_s.get("assembly_selection", {}))
+
+    # Metric read from the Processing-tab CSV (output/csv_file_comparison/
+    # max_comparison_batch_*.csv) that "Auto-pick worst per component" ranks by.
+    _ASSEMBLY_METRIC_OPTIONS = ["main_area_max", "max_after", "max_before",
+                               "total_power_after", "total_power_before"]
+    assembly_metric_var = tk.StringVar(
+        value=pp_s.get("assembly_metric", "main_area_max"))
+
+    # Which Processing CSV(s) the ranking reads. The sentinel below keeps the
+    # original behaviour (read every CSV, newest wins on duplicate keys); any
+    # other value pins the ranking to that single run's CSV.
+    _ASSEMBLY_CSV_ALL = "(all runs — newest wins)"
+    _ASSEMBLY_CSV_PREFIX = "max_comparison_batch_"
+    # {display_label: Path} for the CSVs currently on disk, rebuilt on demand.
+    _assembly_csv_map: dict[str, Path] = {}
+    assembly_csv_var = tk.StringVar(value=_ASSEMBLY_CSV_ALL)
+    # Filename remembered from settings/config; resolved to a label once the
+    # output folder is known and the folder has been scanned.
+    _saved_assembly_csv: list = [str(pp_s.get("assembly_csv", "") or "")]
+
+    def _scenario_label(sp: str) -> str:
+        try:
+            output_name, case, scenario = extract_case_scenario(sp)
+        except Exception:
+            return Path(sp).name
+        base = f"{output_name} / {case} / {scenario}"
+        leaf = Path(sp).name
+        return base if leaf in (case, scenario) else f"{base}  [{leaf}]"
+
+    def _unique_labels(sps: list) -> dict:
+        """Map each scenario path to a unique display label (dedup collisions)."""
+        labels: dict[str, str] = {}
+        counts: dict[str, int] = {}
+        for sp in sps:
+            lbl = _scenario_label(sp)
+            if lbl in labels:
+                counts[lbl] = counts.get(lbl, 1) + 1
+                lbl = f"{lbl} ({counts[lbl]})"
+            labels[lbl] = sp
+        return labels
+
+    assembly_top = tk.Frame(assembly_lframe)
+    assembly_top.pack(fill="x", pady=(0, 4))
+    tk.Label(assembly_top, text="Assembly name:").pack(side="left")
+    assembly_name_var = tk.StringVar(value=pp_s.get("assembly_name", "assembly"))
+    tk.Entry(assembly_top, textvariable=assembly_name_var, width=24).pack(
+        side="left", padx=(6, 16))
+    tk.Label(assembly_top, text="Rank by:").pack(side="left")
+    assembly_metric_cb = ttk.Combobox(
+        assembly_top, textvariable=assembly_metric_var,
+        values=_ASSEMBLY_METRIC_OPTIONS, state="readonly", width=18)
+    assembly_metric_cb.pack(side="left", padx=(6, 16))
+
+    def _scan_processing_csvs() -> list:
+        """Every Processing-tab CSV on disk (oldest → newest), regardless of
+        the user's pick. Located at {output_folder}/csv_file_comparison/."""
+        get_out = _get_output_folder[0]
+        if get_out is None:
+            return []
+        out_raw = get_out().strip()
+        if not out_raw:
+            return []
+        csv_dir = Path(out_raw) / "csv_file_comparison"
+        if not csv_dir.is_dir():
+            return []
+        # Filenames carry a %Y-%m-%d_%H-%M-%S stamp, so lexical == chronological.
+        return sorted(csv_dir.glob(f"{_ASSEMBLY_CSV_PREFIX}*.csv"))
+
+    def _csv_label(fp: Path) -> str:
+        """Display label for a CSV: just its run timestamp. Kept bijective with
+        the filename so a pick can be persisted and restored reliably."""
+        stem = fp.stem
+        if stem.startswith(_ASSEMBLY_CSV_PREFIX):
+            stem = stem[len(_ASSEMBLY_CSV_PREFIX):]
+        return stem or fp.name
+
+    def _rebuild_csv_map() -> None:
+        """Rescan the CSV folder into {label: Path}, chronological. No UI side
+        effects, so it is safe to call while resolving a pick."""
+        _assembly_csv_map.clear()
+        for fp in _scan_processing_csvs():
+            _assembly_csv_map[_csv_label(fp)] = fp
+
+    def _refresh_csv_choices() -> None:
+        """Rescan the CSV folder and repopulate the picker (newest first).
+
+        Wired to the combobox's *postcommand* so the list is always current when
+        the user opens it — the output folder can change and the Processing tab
+        writes a new CSV on every run."""
+        _rebuild_csv_map()
+        # Newest first: most recent run is the usual pick.
+        labels = list(reversed(list(_assembly_csv_map.keys())))
+        assembly_csv_cb.configure(values=[_ASSEMBLY_CSV_ALL] + labels)
+
+        # Restore a pick remembered from settings/config once it shows up.
+        want = _saved_assembly_csv[0]
+        if want:
+            match = next((lbl for lbl, fp in _assembly_csv_map.items()
+                          if fp.name == want), None)
+            if match is not None:
+                assembly_csv_var.set(match)
+                _saved_assembly_csv[0] = ""
+        # A pinned CSV that has since been deleted/renamed falls back to "all"
+        # rather than silently ranking against nothing.
+        if (assembly_csv_var.get() != _ASSEMBLY_CSV_ALL
+                and assembly_csv_var.get() not in _assembly_csv_map):
+            assembly_csv_var.set(_ASSEMBLY_CSV_ALL)
+
+    def _selected_csv_filename() -> str:
+        """The pinned CSV's filename for persistence, or "" for "all runs".
+        Falls back to the not-yet-resolved saved name so a pin survives a
+        session in which the output folder was never populated."""
+        chosen = assembly_csv_var.get()
+        if not chosen or chosen == _ASSEMBLY_CSV_ALL:
+            return _saved_assembly_csv[0]
+        if chosen not in _assembly_csv_map:
+            _rebuild_csv_map()
+        fp = _assembly_csv_map.get(chosen)
+        return fp.name if fp is not None else _saved_assembly_csv[0]
+
+    def _find_processing_csvs() -> list:
+        """The CSV(s) the ranking should read, oldest → newest so the newest
+        wins on duplicate keys. Honours the user's pick in the CSV combobox:
+        a single pinned file, or every CSV when "all runs" is selected."""
+        # A pin restored from settings can still be pending here, because the
+        # output folder is injected by the caller after this tab is built.
+        if _saved_assembly_csv[0]:
+            _refresh_csv_choices()
+        chosen = assembly_csv_var.get()
+        if chosen and chosen != _ASSEMBLY_CSV_ALL:
+            # The map is only rebuilt when the dropdown opens, so it can be
+            # stale (or empty) here — rescan before concluding the pick is gone.
+            if chosen not in _assembly_csv_map:
+                _rebuild_csv_map()
+            fp = _assembly_csv_map.get(chosen)
+            if fp is not None and fp.is_file():
+                return [fp]
+            return []
+        return _scan_processing_csvs()
+
+    assembly_top2 = tk.Frame(assembly_lframe)
+    assembly_top2.pack(fill="x", pady=(0, 6))
+    tk.Label(assembly_top2, text="from Processing CSV:").pack(side="left")
+    assembly_csv_cb = ttk.Combobox(
+        assembly_top2, textvariable=assembly_csv_var, state="readonly", width=26)
+    assembly_csv_cb.pack(side="left", padx=(6, 8))
+    assembly_csv_cb.configure(postcommand=_refresh_csv_choices)
+    tk.Label(assembly_top2,
+             text="(newest first — pick a single Processing run to rank against, "
+                  "or use all runs)",
+             fg="#888888", font=("Segoe UI", 8, "italic")).pack(side="left")
+    _refresh_csv_choices()
+
+    def _csv_row_component(filename: str) -> str:
+        comp = Path(filename).stem
+        for pfx in ("smoothed_results_", "results_",
+                    "post_smooth_results_", "merged_results_"):
+            if comp.lower().startswith(pfx):
+                return comp[len(pfx):]
+        return comp
+
+    def _build_csv_metric_index(metric_col: str) -> dict:
+        """Return {(case, scenario, comp): metric_value} parsed straight out of
+        the Processing-tab CSV(s) — no VTP files are opened, so this is fast
+        even with many components/scenarios. Matches by (case, scenario,
+        component) rather than file path, since Tab 3 may browse a different
+        source (e.g. post-smoothed VTPs) than the original files the CSV was
+        written for."""
+        index: dict = {}
+        for csv_fp in _find_processing_csvs():
+            try:
+                with open(csv_fp, newline="", encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        filename = (row.get("filename") or "").strip()
+                        if not filename:
+                            continue
+                        val_raw = (row.get(metric_col) or "").strip()
+                        if not val_raw:
+                            continue
+                        try:
+                            val = float(val_raw)
+                        except ValueError:
+                            continue
+                        case     = (row.get("case") or "").strip()
+                        scenario = (row.get("scenario") or "").strip()
+                        comp     = _csv_row_component(filename)
+                        index[(case, scenario, comp)] = val
+            except Exception:
+                continue
+        return index
+
+    def _auto_pick_worst() -> None:
+        """Pre-select, for each component, the scenario whose Processing-tab
+        CSV row has the highest value in the chosen metric column. Reads the
+        CSV(s) already written by the Processing tab instead of re-opening
+        every candidate VTP file (much faster). Purely a starting point —
+        every pick can still be changed manually in the dropdowns below."""
+        if not _all_comp_names:
+            messagebox.showinfo("No data", "Click Load Cases first.")
+            return
+        metric_col = assembly_metric_var.get() or "main_area_max"
+        csvs = _find_processing_csvs()
+        if not csvs:
+            if assembly_csv_var.get() != _ASSEMBLY_CSV_ALL:
+                messagebox.showwarning(
+                    "Selected CSV not available",
+                    f"The pinned Processing CSV '{assembly_csv_var.get()}' could "
+                    "not be read — it may have been moved or deleted, or the "
+                    "output folder has changed.\n\n"
+                    "Re-open the 'from Processing CSV' dropdown to pick an "
+                    "available run.")
+            else:
+                messagebox.showwarning(
+                    "No Processing CSV found",
+                    "No 'max_comparison_batch_*.csv' file was found in:\n\n"
+                    "  {output_folder}\\csv_file_comparison\\\n\n"
+                    "Run the Processing tab at least once first — auto-pick reads "
+                    "its per-file metrics instead of re-opening every VTP.")
+            return
+        metric_index = _build_csv_metric_index(metric_col)
+        n_done, n_skipped = 0, 0
+        for comp in _all_comp_names:
+            scen_map = _comp_files.get(comp, {})
+            if not scen_map:
+                continue
+            best_sp, best_val = None, None
+            for sp in scen_map:
+                try:
+                    _, case, scenario = extract_case_scenario(sp)
+                except Exception:
+                    continue
+                val = metric_index.get((case, scenario, comp))
+                if val is None:
+                    continue
+                if best_val is None or val > best_val:
+                    best_val, best_sp = val, sp
+            if best_sp is not None:
+                _comp_selected_scenario[comp] = best_sp
+                n_done += 1
+            else:
+                n_skipped += 1
+        _build_assembly_rows()
+        src_desc = (f"all {len(csvs)} Processing CSV(s)"
+                    if assembly_csv_var.get() == _ASSEMBLY_CSV_ALL
+                    else f"Processing CSV '{csvs[0].name}'")
+        msg = (f"Ranked by '{metric_col}' from {src_desc}.\n\n"
+               f"Selected the highest-value scenario for {n_done} component(s).")
+        if n_skipped:
+            msg += (f"\n{n_skipped} component(s) had no matching CSV data and "
+                    "were left unchanged.")
+        msg += "\n\nReview and adjust any picks below as needed."
+        messagebox.showinfo("Auto-pick complete", msg)
+
+    def _clear_assembly_selections() -> None:
+        _comp_selected_scenario.clear()
+        _build_assembly_rows()
+
+    tk.Button(assembly_top, text="Auto-pick worst per component", width=26,
+              command=_auto_pick_worst).pack(side="left", padx=(0, 8))
+    tk.Button(assembly_top, text="Clear selections", width=14,
+              command=_clear_assembly_selections).pack(side="left")
+
+    assembly_body = tk.Frame(assembly_lframe)
+    assembly_body.pack(fill="both", expand=True)
+    assembly_canvas = tk.Canvas(assembly_body, bg="white", height=220,
+                                highlightthickness=0)
+    assembly_vscroll = tk.Scrollbar(assembly_body, orient="vertical",
+                                    command=assembly_canvas.yview)
+    assembly_canvas.configure(yscrollcommand=assembly_vscroll.set)
+    assembly_vscroll.pack(side="right", fill="y")
+    assembly_canvas.pack(side="left", fill="both", expand=True)
+    assembly_inner = tk.Frame(assembly_canvas, bg="white")
+    _assembly_win = assembly_canvas.create_window((0, 0), window=assembly_inner, anchor="nw")
+    assembly_inner.bind("<Configure>",
+                        lambda e: assembly_canvas.configure(
+                            scrollregion=assembly_canvas.bbox("all")))
+    assembly_canvas.bind("<Configure>",
+                         lambda e: assembly_canvas.itemconfig(_assembly_win, width=e.width))
+
+    def _on_assembly_scroll(event):
+        assembly_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    assembly_canvas.bind("<Enter>",
+                         lambda _: assembly_canvas.bind_all("<MouseWheel>", _on_assembly_scroll))
+    assembly_canvas.bind("<Leave>",
+                         lambda _: assembly_canvas.unbind_all("<MouseWheel>"))
+
+    assembly_status_var = tk.StringVar(value="  (click Load Cases above to populate)")
+    tk.Label(assembly_lframe, textvariable=assembly_status_var, fg="#555555",
+             anchor="w").pack(fill="x", pady=(2, 4))
+
+    assembly_run_btn = tk.Button(
+        assembly_lframe, text="Merge Selected \u2192 Single VTK", width=26,
+        bg="#7c3aed", fg="white", font=("Segoe UI", 10, "bold"))
+    assembly_run_btn.pack(anchor="w")
+
+    def _build_assembly_rows() -> None:
+        for w in assembly_inner.winfo_children():
+            w.destroy()
+        _comp_label_maps.clear()
+
+        if not _all_comp_names:
+            tk.Label(assembly_inner, text="(no components loaded \u2014 click Load Cases)",
+                     fg="#aaaaaa", bg="white").pack(anchor="w", padx=6, pady=4)
+            assembly_status_var.set("  (no components loaded)")
+            return
+
+        n_with_options = 0
+        for comp in _all_comp_names:
+            scen_map = _comp_files.get(comp, {})
+            # Restore a persisted pick on first build after Load Cases, if still valid
+            if (comp not in _comp_selected_scenario
+                    and comp in _saved_assembly_selection
+                    and _saved_assembly_selection[comp] in scen_map):
+                _comp_selected_scenario[comp] = _saved_assembly_selection[comp]
+
+            label_map = _unique_labels(sorted(scen_map.keys()))
+            _comp_label_maps[comp] = label_map
+
+            row = tk.Frame(assembly_inner, bg="white")
+            row.pack(fill="x", padx=2, pady=1)
+            tk.Label(row, text=comp, width=22, anchor="w", bg="white",
+                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 6))
+
+            if not label_map:
+                tk.Label(row, text="(no matching files)", bg="white",
+                         fg="#bbbbbb", font=("Segoe UI", 8, "italic")).pack(
+                    side="left", fill="x", expand=True)
+                continue
+
+            n_with_options += 1
+            options = ["(select)"] + list(label_map.keys())
+            prev_sp  = _comp_selected_scenario.get(comp)
+            prev_lbl = next((lbl for lbl, sp in label_map.items() if sp == prev_sp),
+                            "(select)")
+            var = tk.StringVar(value=prev_lbl)
+            cb = ttk.Combobox(row, textvariable=var, values=options,
+                              state="readonly", width=48)
+            cb.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+            def _on_pick(_e=None, c=comp, v=var, lm=label_map):
+                chosen = v.get()
+                if chosen == "(select)":
+                    _comp_selected_scenario.pop(c, None)
+                else:
+                    _comp_selected_scenario[c] = lm.get(chosen)
+                assembly_status_var.set(
+                    f"  {len(_comp_selected_scenario)}/{len(_all_comp_names)} "
+                    "component(s) selected")
+
+            cb.bind("<<ComboboxSelected>>", _on_pick)
+
+        assembly_inner.update_idletasks()
+        assembly_canvas.configure(scrollregion=assembly_canvas.bbox("all"))
+        assembly_status_var.set(
+            f"  {n_with_options}/{len(_all_comp_names)} component(s) have available "
+            f"scenarios  \u2014  {len(_comp_selected_scenario)} selected")
+
+    def get_assembly_cfg() -> dict | None:
+        """Validate and return the Assembly Merge run cfg, or None on invalid input."""
+        if not _all_comp_names:
+            messagebox.showwarning("No data", "Click Load Cases first.")
+            return None
+        selection: dict[str, str] = {}
+        missing: list[str] = []
+        for comp in _all_comp_names:
+            sp = _comp_selected_scenario.get(comp)
+            if sp is None:
+                missing.append(comp)
+                continue
+            fp = _comp_files.get(comp, {}).get(sp)
+            if fp:
+                selection[comp] = fp
+        if missing:
+            if not messagebox.askyesno(
+                    "Missing selections",
+                    f"{len(missing)} component(s) have no scenario selected and "
+                    "will be excluded from the merge:\n\n" + ", ".join(sorted(missing)) +
+                    "\n\nContinue anyway?"):
+                return None
+        if not selection:
+            messagebox.showwarning("Nothing selected",
+                                   "Select a scenario for at least one component.")
+            return None
+        if not pp_merge_pd_var.get() and not pp_merge_pwr_var.get():
+            messagebox.showwarning(
+                "No merge array selected",
+                "Select at least one array to merge (Power Density or Total Power).")
+            return None
+        return {
+            "component_selection": selection,
+            "assembly_name": assembly_name_var.get().strip() or "assembly",
+            "merge_pd":  pp_merge_pd_var.get(),
+            "merge_pwr": pp_merge_pwr_var.get(),
+        }
+
+    assembly_lframe.pack(fill="both", expand=True, padx=4, pady=4)
+
     # ── Snapshots ─────────────────────────────────────────────────────────────
-    snap_lframe = tk.LabelFrame(tab3, text="Snapshots", padx=8, pady=4)
+    snap_lframe = tk.LabelFrame(tab_cg, text="Snapshots", padx=8, pady=4)
     snap_row = tk.Frame(snap_lframe)
     snap_row.pack(fill="x")
     pp_save_snaps_var = tk.BooleanVar(value=bool(pp_s.get("save_snapshots", False)))
@@ -744,7 +1180,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     _update_snap_state()
 
     # ── Run button ────────────────────────────────────────────────────────────
-    btn_frame = tk.Frame(tab3)
+    btn_frame = tk.Frame(tab_cg)
 
     tab3_run_btn = tk.Button(
         btn_frame, text="Run Post Processing", width=20,
@@ -752,9 +1188,10 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     )
     tab3_run_btn.pack(side="left", padx=6)
 
-    # ── Pack order: cases → mult → merge → snaps → run ───────────────────────
+    # ── Pack order: cases → merge arrays (shared) → tool sub-tabs ────────────
     snap_lframe.pack(fill="x", padx=10, pady=(4, 2))
     btn_frame.pack(pady=(4, 10))
+    pp_tools_nb.pack(fill="both", expand=True, padx=10, pady=(4, 8))
 
     # src values where mult factor is editable (all original sources)
     _PP_ORIGINAL_SRCS = {"original", "original_raw", "original_smooth"}
@@ -877,6 +1314,10 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             "snap_total_pwr":   pp_snap_tp_var.get(),
             "case_groups":      dict(case_group),
             "group_labels":     dict(_group_labels),
+            "assembly_name":       assembly_name_var.get(),
+            "assembly_metric":     assembly_metric_var.get(),
+            "assembly_csv":        _selected_csv_filename(),
+            "assembly_selection":  dict(_comp_selected_scenario),
         }
 
     def apply_pp_cfg(pp: dict) -> None:
@@ -918,6 +1359,20 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             else:
                 case_group.pop(sp, None)
                 ind.configure(bg="#e5e7eb", text="", fg="#e5e7eb")
+        # Restore Assembly Merge name + selections (applied to already-built rows, if any)
+        assembly_name_var.set(pp.get("assembly_name", assembly_name_var.get()))
+        assembly_metric_var.set(pp.get("assembly_metric", assembly_metric_var.get()))
+        # Pinned Processing CSV: remembered by filename and resolved against
+        # whatever is on disk for the current output folder.
+        _saved_assembly_csv[0] = str(pp.get("assembly_csv", "") or "")
+        if not _saved_assembly_csv[0]:
+            assembly_csv_var.set(_ASSEMBLY_CSV_ALL)
+        _refresh_csv_choices()
+        _saved_assembly_selection.clear()
+        _saved_assembly_selection.update(pp.get("assembly_selection", {}))
+        if _comp_label_maps:
+            _comp_selected_scenario.clear()
+            _build_assembly_rows()
 
     return {
         "tab3_run_btn":       tab3_run_btn,
@@ -930,4 +1385,6 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         "_on_load_cases":     on_load_cases,
         "case_group":         case_group,
         "pp_source_var":      pp_source_var,
+        "assembly_run_btn":   assembly_run_btn,
+        "get_assembly_cfg":   get_assembly_cfg,
     }
