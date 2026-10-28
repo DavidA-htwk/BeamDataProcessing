@@ -22,8 +22,10 @@ from modules.core.settings import (
     ARRAY_NAME, POWER_ARRAY, SMOOTH_PROXIMITY_RADIUS, SPIKE_SIGMA, SPIKE_RATIO, MIN_POWER_W, _safe_float,
 )
 from modules.vtk.vtk_io import _write_vtp, read_vtp
+from modules.core.console import configure_stdio
 from modules.core.path_utils import extract_case_scenario
 from modules.vtk.smoothing import precompute_smooth_geometry
+from modules.vtk.physical_smooth import precompute_diffusion_geometry
 from modules.processing.workers import (
     _load_one_file, _smooth_one_file, _transform_one_file, _render_subprocess,
     _load_smooth_write_one_file,
@@ -244,6 +246,8 @@ def run_processing(
                     needs_edge_topology = (
                         comp_mode == "edge" or (comp_ni2 > 0 and comp_mode2 == "edge")
                     )
+                    if comp_ni2 == 0:
+                        comp_mode2 = ""    # stage 2 inactive
                     pd_tmp    = read_vtp(str(fp))           # load for cache only
                     cache     = precompute_smooth_geometry(
                         pd_tmp,
@@ -251,6 +255,16 @@ def run_processing(
                         log_fn=log,
                         skip_edge_expansion=not needs_edge_topology,
                     )
+                    # "physical" mode needs a different operator (the dual
+                    # -graph Laplacian).  It is geometry-only too, so it is
+                    # built once per component here and carried on the same
+                    # cache dict rather than rebuilt for every file.
+                    if cache is not None and "physical" in (comp_mode, comp_mode2):
+                        t0p = time.perf_counter()
+                        cache["_diffusion"] = precompute_diffusion_geometry(
+                            pd_tmp, log_fn=log)
+                        log(f"    [{comp}] diffusion operator cached "
+                            f"({time.perf_counter()-t0p:.1f}s)")
                     del pd_tmp                              # free immediately
                     n_ec = cache.get("n_direct", 0) if cache else 0
                     n_ep = len(cache.get("edge_pt_ids_arr", [])) if cache else 0
@@ -464,7 +478,10 @@ def run_processing(
                 f"({n_snap_workers} render process(es))...")
             t0 = time.perf_counter()
             try:
-                with multiprocessing.Pool(processes=n_snap_workers) as pool:
+                # Pool workers are fresh processes with their own stdout,
+                # so they need the same stdio fix as the parent.
+                with multiprocessing.Pool(processes=n_snap_workers,
+                                          initializer=configure_stdio) as pool:
                     for done, result in enumerate(
                             pool.imap_unordered(_render_subprocess, snap_proc_args), 1):
                         if stopped():
@@ -500,6 +517,10 @@ def run_processing(
 
 # ── Transform pipeline ────────────────────────────────────────────────────────
 
+# Output subfolder per format, so CSV and VTP runs never overwrite each other.
+_XFM_OUT_ROOT = {"csv": "transformed", "vtp": "transformed_vtp"}
+
+
 def run_transform(
         input_dirs: list,
         xfm_params: dict,
@@ -524,10 +545,24 @@ def run_transform(
     out_unit    = xfm_params.get("output_unit", in_unit)
     coord_scale = xfm_params.get("coord_scale", 1.0)
     mult        = xfm_params.get("mult", 1.0)
+
+    # Which output format(s) to produce: "csv", "vtp" or "both".
+    out_format = str(xfm_params.get("output_format", "csv")).lower()
+    formats    = ["csv", "vtp"] if out_format == "both" else [out_format]
+    formats    = [f for f in formats if f in ("csv", "vtp")] or ["csv"]
+
     log(f"Coordinate transform: {preset}  (input unit: {in_unit} -> output unit: {out_unit})")
     log(f"  Rotation: {angle_deg} deg about Z   "
         f"Translation: dx={dx} {in_unit}, dy={dy} {in_unit}, dz={dz} {in_unit}")
     log(f"  Coordinate scale factor: {coord_scale}   Power multiplier: {mult}")
+    log(f"  Output format: {' + '.join(f.upper() for f in formats)}")
+    if "vtp" in formats and mult != 1.0:
+        log(f"  [NOTE] The VTP power arrays are written pre-multiplied by "
+            f"{mult}, including the per-species")
+        log(f"         variants (Deposited_Power_W_H+, Power_Density_W_m2_H0, "
+            f"...) so they still sum to the total.")
+        log(f"         Do not feed these files back into Processing or the "
+            f"factor would be applied twice.")
 
     expanded: list[Path] = []
     for d in input_dirs:
@@ -562,8 +597,11 @@ def run_transform(
         log(f"  {folder_case}/{folder_scenario}: {len(files)} file(s)")
         for filepath in files:
             _, case, scenario = extract_case_scenario(str(filepath.parent))
-            dest_dir = out_root / "transformed" / output_name / case
-            all_xfm_args.append((filepath, dest_dir, output_name, case, scenario, xfm_params))
+            dest_dirs = {
+                fmt: out_root / _XFM_OUT_ROOT[fmt] / output_name / case
+                for fmt in formats
+            }
+            all_xfm_args.append((filepath, dest_dirs, output_name, case, scenario, xfm_params))
 
     n_total   = len(all_xfm_args)
     n_workers = min(os.cpu_count() or 4, n_total, 12)
@@ -578,8 +616,9 @@ def run_transform(
                 pool.terminate(); break
             if isinstance(result, Exception):
                 log(f"  [{done}/{n_total}] ERROR: {result}"); continue
-            filepath, out_path, _ = result
-            log(f"  [{done}/{n_total}] {filepath.name} -> {out_path.name}")
+            filepath, out_paths, _ = result
+            names = ", ".join(p.name for p in out_paths)
+            log(f"  [{done}/{n_total}] {filepath.name} -> {names}")
             total += 1
 
     log("\n" + "=" * 80)
@@ -587,4 +626,5 @@ def run_transform(
         log(f"STOPPED after {total} file(s) transformed.")
     else:
         log(f"Transformed {total} file(s).")
-    log(f"Output root: {out_root / 'transformed'}")
+    for fmt in formats:
+        log(f"Output root ({fmt.upper()}): {out_root / _XFM_OUT_ROOT[fmt]}")

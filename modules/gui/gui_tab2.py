@@ -462,6 +462,12 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
 
     def _build_scenario_list(scenarios_by_output: dict[str, list[str]]) -> None:
         """Populate the scenario pane; one checkbox row per scenario folder."""
+        # On a reload, carry over what is ticked now — otherwise the selection
+        # saved at startup comes back and silently re-ticks folders the user
+        # has since unticked (and leaves newly wanted ones unticked).
+        if case_checks:
+            _saved_sel.clear()
+            _saved_sel.update(sp for sp, v in case_checks.items() if v.get())
         for w in scen_inner.winfo_children():
             w.destroy()
         case_checks.clear()
@@ -687,6 +693,23 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     tk.Button(selall_frame, text="Deselect all", width=10,
               command=_desel_all).pack(side="left")
 
+    # ── Output format ─────────────────────────────────────────────────────────
+    fmt_lframe = tk.LabelFrame(tab2, text="Output format", padx=8, pady=4)
+    fmt_lframe.pack(fill="x", padx=10, pady=(8, 0))
+    _fmt_row = tk.Frame(fmt_lframe)
+    _fmt_row.pack(fill="x")
+    xfm_output_format_var = tk.StringVar(value=xfm_s.get("output_format", "csv"))
+    for _txt, _val in (
+        ("CSV  (per-cell table)",       "csv"),
+        ("VTP  (transformed mesh)",     "vtp"),
+        ("Both",                        "both"),
+    ):
+        tk.Radiobutton(_fmt_row, text=_txt, variable=xfm_output_format_var,
+                       value=_val).pack(side="left", padx=(0, 14))
+    xfm_fmt_note = tk.Label(fmt_lframe, text="", fg="#64748b", anchor="w",
+                            font=("Segoe UI", 8))
+    xfm_fmt_note.pack(fill="x", pady=(2, 0))
+
     # ── Export options ────────────────────────────────────────────────────────
     export_lframe = tk.LabelFrame(tab2, text="Properties to export", padx=8, pady=4)
     export_lframe.pack(fill="x", padx=10, pady=(8, 4))
@@ -696,13 +719,39 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
     xfm_export_area  = tk.BooleanVar(value=bool(xfm_s.get("export_area",  True)))
     xfm_export_power = tk.BooleanVar(value=bool(xfm_s.get("export_power", True)))
     xfm_export_pload = tk.BooleanVar(value=bool(xfm_s.get("export_pload", True)))
-    for text, var, pad in [
-        ("Geometry (X, Y, Z)",           xfm_export_geom,  12),
-        ("Cell area",                    xfm_export_area,  12),
-        ("Power (Deposited_Power_W)",    xfm_export_power, 12),
-        ("Power load (Power_Density_W_m2)", xfm_export_pload, 0),
+    _exp_boxes: dict[str, tk.Checkbutton] = {}
+    for key, text, var, pad in [
+        ("geom",  "Geometry (X, Y, Z)",               xfm_export_geom,  12),
+        ("area",  "Cell area",                        xfm_export_area,  12),
+        ("power", "Power (Deposited_Power_W)",        xfm_export_power, 12),
+        ("pload", "Power load (Power_Density_W_m2)",  xfm_export_pload, 0),
     ]:
-        tk.Checkbutton(_exp_row, text=text, variable=var).pack(side="left", padx=(0, pad))
+        cb = tk.Checkbutton(_exp_row, text=text, variable=var)
+        cb.pack(side="left", padx=(0, pad))
+        _exp_boxes[key] = cb
+
+    def _update_xfm_format_state(*_):
+        """Reflect the chosen output format in the export-option widgets.
+
+        A VTP always carries its point coordinates, so the Geometry toggle is
+        meaningless when no CSV is written.
+        """
+        fmt = xfm_output_format_var.get()
+        _exp_boxes["geom"].configure(state="disabled" if fmt == "vtp" else "normal")
+        if fmt == "csv":
+            xfm_fmt_note.configure(
+                text="Writes per-cell CSVs to  <output>/transformed/")
+        elif fmt == "vtp":
+            xfm_fmt_note.configure(
+                text="Writes transformed meshes to  <output>/transformed_vtp/   "
+                     "— Geometry is always included in a VTP.")
+        else:
+            xfm_fmt_note.configure(
+                text="Writes CSVs to  <output>/transformed/  and meshes to  "
+                     "<output>/transformed_vtp/")
+
+    xfm_output_format_var.trace_add("write", _update_xfm_format_state)
+    _update_xfm_format_state()
 
     xfm_misc_frame = tk.Frame(tab2)
     xfm_misc_frame.pack(fill="x", padx=10, pady=(2, 4))
@@ -787,18 +836,36 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             return None
         # VTPs always store raw values — apply the user-entered factor directly to the CSV.
         effective_mult = mult
+        out_fmt   = xfm_output_format_var.get()
         exp_geom  = xfm_export_geom.get()
         exp_area  = xfm_export_area.get()
         exp_power = xfm_export_power.get()
         exp_pload = xfm_export_pload.get()
-        if not any([exp_geom, exp_area, exp_power, exp_pload]):
+        # A VTP always carries its coordinates, so Geometry alone is not a
+        # meaningful selection when only VTPs are written.
+        _selected_props = ([exp_area, exp_power, exp_pload] if out_fmt == "vtp"
+                           else [exp_geom, exp_area, exp_power, exp_pload])
+        if not any(_selected_props):
             messagebox.showwarning("Nothing selected",
                                    "Select at least one property to export.")
             return None
         unit        = xfm_unit_var.get()
         output_unit = xfm_out_unit_var.get()
         unit_to_m   = {"m": 1.0, "mm": 0.001}
-        coord_scale = unit_to_m[unit] / unit_to_m[output_unit]
+        s_in        = unit_to_m[unit]
+        s_out       = unit_to_m[output_unit]
+        coord_scale = s_in / s_out
+
+        # The workers add dx/dy/dz straight onto the raw file coordinates and
+        # only convert units afterwards, so the translation has to be handed
+        # over already expressed in the *input* unit.  The presets define it in
+        # metres; without this conversion an mm-coordinate file had metres
+        # added to millimetres and landed ~1000x short of the target frame.
+        _p_unit  = _trf.TRANSFORM_PRESETS.get(
+            xfm_preset_var.get(), {}).get("unit", "m")
+        _t_scale = unit_to_m.get(_p_unit, 1.0) / s_in
+        dx, dy, dz = dx * _t_scale, dy * _t_scale, dz * _t_scale
+
         return {
             "preset":       xfm_preset_var.get(),
             "angle_deg":    angle, "dx": dx, "dy": dy, "dz": dz,
@@ -806,6 +873,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             "coord_scale":  coord_scale,
             "pattern":      xfm_pattern_var.get() or "smoothed_results_*.vtp",
             "name_filter":  xfm_filter_var.get().strip(),
+            "output_format": out_fmt,
             "export_geom":  exp_geom, "export_area":  exp_area,
             "export_power": exp_power, "export_pload": exp_pload,
             "mult":         effective_mult, "ignore_zeros": xfm_ignore_zeros.get(),
@@ -827,6 +895,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
             "dz":             xfm_dz_var.get(),
             "pattern":        xfm_pattern_var.get(),
             "name_filter":    xfm_filter_var.get(),
+            "output_format":  xfm_output_format_var.get(),
             "export_geom":    xfm_export_geom.get(),
             "export_area":    xfm_export_area.get(),
             "export_power":   xfm_export_power.get(),
@@ -858,6 +927,8 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         xfm_dz_var.set(xfm.get("dz", "0.920"))
         xfm_pattern_var.set(xfm.get("pattern", "smoothed_results_*.vtp"))
         xfm_filter_var.set(xfm.get("name_filter", ""))
+        _fmt = str(xfm.get("output_format", "csv")).lower()
+        xfm_output_format_var.set(_fmt if _fmt in ("csv", "vtp", "both") else "csv")
         xfm_export_geom.set(bool(xfm.get("export_geom",  True)))
         xfm_export_area.set(bool(xfm.get("export_area",  True)))
         xfm_export_power.set(bool(xfm.get("export_power", True)))
@@ -881,6 +952,7 @@ def build_transform_tab(tab2: tk.Frame, settings: dict) -> dict:
         "xfm_dz_var":          xfm_dz_var,
         "xfm_pattern_var":     xfm_pattern_var,
         "xfm_filter_var":      xfm_filter_var,
+        "xfm_output_format_var": xfm_output_format_var,
         "xfm_export_geom":     xfm_export_geom,
         "xfm_export_area":     xfm_export_area,
         "xfm_export_power":    xfm_export_power,

@@ -215,12 +215,12 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
     tk.Label(comp_grid, text="", width=4).grid(row=_BR, column=1)
     tk.Spinbox(comp_grid, from_=0, to=20, width=4,
                textvariable=_bulk_iter_var).grid(row=_BR, column=2, sticky="w", padx=(0, 4))
-    _bk_mode = tk.OptionMenu(comp_grid, _bulk_mode_var, "edge", "auto")
+    _bk_mode = tk.OptionMenu(comp_grid, _bulk_mode_var, "edge", "auto", "physical")
     _bk_mode.config(width=5)
     _bk_mode.grid(row=_BR, column=3, sticky="w", padx=(0, 2))
     tk.Spinbox(comp_grid, from_=0, to=20, width=4,
                textvariable=_bulk_iter2_var).grid(row=_BR, column=4, sticky="w", padx=(0, 4))
-    _bk_mode2 = tk.OptionMenu(comp_grid, _bulk_mode2_var, "edge", "auto")
+    _bk_mode2 = tk.OptionMenu(comp_grid, _bulk_mode2_var, "edge", "auto", "physical")
     _bk_mode2.config(width=5)
     _bk_mode2.grid(row=_BR, column=5, sticky="w", padx=(0, 2))
     tk.Entry(comp_grid, textvariable=_bulk_sigma_var,  width=5).grid(
@@ -276,12 +276,12 @@ def build_processing_tab(tab1: tk.Frame, settings: dict, log_fn) -> dict:
                  fg="#666666").grid(row=r, column=1, sticky="w", padx=(0, 6))
         tk.Spinbox(comp_grid, from_=0, to=20, width=4,
                    textvariable=smooth_var).grid(row=r, column=2, sticky="w", padx=(0, 4))
-        mode_menu = tk.OptionMenu(comp_grid, smooth_mode_var, "edge", "auto")
+        mode_menu = tk.OptionMenu(comp_grid, smooth_mode_var, "edge", "auto", "physical")
         mode_menu.config(width=5)
         mode_menu.grid(row=r, column=3, sticky="w", padx=(0, 2))
         tk.Spinbox(comp_grid, from_=0, to=20, width=4,
                    textvariable=smooth_var2).grid(row=r, column=4, sticky="w", padx=(0, 4))
-        mode_menu2 = tk.OptionMenu(comp_grid, smooth_mode_var2, "edge", "auto")
+        mode_menu2 = tk.OptionMenu(comp_grid, smooth_mode_var2, "edge", "auto", "physical")
         mode_menu2.config(width=5)
         mode_menu2.grid(row=r, column=5, sticky="w", padx=(0, 2))
         sigma_entry = tk.Entry(comp_grid, textvariable=spike_sigma_var, width=5)

@@ -13,6 +13,8 @@ The tab lets the user:
   - Configure optional snapshots (power density / total power)
   - Set a multiplication factor (shown only when source = original)
   - Run the cell-wise max merge via run_post_processing()
+  - Pick one scenario per component and assemble them into one VTK
+  - Sum the same scenario across output folders via run_sum_merge()
 """
 
 from __future__ import annotations
@@ -570,6 +572,7 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         _update_pp_mult_state()
         _build_scenario_list(scenarios_by_output)
         _build_assembly_rows()
+        _build_sum_rows()
         if n_scenarios:
             src_label = "post-smoothed" if source == "post_smooth" else "input"
             load_case_status.set(
@@ -691,8 +694,10 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
     pp_tools_nb = ttk.Notebook(tab3)
     tab_cg  = tk.Frame(pp_tools_nb)   # colour-group (cell-wise max) tool
     tab_asm = tk.Frame(pp_tools_nb)   # worst-case assembly tool
+    tab_sum = tk.Frame(pp_tools_nb)   # sum merge across output folders
     pp_tools_nb.add(tab_cg,  text="Colour-Group Merge  (cell-wise max)")
     pp_tools_nb.add(tab_asm, text="Worst-Case Assembly Merge")
+    pp_tools_nb.add(tab_sum, text="Sum Merge  (add power across outputs)")
 
     # ── Multiplication factor ─────────────────────────────────────────────────
     mult_lframe = tk.LabelFrame(tab_cg, text="Snapshot factor (visual only)", padx=8, pady=4)
@@ -1151,6 +1156,321 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
 
     assembly_lframe.pack(fill="both", expand=True, padx=4, pady=4)
 
+    # ── Sum Merge (same scenario across output folders, power summed) ────────
+    # A THIRD tool, independent of the two above:
+    #   - Pairs files by (scenario path below OUTPUT_*, component) across the
+    #     loaded output folders, e.g. OUTPUT_X/hnb_3_+10_+2_D/results_dlm-b5.vtp
+    #     with OUTPUT_X_Ray/hnb_3_+10_+2_D/results_dlm-b5.vtp.
+    #   - Sums Deposited_Power_W cell-wise and recomputes the power density from
+    #     the summed power (no per-cell max selection).
+    # Reuses the Load Cases scan (_comp_files) but has its own scenario ticks.
+    sum_lframe = tk.Frame(tab_sum, padx=8, pady=6)
+    tk.Label(
+        sum_lframe,
+        text="Sums the deposited power of the SAME scenario across the loaded "
+             "output folders (e.g. a beam run and its ray run), component by "
+             "component. Power density is recomputed from the summed power and "
+             "the cell area, so its maximum is that of the cumulative load. "
+             "Output is written as a new OUTPUT_<name> folder that can be "
+             "loaded in the Processing tab.",
+        fg="#444444", anchor="w", justify="left", wraplength=760,
+    ).pack(fill="x", pady=(0, 4))
+    sum_src_note = tk.Label(sum_lframe, text="", fg="#b45309", anchor="w",
+                            justify="left", wraplength=760,
+                            font=("Segoe UI", 8, "italic"))
+    sum_src_note.pack(fill="x", pady=(0, 4))
+
+    _sum_index: dict[str, dict[str, str]] = {}      # {scenario_key: {output_name: scenario_path}}
+    _sum_output_vars: dict[str, tk.BooleanVar] = {}  # {output_name: included?}
+    _sum_scen_vars: dict[str, tk.BooleanVar] = {}    # {scenario_key: selected?}
+    _saved_sum_selected: set[str] = set(pp_s.get("sum_selected", []))
+    _saved_sum_outputs_off: set[str] = set(pp_s.get("sum_outputs_off", []))
+    _sum_factor_vars: dict[str, tk.StringVar] = {}   # {output_name: factor text}
+    _saved_sum_factors: dict[str, str] = {k: str(v) for k, v in
+                                          pp_s.get("sum_factors", {}).items()}
+
+    def _sum_key(sp: str) -> tuple[str, str]:
+        """(output_name, scenario_key) for scenario folder *sp*. The key is the
+        path below the OUTPUT_* ancestor, so the same scenario in two output
+        folders gets the same key."""
+        parts = Path(sp).parts
+        idx = next((i for i, p in enumerate(parts)
+                    if p.upper().startswith("OUTPUT_")), None)
+        if idx is None:
+            return (parts[-2] if len(parts) >= 2 else "?"), Path(sp).name
+        sub = [p for p in parts[idx + 1:]]
+        while sub and sub[-1].upper() in {"SMOOTHED", "RAW", "RESULTS"}:
+            sub.pop()
+        return parts[idx], "/".join(sub) or parts[idx]
+
+    sum_top = tk.Frame(sum_lframe)
+    sum_top.pack(fill="x", pady=(0, 4))
+    tk.Label(sum_top, text="Output name:  OUTPUT_").pack(side="left")
+    sum_name_var = tk.StringVar(value=pp_s.get("sum_name", ""))
+    tk.Entry(sum_top, textvariable=sum_name_var, width=30).pack(
+        side="left", padx=(0, 16))
+
+    # Default pairing is by scenario folder name. Combine mode instead sums
+    # every ticked scenario together (per component), for runs whose scenario
+    # folders are named differently (e.g. DNB_EM + HNB_FFTC_D_f500k_2509).
+    sum_combine_row = tk.Frame(sum_lframe)
+    sum_combine_row.pack(fill="x", pady=(0, 4))
+    sum_combine_var = tk.BooleanVar(value=bool(pp_s.get("sum_combine", False)))
+    sum_combine_name_var = tk.StringVar(value=pp_s.get("sum_combine_name", ""))
+    tk.Checkbutton(sum_combine_row, text="Combine ticked scenarios into one",
+                   variable=sum_combine_var).pack(side="left")
+    tk.Label(sum_combine_row, text="  scenario name:").pack(side="left")
+    sum_combine_entry = tk.Entry(sum_combine_row, textvariable=sum_combine_name_var,
+                                 width=30)
+    sum_combine_entry.pack(side="left", padx=(4, 8))
+    tk.Label(sum_combine_row,
+             text="(sums different scenario names together; blank = names joined by '+')",
+             fg="#888888", font=("Segoe UI", 8, "italic")).pack(side="left")
+
+    def _update_combine_state(*_) -> None:
+        sum_combine_entry.configure(
+            state="normal" if sum_combine_var.get() else "disabled")
+
+    sum_combine_var.trace_add("write", _update_combine_state)
+    _update_combine_state()
+
+    sum_out_frame = tk.Frame(sum_lframe)
+    sum_out_frame.pack(fill="x", pady=(0, 4))
+
+    sum_btns = tk.Frame(sum_lframe)
+    sum_btns.pack(fill="x", pady=(0, 4))
+
+    sum_body = tk.Frame(sum_lframe)
+    sum_body.pack(fill="both", expand=True)
+    sum_canvas = tk.Canvas(sum_body, bg="white", height=200, highlightthickness=0)
+    sum_vscroll = tk.Scrollbar(sum_body, orient="vertical", command=sum_canvas.yview)
+    sum_canvas.configure(yscrollcommand=sum_vscroll.set)
+    sum_vscroll.pack(side="right", fill="y")
+    sum_canvas.pack(side="left", fill="both", expand=True)
+    sum_inner = tk.Frame(sum_canvas, bg="white")
+    _sum_win = sum_canvas.create_window((0, 0), window=sum_inner, anchor="nw")
+    sum_inner.bind("<Configure>",
+                   lambda e: sum_canvas.configure(scrollregion=sum_canvas.bbox("all")))
+    sum_canvas.bind("<Configure>",
+                    lambda e: sum_canvas.itemconfig(_sum_win, width=e.width))
+
+    def _on_sum_scroll(event):
+        sum_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    sum_canvas.bind("<Enter>",
+                    lambda _: sum_canvas.bind_all("<MouseWheel>", _on_sum_scroll))
+    sum_canvas.bind("<Leave>",
+                    lambda _: sum_canvas.unbind_all("<MouseWheel>"))
+
+    sum_status_var = tk.StringVar(value="  (click Load Cases above to populate)")
+    tk.Label(sum_lframe, textvariable=sum_status_var, fg="#555555",
+             anchor="w").pack(fill="x", pady=(2, 4))
+
+    sum_run_btn = tk.Button(
+        sum_lframe, text="Sum-Merge Selected Scenarios", width=28,
+        bg="#0f766e", fg="white", font=("Segoe UI", 10, "bold"))
+    sum_run_btn.pack(anchor="w")
+
+    def _sum_active_outputs() -> list[str]:
+        return [o for o, v in sorted(_sum_output_vars.items()) if v.get()]
+
+    def _sum_sources(key: str, comp: str,
+                     factors: dict[str, float] | None = None) -> list[list]:
+        """[[output_name, file_path, factor], ...] for one scenario/component."""
+        files = _comp_files.get(comp, {})
+        out = []
+        for o in _sum_active_outputs():
+            sp = _sum_index.get(key, {}).get(o)
+            if sp and sp in files:
+                out.append([o, files[sp], (factors or {}).get(o, 1.0)])
+        return out
+
+    def _sum_update_status(*_) -> None:
+        n_sel = sum(v.get() for v in _sum_scen_vars.values())
+        sum_status_var.set(
+            f"  {len(_sum_scen_vars)} scenario(s) found in {len(_sum_output_vars)} "
+            f"output(s)  —  {n_sel} selected")
+
+    def _build_sum_rows() -> None:
+        """(Re)build output checkboxes + scenario rows from the Load Cases scan."""
+        _sum_index.clear()
+        sps = {sp for scen_map in _comp_files.values() for sp in scen_map}
+        for sp in sorted(sps):
+            o, key = _sum_key(sp)
+            _sum_index.setdefault(key, {})[o] = sp
+
+        outputs = sorted({o for m in _sum_index.values() for o in m})
+        for o in list(_sum_output_vars):
+            if o not in outputs:
+                del _sum_output_vars[o]
+        for o in outputs:
+            if o not in _sum_output_vars:
+                v = tk.BooleanVar(value=o not in _saved_sum_outputs_off)
+                v.trace_add("write", lambda *_: _build_sum_scen_rows())
+                _sum_output_vars[o] = v
+            if o not in _sum_factor_vars:
+                _sum_factor_vars[o] = tk.StringVar(value=_saved_sum_factors.get(o, "1.0"))
+        for w in sum_out_frame.winfo_children():
+            w.destroy()
+        if outputs:
+            tk.Label(sum_out_frame, text="Outputs to sum", anchor="w",
+                     font=("Segoe UI", 8, "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(sum_out_frame, text="Factor", anchor="w",
+                     font=("Segoe UI", 8, "bold")).grid(row=0, column=1, sticky="w",
+                                                        padx=(12, 0))
+            tk.Label(sum_out_frame,
+                     text="power of that output is multiplied by this before summing "
+                          "(baked into the summed VTP)",
+                     fg="#888888", font=("Segoe UI", 8, "italic")).grid(
+                row=0, column=2, sticky="w", padx=(8, 0))
+            for r, o in enumerate(outputs, 1):
+                tk.Checkbutton(sum_out_frame, text=o, anchor="w",
+                               variable=_sum_output_vars[o]).grid(row=r, column=0, sticky="w")
+                tk.Entry(sum_out_frame, textvariable=_sum_factor_vars[o],
+                         width=10).grid(row=r, column=1, sticky="w", padx=(12, 0))
+        if not sum_name_var.get().strip() and outputs:
+            sum_name_var.set(f"{outputs[0][len('OUTPUT_'):] or outputs[0]}_SUM")
+
+        for key in list(_sum_scen_vars):
+            if key not in _sum_index:
+                del _sum_scen_vars[key]
+        for key in _sum_index:
+            if key not in _sum_scen_vars:
+                v = tk.BooleanVar(value=key in _saved_sum_selected)
+                v.trace_add("write", _sum_update_status)
+                _sum_scen_vars[key] = v
+        _build_sum_scen_rows()
+
+    def _build_sum_scen_rows() -> None:
+        for w in sum_inner.winfo_children():
+            w.destroy()
+        if not _sum_index:
+            tk.Label(sum_inner, text="(no scenarios loaded — click Load Cases)",
+                     fg="#aaaaaa", bg="white").pack(anchor="w", padx=6, pady=4)
+            _sum_update_status()
+            return
+        active = _sum_active_outputs()
+        for key in sorted(_sum_index):
+            present = [o for o in active if o in _sum_index[key]]
+            n_comp = sum(1 for c in _all_comp_names if _sum_sources(key, c))
+            complete = len(active) >= 2 and len(present) == len(active)
+            row = tk.Frame(sum_inner, bg="white")
+            row.pack(fill="x", padx=2, pady=0)
+            tk.Checkbutton(row, text=key, variable=_sum_scen_vars[key], bg="white",
+                           anchor="w", width=34, font=("Segoe UI", 8),
+                           activebackground="white").pack(side="left")
+            missing = [o for o in active if o not in _sum_index[key]]
+            info = f"{len(present)}/{len(active)} outputs · {n_comp} component(s)"
+            if missing:
+                info += f"   missing in: {', '.join(missing)}"
+            tk.Label(row, text=info, bg="white", anchor="w",
+                     fg="#0f766e" if complete else "#b45309",
+                     font=("Segoe UI", 8)).pack(side="left", fill="x", expand=True)
+        sum_inner.update_idletasks()
+        sum_canvas.configure(scrollregion=sum_canvas.bbox("all"))
+        _sum_update_status()
+
+    def _sum_select(mode: str) -> None:
+        active = _sum_active_outputs()
+        for key, v in _sum_scen_vars.items():
+            if mode == "all":
+                v.set(True)
+            elif mode == "none":
+                v.set(False)
+            else:   # "complete": present in every selected output
+                v.set(len(active) >= 2
+                      and all(o in _sum_index.get(key, {}) for o in active))
+
+    tk.Button(sum_btns, text="Select all", width=10,
+              command=lambda: _sum_select("all")).pack(side="left", padx=(0, 3))
+    tk.Button(sum_btns, text="Select complete", width=14,
+              command=lambda: _sum_select("complete")).pack(side="left", padx=(0, 3))
+    tk.Button(sum_btns, text="Select none", width=10,
+              command=lambda: _sum_select("none")).pack(side="left", padx=(0, 3))
+    tk.Label(sum_btns, text="  (complete = scenario exists in every ticked output)",
+             fg="#888888", font=("Segoe UI", 8, "italic")).pack(side="left")
+
+    def _update_sum_src_note(*_) -> None:
+        if pp_source_var.get() == "original_raw":
+            sum_src_note.configure(text="")
+        else:
+            sum_src_note.configure(
+                text="⚠ Input source is not RAW. The summed density is always "
+                     "recomputed from Deposited_Power_W / cell area, so any upstream "
+                     "smoothing of the density is not carried over, and folders "
+                     "without SMOOTHED/ files will be missing. RAW is recommended.")
+
+    pp_source_var.trace_add("write", _update_sum_src_note)
+    _update_sum_src_note()
+
+    def get_sum_cfg() -> dict | None:
+        """Validate and return the Sum Merge run cfg, or None on invalid input."""
+        if not _sum_index:
+            messagebox.showwarning("No data", "Click Load Cases first.")
+            return None
+        active = _sum_active_outputs()
+        if not active:
+            messagebox.showwarning("No outputs", "Tick at least one output folder to sum.")
+            return None
+        factors: dict[str, float] = {}
+        for o in active:
+            raw = _sum_factor_vars[o].get().strip() if o in _sum_factor_vars else "1.0"
+            try:
+                f = float(raw or "1.0")
+            except ValueError:
+                f = float("nan")
+            if not (f > 0 and f != float("inf")):
+                messagebox.showerror(
+                    "Invalid factor",
+                    f"The factor for {o} must be a positive number (got '{raw}').\n\n"
+                    "Untick the output instead to leave it out of the sum.")
+                return None
+            factors[o] = f
+        keys = [k for k, v in sorted(_sum_scen_vars.items()) if v.get()]
+        if not keys:
+            messagebox.showwarning("Nothing selected", "Select at least one scenario.")
+            return None
+        slots = []
+        if sum_combine_var.get():
+            # All ticked scenarios summed into ONE scenario, per component.
+            # Sources are labelled output/scenario so they stay distinguishable
+            # when two ticked scenarios come from the same output.
+            combined = (sum_combine_name_var.get().strip().strip("\\/")
+                        or "+".join(keys))
+            for comp in _all_comp_names:
+                src = [[f"{o}/{key}", fp, f]
+                       for key in keys for o, fp, f in _sum_sources(key, comp, factors)]
+                if src:
+                    slots.append({"scenario": combined, "component": comp, "sources": src})
+        else:
+            for key in keys:
+                for comp in _all_comp_names:
+                    src = _sum_sources(key, comp, factors)
+                    if src:
+                        slots.append({"scenario": key, "component": comp, "sources": src})
+        if not slots:
+            messagebox.showwarning("No files", "No files found for the selected scenarios.")
+            return None
+        n_single = sum(1 for s in slots if len(s["sources"]) < 2)
+        if n_single:
+            singles = sorted({s["component"] for s in slots if len(s["sources"]) < 2})
+            hint = ("" if sum_combine_var.get() else
+                    "\n\nThe pairing is by scenario folder name. If the files you "
+                    "want to add sit in scenarios with DIFFERENT names, tick them "
+                    "and enable 'Combine ticked scenarios into one'.")
+            if not messagebox.askyesno(
+                    "Single-source files",
+                    f"{n_single} of {len(slots)} component file(s) have only one "
+                    "source, so nothing will be added to them — they are written "
+                    "with their power unchanged:\n\n  "
+                    + ", ".join(singles[:12]) + (" …" if len(singles) > 12 else "")
+                    + hint + "\n\nContinue anyway?"):
+                return None
+        name = sum_name_var.get().strip() or f"{active[0][len('OUTPUT_'):]}_SUM"
+        return {"sum_slots": slots, "sum_name": name}
+
+    sum_lframe.pack(fill="both", expand=True, padx=4, pady=4)
+
     # ── Snapshots ─────────────────────────────────────────────────────────────
     snap_lframe = tk.LabelFrame(tab_cg, text="Snapshots", padx=8, pady=4)
     snap_row = tk.Frame(snap_lframe)
@@ -1318,6 +1638,15 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
             "assembly_metric":     assembly_metric_var.get(),
             "assembly_csv":        _selected_csv_filename(),
             "assembly_selection":  dict(_comp_selected_scenario),
+            "sum_name":            sum_name_var.get(),
+            "sum_selected":        (sorted(k for k, v in _sum_scen_vars.items() if v.get())
+                                    if _sum_scen_vars else sorted(_saved_sum_selected)),
+            "sum_outputs_off":     (sorted(o for o, v in _sum_output_vars.items() if not v.get())
+                                    if _sum_output_vars else sorted(_saved_sum_outputs_off)),
+            "sum_combine":         sum_combine_var.get(),
+            "sum_combine_name":    sum_combine_name_var.get(),
+            "sum_factors":         {**_saved_sum_factors,
+                                    **{o: v.get() for o, v in _sum_factor_vars.items()}},
         }
 
     def apply_pp_cfg(pp: dict) -> None:
@@ -1373,6 +1702,22 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         if _comp_label_maps:
             _comp_selected_scenario.clear()
             _build_assembly_rows()
+        # Restore Sum Merge name + ticks
+        sum_name_var.set(pp.get("sum_name", sum_name_var.get()))
+        _saved_sum_selected.clear()
+        _saved_sum_selected.update(pp.get("sum_selected", []))
+        _saved_sum_outputs_off.clear()
+        _saved_sum_outputs_off.update(pp.get("sum_outputs_off", []))
+        for key, v in _sum_scen_vars.items():
+            v.set(key in _saved_sum_selected)
+        for o, v in _sum_output_vars.items():
+            v.set(o not in _saved_sum_outputs_off)
+        sum_combine_var.set(bool(pp.get("sum_combine", False)))
+        sum_combine_name_var.set(pp.get("sum_combine_name", ""))
+        _saved_sum_factors.clear()
+        _saved_sum_factors.update({k: str(v) for k, v in pp.get("sum_factors", {}).items()})
+        for o, v in _sum_factor_vars.items():
+            v.set(_saved_sum_factors.get(o, "1.0"))
 
     return {
         "tab3_run_btn":       tab3_run_btn,
@@ -1387,4 +1732,6 @@ def build_post_processing_tab(tab3: tk.Frame, settings: dict) -> dict:
         "pp_source_var":      pp_source_var,
         "assembly_run_btn":   assembly_run_btn,
         "get_assembly_cfg":   get_assembly_cfg,
+        "sum_run_btn":        sum_run_btn,
+        "get_sum_cfg":        get_sum_cfg,
     }

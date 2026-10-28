@@ -21,9 +21,11 @@ from modules.vtk.vtk_io import (
 )
 from modules.vtk.smoothing import apply_edge_smooth, find_main_area_max
 from modules.vtk.smart_smooth import smart_smooth_auto, apply_min_power_sliver_filter
+from modules.vtk.physical_smooth import physical_smooth
 from modules.vtk.snapshot_max import save_max_snapshot, precompute_snapshot
 from modules.transform.generate_report import extract_cells_to_csv
 from modules.transform import transform_reference_frame as _trf
+from modules.transform.transform_vtp import transform_vtp_file
 
 
 # ── Thread workers ────────────────────────────────────────────────────────────
@@ -145,6 +147,15 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
         if _stages:
             def _run_stage(src_pd, s_mode: str, s_iter: int):
+                if s_mode == "physical":
+                    # Not an iterative filter: the bandwidth is fitted to the
+                    # counting statistics, so s_iter only gates whether the
+                    # stage runs at all.  The diffusion operator is cached
+                    # alongside the edge topology by the pipeline.
+                    return physical_smooth(
+                        src_pd, stop_event=stop_event,
+                        geo_cache=(geo_cache or {}).get("_diffusion"),
+                    )
                 if s_mode == "auto":
                     return smart_smooth_auto(
                         src_pd, n_iter=s_iter, stop_event=stop_event,
@@ -250,12 +261,15 @@ def _load_smooth_write_one_file(args: tuple) -> tuple:
 
 
 def _transform_one_file(args: tuple) -> tuple:
-    """Extract cells to CSV and apply coordinate transform for one VTP file.
+    """Coordinate-transform one VTP file into CSV and/or VTP output.
 
-    Returns (filepath, out_path, None) or an Exception.
+    *dest_dirs* maps an output format ("csv", "vtp") to the folder its result
+    should be written to; only the formats present are produced.
+
+    Returns (filepath, [out_path, ...], None) or an Exception.
     """
     try:
-        filepath, dest_dir, output_name, case, scenario, xfm_params = args
+        filepath, dest_dirs, output_name, case, scenario, xfm_params = args
         angle_deg    = xfm_params["angle_deg"]
         dx           = xfm_params["dx"]
         dy           = xfm_params["dy"]
@@ -268,26 +282,47 @@ def _transform_one_file(args: tuple) -> tuple:
         ignore_zeros = xfm_params.get("ignore_zeros", False)
         coord_scale  = float(xfm_params.get("coord_scale", 1.0))
 
-        dest_dir = Path(dest_dir)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        csv_name = f"{output_name}__{case}__{scenario}__{filepath.stem}.csv"
-        out_path = dest_dir / csv_name
-        tmp_csv  = dest_dir / f"{output_name}__{case}__{scenario}__{filepath.stem}.tmp.csv"
+        stem      = f"{output_name}__{case}__{scenario}__{filepath.stem}"
+        out_paths: list[Path] = []
 
-        extract_cells_to_csv(
-            str(filepath), str(tmp_csv),
-            export_geom=export_geom, export_area=export_area,
-            export_power=export_power, export_pload=export_pload,
-            mult=mult, ignore_zeros=ignore_zeros,
-        )
-        _trf.process_file(
-            input_path=tmp_csv, output_path=out_path,
-            x_col=None, y_col=None, z_col=None,
-            angle_deg=angle_deg, dx=dx, dy=dy, dz=dz,
-            coord_scale=coord_scale,
-        )
-        tmp_csv.unlink(missing_ok=True)
-        return filepath, out_path, None
+        if "csv" in dest_dirs:
+            csv_dir = Path(dest_dirs["csv"])
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            out_path = csv_dir / f"{stem}.csv"
+            tmp_csv  = csv_dir / f"{stem}.tmp.csv"
+
+            extract_cells_to_csv(
+                str(filepath), str(tmp_csv),
+                export_geom=export_geom, export_area=export_area,
+                export_power=export_power, export_pload=export_pload,
+                mult=mult, ignore_zeros=ignore_zeros,
+            )
+            _trf.process_file(
+                input_path=tmp_csv, output_path=out_path,
+                x_col=None, y_col=None, z_col=None,
+                angle_deg=angle_deg, dx=dx, dy=dy, dz=dz,
+                coord_scale=coord_scale,
+            )
+            tmp_csv.unlink(missing_ok=True)
+            out_paths.append(out_path)
+
+        if "vtp" in dest_dirs:
+            vtp_dir = Path(dest_dirs["vtp"])
+            vtp_dir.mkdir(parents=True, exist_ok=True)
+            vtp_path = vtp_dir / f"{stem}.vtp"
+            # export_geom has no VTP equivalent: a mesh without coordinates is
+            # not a mesh, so the points are always written.
+            transform_vtp_file(
+                input_path=filepath, output_path=vtp_path,
+                angle_deg=angle_deg, dx=dx, dy=dy, dz=dz,
+                coord_scale=coord_scale,
+                export_area=export_area, export_power=export_power,
+                export_pload=export_pload,
+                mult=mult, ignore_zeros=ignore_zeros,
+            )
+            out_paths.append(vtp_path)
+
+        return filepath, out_paths, None
     except Exception as exc:
         return exc
 

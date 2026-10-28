@@ -106,6 +106,76 @@ MAIN_AREA_SUPPORT_RATIO         = 0.7
 MAIN_AREA_SUPPORT_MIN_COUNT     = 50
 MAIN_AREA_MAX_SCAN_CANDIDATES   = 2000
 
+# ── "Physical" smoothing mode (modules/vtk/physical_smooth.py) ────────────
+# This mode does not hunt for outliers to repair.  It estimates the surface
+# power-density field from the Monte Carlo tally with an operator that
+# conserves energy exactly, cannot produce a zero cell next to a hot one, and
+# reports its own uncertainty.  Almost all the heuristic knobs above become
+# unnecessary under it; only these two are physical choices:
+#
+# PHYS_TARGET_REL_ERROR  — CEILING on the statistical error you will accept.
+#                          Every cell starts at the finest scale the mesh can
+#                          support (one cell width) and is widened only where
+#                          the measured 1-sigma counting error exceeds this.
+#                          A cell that already beats the ceiling is left at
+#                          full resolution, so well-sampled peaks keep their
+#                          gradients while sparse tails get wide kernels.
+# PHYS_MAX_BANDWIDTH_M   — hard cap on the smoothing length [m].  Set this to
+#                          the smallest hot spot that must survive, or to the
+#                          thermal diffusion length of the component below
+#                          which its own conduction smooths the load anyway.
+PHYS_TARGET_REL_ERROR   = 0.05
+PHYS_MAX_BANDWIDTH_M    = 0.04
+
+# Numerical / robustness settings — rarely need changing.
+# PHYS_MIN_BANDWIDTH_FACTOR — bandwidth floor as a multiple of sqrt(cell area).
+#     You cannot resolve structure below one cell, so 1.0 is the natural
+#     value.  Do NOT raise it to force hole-filling: measured on the DNB duct
+#     liner the hole count is completely insensitive to this floor (the
+#     statistical rule already widens the kernel in the sparse regions where
+#     holes live), while chi2/dof degrades from 6.8 at 1.0 to 68.7 at 3.0 —
+#     i.e. a large floor only erases real structure.
+# PHYS_FEATURE_ANGLE / _SOFT — dihedral gate.  Conductance is 1 below _SOFT
+#     degrees, ramps smoothly to 0 at PHYS_FEATURE_ANGLE.  Stops power
+#     diffusing around a corner onto a shadowed face.  The ramp rather than a
+#     hard cut is what avoids reintroducing a discontinuity at the gate.
+#     NOTE: this threshold is mesh-resolution dependent — on a 2 mm mesh a
+#     tight fillet turns several degrees per cell, so a very small angle can
+#     sever a genuinely continuous curved surface.
+# PHYS_SUBSTEPS — implicit Euler substeps.  One step leaves the Bessel-K0
+#     kernel of the resolvent, which is too peaked at the origin; 3 substeps
+#     give a near-Gaussian kernel at 3x the solve cost.  The second moment
+#     <r^2> = 4*kappa is independent of this.
+# PHYS_BOOTSTRAP_REPLICAS — Poisson resampling replicas for the statistical
+#     error bar.  32 gives sigma to ~13 % relative accuracy; 0 disables it.
+# PHYS_BAND_FACTOR — the solve is restricted to this many max-bandwidths
+#     around the signal, with a no-flux boundary (so conservation stays exact).
+PHYS_MIN_BANDWIDTH_FACTOR = 1.0
+PHYS_FEATURE_ANGLE        = 30.0
+PHYS_FEATURE_ANGLE_SOFT   = 15.0
+PHYS_SUBSTEPS             = 3
+PHYS_BOOTSTRAP_REPLICAS   = 32
+# PHYS_REFINE_PASSES — bandwidth self-calibration passes.  The voxel pilot
+#     understates the local flux wherever the beam footprint is smaller than
+#     the pilot box, which would ask for a far wider kernel than the
+#     statistics need.  Each refine pass measures the error the current
+#     bandwidth actually delivers (a short bootstrap of PHYS_REFINE_PROBES
+#     replicas) and widens per cell by achieved/target, since sigma ~ 1/h.
+#     The schedule is monotone (widen only), so 0 passes means "no smoothing
+#     beyond one cell width" rather than anything unsafe.
+PHYS_REFINE_PASSES        = 1
+PHYS_REFINE_PROBES        = 4
+# PHYS_BOOTSTRAP_BLOCK - replicas solved together as one multi-RHS system.
+#     They share the neighbour and weight arrays, which is most of the memory
+#     traffic, so a block is much cheaper than the same number of separate
+#     solves.  Raise for speed, lower if memory is tight: peak scales as
+#     block x non-zeros x 8 bytes.
+PHYS_BOOTSTRAP_BLOCK      = 4
+PHYS_BAND_FACTOR          = 3.0
+PHYS_CG_TOL               = 1e-7
+PHYS_CG_MAXITER           = 400
+
+
 # Settings file lives at project root / config / (two levels above modules/core/).
 SETTINGS_FILE: Path = Path(__file__).resolve().parent.parent.parent / "config" / "data_handling_settings.json"
 

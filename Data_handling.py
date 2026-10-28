@@ -38,11 +38,13 @@ except ImportError:
         "  pip install vtk numpy"
     )
 
+from modules.core.console import configure_stdio
 from modules.core.settings import (
     load_settings, save_settings, _safe_float, SMOOTH_PROXIMITY_RADIUS,
 )
 from modules.processing.pipeline import run_processing, run_transform
-from modules.processing.post_pipeline import run_post_processing, run_component_worst_case_merge
+from modules.processing.post_pipeline import (run_post_processing, run_component_worst_case_merge,
+                                              run_sum_merge)
 from modules.gui.gui_tab1 import build_processing_tab
 from modules.gui.gui_tab2 import build_transform_tab
 from modules.gui.gui_tab3 import build_post_processing_tab
@@ -241,6 +243,8 @@ def run_gui() -> None:
     apply_pp_cfg           = t3["apply_pp_cfg"]
     assembly_run_btn       = t3["assembly_run_btn"]
     get_assembly_cfg       = t3["get_assembly_cfg"]
+    sum_run_btn            = t3["sum_run_btn"]
+    get_sum_cfg            = t3["get_sum_cfg"]
 
     # Wire Tab 1 directory reader into Tab 2 and Tab 3 Load Cases buttons
     def _get_tab1_dirs_for_t2() -> list[str]:
@@ -372,7 +376,7 @@ def run_gui() -> None:
     stop_btn_pp   = _add_stop_btn(log_box_pp,   _stop_pp)
     stop_btn_xfm  = _add_stop_btn(log_box_xfm,  _stop_xfm)
 
-    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn, assembly_run_btn]
+    _all_run_btns = [tab1_run_btn, tab3_run_btn, tab2_run_btn, assembly_run_btn, sum_run_btn]
 
     def _set_busy(mode: str = "proc") -> None:
         """mode: 'proc' | 'pp' | 'xfm' — clear the pane and arm stop button."""
@@ -389,6 +393,7 @@ def run_gui() -> None:
             _stop_pp.clear()
             tab3_run_btn.configure(state="disabled")
             assembly_run_btn.configure(state="disabled")
+            sum_run_btn.configure(state="disabled")
             stop_btn_pp.configure(state="normal", text="■ Stop")
             _log_lines_pp.clear()
             log_box_pp.configure(state="normal")
@@ -415,6 +420,7 @@ def run_gui() -> None:
         if _active_pp[0] == 0:
             tab3_run_btn.configure(state="normal")
             assembly_run_btn.configure(state="normal")
+            sum_run_btn.configure(state="normal")
             stop_btn_pp.configure(state="disabled", text="■ Stop")
         _finish_if_idle()
 
@@ -468,6 +474,15 @@ def run_gui() -> None:
         def worker():
             try:
                 run_component_worst_case_merge(cfg, log_pp, _stop_pp)
+            finally:
+                root.after(0, _on_pp_done)
+        _active_pp[0] += 1
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_sum_merge(cfg: dict) -> None:
+        def worker():
+            try:
+                run_sum_merge(cfg, log_pp, _stop_pp)
             finally:
                 root.after(0, _on_pp_done)
         _active_pp[0] += 1
@@ -559,6 +574,17 @@ def run_gui() -> None:
         _set_busy("pp")
         _launch_assembly_merge(assembly_cfg)
 
+    def on_run_sum_merge():
+        sum_cfg = get_sum_cfg()
+        if sum_cfg is None:
+            return
+        sum_cfg["output_folder"] = output_folder_var.get()
+        if not _confirm_overwrite():
+            return
+        save_settings(_current_cfg())
+        _set_busy("pp")
+        _launch_sum_merge(sum_cfg)
+
     def on_run_transform():
         xfm_params = get_transform_params()
         if xfm_params is None:
@@ -577,6 +603,7 @@ def run_gui() -> None:
     tab1_run_btn.configure(command=on_run_processing)
     tab3_run_btn.configure(command=on_run_post_processing)
     assembly_run_btn.configure(command=on_run_assembly_merge)
+    sum_run_btn.configure(command=on_run_sum_merge)
     tab2_run_btn.configure(command=on_run_transform)
 
     # -- Final window sizing ----------------------------------------------------
@@ -599,6 +626,10 @@ def run_gui() -> None:
 # -- Entry point ---------------------------------------------------------------
 
 def main() -> None:
+    # Before anything logs: a redirected stdout defaults to the ANSI code page
+    # on Windows, where the em dashes and arrows in the log text raise
+    # UnicodeEncodeError and take the worker down with them.
+    configure_stdio()
     run_gui()
 
 
